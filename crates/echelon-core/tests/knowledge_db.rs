@@ -92,6 +92,14 @@ async fn central_knowledge_transactions_and_history() {
     let request = json!({"op":"submit","request_id":Uuid::new_v4(),"document":source(),"rationale":"Reusable reference, without copying the manual"});
     let queued = knowledge::submit(&pool, &h, &request).await.unwrap();
     assert_eq!(queued["submission"]["status"], "pending");
+    let preview = knowledge::read(&pool, &a, &json!({"op":"submissions","status":"pending"}))
+        .await
+        .unwrap();
+    assert_eq!(preview["submissions"][0]["title"], "가상 기술문서 위치");
+    assert!(
+        preview["submissions"][0].get("document").is_none(),
+        "Queue listing must not load full submitted bodies"
+    );
     assert!(
         knowledge::read(&pool, &a, &json!({})).await.unwrap()["items"]
             .as_array()

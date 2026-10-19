@@ -748,11 +748,15 @@ pub async fn read(pool: &PgPool, a: &Claims, input: &Value) -> AppResult<Value> 
             {
                 return Err(invalid());
             }
-            let rows=sqlx::query("SELECT * FROM knowledge_submissions WHERE tenant_id=$1 AND ($2::text IS NULL OR status=$2) AND ($3::uuid IS NULL OR source_task_id=$3) AND ($4::uuid IS NULL OR id>$4) ORDER BY id LIMIT $5")
+            let rows=sqlx::query("SELECT id,source_task_id,target_id,base_version,status,result_item_id,result_version,rationale,document->>'title' AS title,document->>'category' AS category,document->'tags' AS tags,created_at::text AS submitted_at,decided_at::text AS decided_at FROM knowledge_submissions WHERE tenant_id=$1 AND ($2::text IS NULL OR status=$2) AND ($3::uuid IS NULL OR source_task_id=$3) AND ($4::uuid IS NULL OR id>$4) ORDER BY id LIMIT $5")
                 .bind(a.tenant_id).bind(status).bind(source_task_id).bind(after_id).bind(limit).fetch_all(pool).await.map_err(database)?;
-            Ok(
-                json!({"submissions":rows.iter().map(submission_json).collect::<Vec<_>>(),"next_after_id":rows.last().map(|r|r.get::<Uuid,_>("id"))}),
-            )
+            Ok(json!({"submissions":rows.iter().map(|r|json!({
+                    "id":r.get::<Uuid,_>("id"),"source_task_id":r.get::<Uuid,_>("source_task_id"),
+                    "target_id":r.get::<Option<Uuid>,_>("target_id"),"base_version":r.get::<Option<i32>,_>("base_version"),
+                    "status":r.get::<String,_>("status"),"item_id":r.get::<Option<Uuid>,_>("result_item_id"),"version":r.get::<Option<i32>,_>("result_version"),
+                    "title":r.get::<String,_>("title"),"category":r.get::<String,_>("category"),"tags":r.get::<Value,_>("tags"),
+                    "rationale":r.get::<String,_>("rationale"),"submitted_at":r.get::<String,_>("submitted_at"),"decided_at":r.get::<Option<String>,_>("decided_at")
+                })).collect::<Vec<_>>(),"next_after_id":rows.last().map(|r|r.get::<Uuid,_>("id"))}))
         }
         ReadInput::Submission { submission_id } => {
             let row =

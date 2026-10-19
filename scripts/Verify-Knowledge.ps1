@@ -70,6 +70,7 @@ Assert-KnowledgeDenied 'knowledge.publish' $acceptance 403 $handler $sourceTask
 Assert-KnowledgeDenied 'knowledge.submit' $payload 403
 $queue=Invoke-KnowledgeTool 'knowledge.read' @{op='submissions';status='pending'}
 Assert-Knowledge (@($queue.submissions).Count -eq 1) 'Analyst did not see the cross-Task intake queue.'
+Assert-Knowledge ($queue.submissions[0].title -eq '가상 기술문서 위치' -and $queue.submissions[0].PSObject.Properties.Name -notcontains 'document') 'The intake preview exposed the full document.'
 $accepted=Accept-Submission $pending
 $root=$accepted.submission.item_id
 Assert-Knowledge ($accepted.submission.version -eq 1) 'Initial adoption did not create version 1.'
