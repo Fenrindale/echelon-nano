@@ -18,7 +18,11 @@ COPY --from=formatted /work/crates /crates
 FROM source AS checks
 COPY Cargo.lock ./
 RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/work/target \
-    cargo fmt --all --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo test --workspace --locked
+    cargo fmt --all --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo test --workspace --locked && \
+    cargo test --test knowledge_db --no-run --locked --message-format=json > /tmp/knowledge-artifacts.json && \
+    test_binary="$(sed -n '/"name":"knowledge_db"/s/.*"executable":"\([^"]*\)".*/\1/p' /tmp/knowledge-artifacts.json | tail -n 1)" && \
+    test -f "$test_binary" && "$test_binary" --list | grep -q '^central_knowledge_transactions_and_history: test$' && \
+    cp "$test_binary" /usr/local/bin/knowledge-db-tests
 
 FROM checks AS build
 RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/work/target \
@@ -31,3 +35,8 @@ USER 10001:10001
 EXPOSE 8080
 ENTRYPOINT ["/usr/local/bin/echelon"]
 CMD ["serve"]
+
+FROM runtime AS knowledge-tests
+COPY --from=checks /usr/local/bin/knowledge-db-tests /usr/local/bin/knowledge-db-tests
+ENTRYPOINT ["/usr/local/bin/knowledge-db-tests"]
+CMD ["--ignored", "--nocapture"]

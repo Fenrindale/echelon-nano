@@ -1,5 +1,7 @@
 # Phase 0 구현과 검증
 
+이 문서는 Phase 0 시점의 기록이다. 후속 중앙 지식 구현과 현재 API 범위는 [Phase 1 문서](KNOWLEDGE.md)를 따른다.
+
 ## 구현 범위
 
 Rust 1.90.0, Axum, Tokio, PostgreSQL, Vault를 사용하는 제어 서버와 Docker Compose 기반을 구현한다. 공개 저장소에는 소스와 재현 가능한 검증 명령을 보관하고 실제 계정 자격증명과 실행 증거는 .runtime에 분리한다.

@@ -3,6 +3,7 @@ use crate::{
     bootstrap::{RuntimeKeys, secret_hash},
     config::Config,
     error::{AppError, AppResult},
+    knowledge,
     policy::{self, Capability, Claims, Role, ToolRequest},
     store::{VaultStore, audit},
     unix_time,
@@ -421,16 +422,10 @@ async fn invoke(
 }
 async fn dispatch(s: &AppState, a: &Claims, req: &ToolRequest) -> AppResult<Value> {
     match req.tool {
-        Capability::KnowledgeRead => {
-            let rows=sqlx::query("SELECT id,category,title,version,truth_state,outcome FROM knowledge_items WHERE tenant_id=$1 ORDER BY created_at LIMIT 30")
-                .bind(a.tenant_id).fetch_all(&s.pool).await.map_err(|_|AppError::internal("knowledge_read_failed"))?;
-            Ok(
-                json!({"items":rows.into_iter().map(|r|json!({"id":r.get::<Uuid,_>("id"),
-                "category":r.get::<String,_>("category"),"title":r.get::<String,_>("title"),
-                "version":r.get::<i32,_>("version"),"truth_state":r.get::<String,_>("truth_state"),
-                "outcome":r.get::<String,_>("outcome")})).collect::<Vec<_>>()}),
-            )
-        }
+        Capability::KnowledgeRead => knowledge::read(&s.pool, a, &req.input).await,
+        Capability::KnowledgeSubmit => knowledge::submit(&s.pool, a, &req.input).await,
+        Capability::KnowledgePublish => knowledge::publish(&s.pool, a, &req.input).await,
+        Capability::KnowledgeClassify => knowledge::classify(&s.pool, a, &req.input).await,
         Capability::TaskPlan => {
             sqlx::query("UPDATE tasks SET plan=$1,status='ready' WHERE id=$2 AND tenant_id=$3")
                 .bind(&req.input)

@@ -2,6 +2,7 @@ pub mod auth;
 pub mod bootstrap;
 pub mod config;
 pub mod error;
+pub mod knowledge;
 pub mod policy;
 pub mod server;
 pub mod store;

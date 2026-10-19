@@ -6,9 +6,9 @@ Analyst curates registered knowledge, Handler plans and delegates work, Agent ex
 
 ## Current scope
 
-Phase 0 implements the control server, PostgreSQL foundation, Vault-backed OAuth credentials, Sign in with ChatGPT, streamed connection probes, serialized refresh rotation, and isolated role verification containers.
+Phase 0 implements the control server, Vault-backed OAuth credentials, Sign in with ChatGPT, streamed connection probes, serialized refresh rotation, and isolated role verification containers. Phase 1 adds PostgreSQL central knowledge with Data/Info/Intel, versioned tags and reference edges, immutable failure history, and Handler submission → Analyst adoption or rejection.
 
-General task automation, external fetch and shell adapters, knowledge promotion, Master optimization, and the full interface are subsequent phases. An allowed capability with no adapter returns HTTP 501 and performs no action.
+General task automation, external fetch and shell adapters, Context Packs, Master optimization, protocols, and the full interface are subsequent phases. An allowed capability with no adapter returns HTTP 501 and performs no action.
 
 The initial model connection uses the official Sign in with ChatGPT route. It does not reuse another application's Codex credentials, call private ChatGPT inference endpoints, or silently fall back to a billed API key.
 
@@ -60,7 +60,16 @@ docker build --target runtime -t echelon-nano:local .
 
 These checks run rustfmt, Clippy with warnings denied, unit tests, and ephemeral RSA/JWKS validation tests. Live OAuth and container isolation require the local setup and are recorded separately from unit tests.
 
-See [the design](docs/PLAN.ko.md) and [Phase 0 validation](docs/PHASE0.md). This is a new Rust implementation inspired by workflow concepts from Artex; it does not include Artex source code.
+To test the knowledge workflow against an isolated, disposable PostgreSQL database:
+
+```powershell
+docker compose -f compose.verify.yaml up --build --abort-on-container-exit --exit-code-from tests
+docker compose -f compose.verify.yaml down --remove-orphans
+```
+
+GitHub CI runs this database test separately; the database test is intentionally ignored by plain cargo test. After rebuilding and starting the local core, run `./scripts/Verify-Knowledge.ps1 -RestartCore` for the actual authenticated HTTP workflow, isolation and restart checks. It retains tagged synthetic records in a separate verification tenant and saves private evidence under .runtime/evidence.
+
+See [the design](docs/PLAN.ko.md), [Phase 0 validation](docs/PHASE0.md), and [the knowledge API and Phase 1 validation](docs/KNOWLEDGE.md). This is a new Rust implementation inspired by workflow concepts from Artex; it does not include Artex source code.
 
 ## Official connection references
 

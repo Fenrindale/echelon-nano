@@ -1,0 +1,31 @@
+name: echelon-nano-verification
+services:
+  database:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: verifier
+      POSTGRES_PASSWORD: synthetic-verification-only
+      POSTGRES_DB: echelon_verification
+    tmpfs: [/var/lib/postgresql/data]
+    networks: [verification]
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U verifier -d echelon_verification']
+      interval: 2s
+      timeout: 2s
+      retries: 30
+  tests:
+    build:
+      context: .
+      target: knowledge-tests
+    environment:
+      DATABASE_URL: postgres://verifier:synthetic-verification-only@database/echelon_verification
+    depends_on:
+      database:
+        condition: service_healthy
+    networks: [verification]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+networks:
+  verification:
+    internal: true
