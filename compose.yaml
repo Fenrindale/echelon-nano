@@ -1,0 +1,136 @@
+name: echelon-nano
+x-role: &role
+  image: echelon-nano:local
+  profiles: [verify]
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  tmpfs: [/tmp]
+  networks: [roles]
+  environment:
+    ECHELON_CORE_URL: http://core:8080
+  pids_limit: 64
+  mem_limit: 192m
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: echelon
+      POSTGRES_DB: echelon
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres-password
+    secrets: [postgres-password]
+    volumes: [postgres-data:/var/lib/postgresql/data]
+    networks: [data]
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U echelon -d echelon"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    mem_limit: 384m
+
+  vault-permissions:
+    image: hashicorp/vault:1.20.4
+    user: '0:0'
+    entrypoint: [/bin/sh, -c]
+    command: ['chmod 0700 /vault/data && chown vault:vault /vault/data']
+    volumes: [vault-data:/vault/data]
+    network_mode: none
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [CHOWN, FOWNER]
+    security_opt: [no-new-privileges:true]
+
+  vault:
+    image: hashicorp/vault:1.20.4
+    user: vault
+    environment:
+      SKIP_CHOWN: 'true'
+      SKIP_SETCAP: 'true'
+    depends_on:
+      vault-permissions:
+        condition: service_completed_successfully
+    command: [server]
+    volumes:
+      - vault-data:/vault/data
+      - ./deploy/vault.hcl:/vault/config/echelon.hcl:ro
+    networks: [secrets]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 256m
+
+  bootstrap:
+    image: echelon-nano:local
+    build:
+      context: .
+      target: runtime
+    profiles: [tools]
+    command: [bootstrap]
+    volumes: [./.runtime/bootstrap:/bootstrap]
+    networks: [secrets]
+    environment:
+      VAULT_ADDR: http://vault:8200
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+
+  core:
+    image: echelon-nano:local
+    build:
+      context: .
+      target: runtime
+    ports: ["127.0.0.1:18431:8080"]
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres-password
+      VAULT_ADDR: http://vault:8200
+      VAULT_TOKEN_FILE: /run/secrets/vault-core-token
+      ECHELON_CALLBACK_URI: http://127.0.0.1:18431/auth/callback
+    secrets: [postgres-password, vault-core-token]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      vault:
+        condition: service_started
+    networks: [roles, data, secrets, provider]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: [/tmp]
+    pids_limit: 128
+    mem_limit: 512m
+
+  analyst:
+    <<: *role
+    command: [role-probe, --role, analyst]
+    volumes: [./.runtime/roles/analyst:/run/secrets/role-token:ro]
+  handler:
+    <<: *role
+    command: [role-probe, --role, handler]
+    volumes: [./.runtime/roles/handler:/run/secrets/role-token:ro]
+  agent:
+    <<: *role
+    command: [role-probe, --role, agent]
+    volumes: [./.runtime/roles/agent:/run/secrets/role-token:ro]
+  master:
+    <<: *role
+    command: [role-probe, --role, master]
+    volumes: [./.runtime/roles/master:/run/secrets/role-token:ro]
+
+networks:
+  roles:
+    internal: true
+  data:
+    internal: true
+  secrets:
+    internal: true
+  provider: {}
+
+volumes:
+  postgres-data: {}
+  vault-data: {}
+
+secrets:
+  postgres-password:
+    file: ./.runtime/bootstrap/postgres-password
+  vault-core-token:
+    file: ./.runtime/bootstrap/vault-core-token

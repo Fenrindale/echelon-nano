@@ -1,0 +1,16 @@
+name: Rust and Docker checks
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Format, Clippy and tests in the pinned Rust image
+        run: docker build --target checks .
+      - name: Build the non-root runtime image
+        run: docker build --target runtime -t echelon-nano:ci .

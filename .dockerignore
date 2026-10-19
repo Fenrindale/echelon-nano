@@ -1,0 +1,10 @@
+.git
+.runtime
+.build
+target
+.env
+.env.*
+*.log
+*.dpapi
+**/*.pem
+**/*.key

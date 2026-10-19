@@ -1,0 +1,72 @@
+# Echelon Nano
+
+Rust and Docker foundations for a shared-knowledge work agent system.
+
+Analyst curates registered knowledge, Handler plans and delegates work, Agent executes a scoped Work Order, and Master audits and optimizes knowledge. Role capabilities are enforced by the server and signed, short-lived scope tokens.
+
+## Current scope
+
+Phase 0 implements the control server, PostgreSQL foundation, Vault-backed OAuth credentials, Sign in with ChatGPT, streamed connection probes, serialized refresh rotation, and isolated role verification containers.
+
+General task automation, external fetch and shell adapters, knowledge promotion, Master optimization, and the full interface are subsequent phases. An allowed capability with no adapter returns HTTP 501 and performs no action.
+
+The initial model connection uses the official Sign in with ChatGPT route. It does not reuse another application's Codex credentials, call private ChatGPT inference endpoints, or silently fall back to a billed API key.
+
+## Requirements
+
+- Docker Desktop with Linux containers and Compose.
+- Windows and PowerShell 7 for the local setup scripts and DPAPI protection.
+- An eligible ChatGPT account and explicit consent for ChatGPT plan usage.
+- Available local port 18431.
+
+A host Rust installation is optional. Docker pins Rust 1.90.0; Cargo.lock is committed.
+
+## Start locally
+
+From the repository root, run:
+
+```powershell
+./scripts/Initialize-Local.ps1
+./scripts/Verify-Roles.ps1
+./scripts/Start-Login.ps1
+```
+
+The last command opens the official account selector and consent flow. After the callback reports success:
+
+```powershell
+./scripts/Verify-LiveOAuth.ps1
+```
+
+The live verifier uses the connected account's model catalog, completes a fixed synthetic inference, sends four concurrent refresh requests for the same generation, then completes another inference. It must observe response.completed for success. A listed model is not sufficient proof of access.
+
+The control page is available at http://127.0.0.1:18431. Operational APIs require a local operator credential. Do not publish this localhost setup directly to the internet.
+
+## Credentials and storage
+
+OAuth access, refresh and ID tokens are stored only in Vault. Public metadata and audit records contain no credential values. The role containers receive only their own short-lived session token and cannot connect directly to Vault, PostgreSQL or the internet.
+
+The local Vault instance uses persistent file storage on an internal Docker network. This single-machine setup uses one unseal share. Recovery material and the local operator credential are encrypted for the current Windows user with DPAPI. Scoped bootstrap credentials and the database password are restricted runtime files outside the Git and Docker build contexts.
+
+After restarting a sealed Vault, rerun Initialize-Local.ps1 -SkipBuild to restore it and rotate the scoped application token. Keep an independent protected backup of the recovery material; DPAPI recovery is tied to the Windows user and machine.
+
+All .runtime content is private and ignored by Git and Docker. Keep evidence, credentials and database volumes out of public issues and commits.
+
+## Verification
+
+```powershell
+docker build --target checks .
+docker build --target runtime -t echelon-nano:local .
+```
+
+These checks run rustfmt, Clippy with warnings denied, unit tests, and ephemeral RSA/JWKS validation tests. Live OAuth and container isolation require the local setup and are recorded separately from unit tests.
+
+See [the design](docs/PLAN.ko.md) and [Phase 0 validation](docs/PHASE0.md). This is a new Rust implementation inspired by workflow concepts from Artex; it does not include Artex source code.
+
+## Official connection references
+
+- [Registration and sign-in](https://developers.openai.com/siwc/token-sharing-open-source/sign-in)
+- [Models and inference](https://developers.openai.com/siwc/token-sharing-open-source/models-and-inference)
+- [Accounts and sessions](https://developers.openai.com/siwc/token-sharing-open-source/profiles-and-sessions)
+- [Preview limitations](https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations)
+
+MIT License.

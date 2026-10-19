@@ -1,0 +1,14 @@
+/.runtime/
+/.build/
+/target/
+.env
+.env.*
+!.env.example
+*.log
+*.pem
+*.key
+*.pfx
+*.dpapi
+**/auth.json
+**/credentials.json
+!Cargo.lock
