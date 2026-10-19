@@ -676,6 +676,66 @@ impl OAuthService {
     }
 }
 
+pub struct ModelReply {
+    pub output: Vec<Value>,
+    pub usage: Value,
+    pub generation: u64,
+}
+
+impl OAuthService {
+    /// Only the server-owned execution broker supplies instructions and tool definitions.
+    /// No arbitrary credential, endpoint, or model fallback is accepted here.
+    pub async fn infer(
+        &self,
+        id: &str,
+        model: &str,
+        instructions: &str,
+        input: &[Value],
+        tools: Value,
+    ) -> AppResult<ModelReply> {
+        if model.is_empty()
+            || model.len() > 160
+            || serde_json::to_vec(input)
+                .map_err(|_| AppError::bad("invalid_inference_input"))?
+                .len()
+                > 262144
+        {
+            return Err(AppError::bad("inference_input_budget_exceeded"));
+        }
+        let record = self.fresh_record(id, None, false).await?;
+        if !record.plan_enabled() {
+            return Err(AppError::forbidden("plan_usage_not_granted"));
+        }
+        // SIWC rejects max_output_tokens. Bound calls, elapsed time and stream bytes locally.
+        let response = self
+            .client
+            .post(format!("{RESOURCE}/responses"))
+            .bearer_auth(&record.access_token)
+            .json(
+                &json!({"model":model,"instructions":instructions,"input":input,
+                "tools":tools,"parallel_tool_calls":false,"store":false,"stream":true,
+                "include":["reasoning.encrypted_content"]}),
+            )
+            .send()
+            .await
+            .map_err(|_| AppError::internal("provider_unavailable"))?;
+        if !response.status().is_success() {
+            return Err(AppError::bad("inference_rejected"));
+        }
+        let mut stream = response.bytes_stream();
+        let mut parser = SseProbe::default();
+        while let Some(chunk) = stream.next().await {
+            parser.feed(&chunk.map_err(|_| AppError::bad("inference_stream_interrupted"))?)?;
+        }
+        let (output, usage) = parser.finish_output()?;
+        Ok(ModelReply {
+            output,
+            usage,
+            generation: record.generation,
+        })
+    }
+}
+
 #[derive(Default)]
 pub struct SseProbe {
     pending: Vec<u8>,
@@ -685,6 +745,8 @@ pub struct SseProbe {
     failed: bool,
     total: usize,
     usage: Value,
+    output: Vec<Value>,
+    items: std::collections::BTreeMap<u64, Value>,
 }
 
 impl SseProbe {
@@ -720,15 +782,32 @@ impl SseProbe {
         let value: Value =
             serde_json::from_str(&data).map_err(|_| AppError::bad("inference_stream_invalid"))?;
         match value["type"].as_str() {
+            Some("response.output_item.done") => {
+                let index = value["output_index"]
+                    .as_u64()
+                    .filter(|n| *n < 128)
+                    .ok_or_else(|| AppError::bad("inference_stream_invalid"))?;
+                if !value["item"].is_object() {
+                    return Err(AppError::bad("inference_stream_invalid"));
+                }
+                self.items.insert(index, value["item"].clone());
+            }
             Some("response.output_text.delta") => self
                 .text
                 .push_str(value["delta"].as_str().unwrap_or_default()),
             Some("response.completed") => {
+                if self.completed {
+                    return Err(AppError::bad("inference_duplicate_completion"));
+                }
                 if value["response"]["status"] != "completed" {
                     self.failed = true;
                 }
                 self.completed = true;
                 self.usage = value["response"]["usage"].clone();
+                self.output = value["response"]["output"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default();
                 if self.text.is_empty()
                     && let Some(output) = value["response"]["output"].as_array()
                 {
@@ -750,7 +829,7 @@ impl SseProbe {
         Ok(())
     }
 
-    pub fn finish(mut self) -> AppResult<(String, Value)> {
+    fn terminal(&mut self) -> AppResult<()> {
         if !self.pending.is_empty() {
             let line = std::str::from_utf8(&self.pending)
                 .map_err(|_| AppError::bad("inference_stream_invalid"))?;
@@ -765,13 +844,60 @@ impl SseProbe {
         if !self.completed {
             return Err(AppError::bad("inference_missing_completion"));
         }
+        // Some transports omit output items from the terminal envelope. Completed item
+        // events carry the full function arguments and encrypted reasoning in index order.
+        if self.output.is_empty() {
+            self.output = self.items.values().cloned().collect();
+        }
+        Ok(())
+    }
+    pub fn finish(mut self) -> AppResult<(String, Value)> {
+        self.terminal()?;
         Ok((self.text, self.usage))
+    }
+    pub fn finish_output(mut self) -> AppResult<(Vec<Value>, Value)> {
+        self.terminal()?;
+        if self.output.is_empty() {
+            return Err(AppError::bad("inference_output_missing"));
+        }
+        Ok((self.output, self.usage))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn function_calls_are_released_only_after_terminal_success() {
+        let call = json!({"type":"function_call","name":"invoke","namespace":"echelon","call_id":"synthetic","arguments":"{}"});
+        let frame = |status: &str| {
+            format!(
+                "data: {}\n\n",
+                json!({"type":format!("response.{status}"),"response":{"status":status,"output":[call.clone()],"usage":{"total_tokens":10}}})
+            )
+        };
+        let mut failed = SseProbe::default();
+        failed.feed(frame("incomplete").as_bytes()).unwrap();
+        assert!(failed.finish_output().is_err());
+        let mut success = SseProbe::default();
+        for chunk in frame("completed").as_bytes().chunks(7) {
+            success.feed(chunk).unwrap();
+        }
+        let (output, usage) = success.finish_output().unwrap();
+        assert_eq!(output, vec![call]);
+        assert_eq!(usage["total_tokens"], 10);
+        let item = format!(
+            "data: {}\n\n",
+            json!({"type":"response.output_item.done","output_index":0,"item":output[0]})
+        );
+        let mut pending = SseProbe::default();
+        pending.feed(item.as_bytes()).unwrap();
+        assert!(pending.finish_output().is_err());
+        let mut streamed = SseProbe::default();
+        streamed.feed(item.as_bytes()).unwrap();
+        streamed.feed(b"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"total_tokens\":10}}}\n\n").unwrap();
+        assert_eq!(streamed.finish_output().unwrap().0, output);
+    }
     #[test]
     fn pkce_matches_rfc7636_vector() {
         assert_eq!(

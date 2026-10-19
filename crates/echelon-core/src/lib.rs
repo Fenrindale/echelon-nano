@@ -3,10 +3,12 @@ pub mod bootstrap;
 pub mod config;
 pub mod context;
 pub mod error;
+pub mod execution;
 pub mod knowledge;
 pub mod policy;
 pub mod server;
 pub mod store;
+pub mod work;
 
 pub fn unix_time() -> u64 {
     std::time::SystemTime::now()

@@ -36,6 +36,10 @@ pub enum Capability {
     KnowledgeSubmit,
     #[serde(rename = "agent.delegate")]
     AgentDelegate,
+    #[serde(rename = "work_order.read")]
+    WorkOrderRead,
+    #[serde(rename = "work_order.complete")]
+    WorkOrderComplete,
     #[serde(rename = "task.observe")]
     TaskObserve,
     #[serde(rename = "external.fetch")]
@@ -54,7 +58,7 @@ pub enum Capability {
     VaultRawRead,
 }
 
-pub const ALL: [Capability; 17] = [
+pub const ALL: [Capability; 19] = [
     Capability::KnowledgeRead,
     Capability::KnowledgeClassify,
     Capability::KnowledgePublish,
@@ -64,6 +68,8 @@ pub const ALL: [Capability; 17] = [
     Capability::TaskPlan,
     Capability::KnowledgeSubmit,
     Capability::AgentDelegate,
+    Capability::WorkOrderRead,
+    Capability::WorkOrderComplete,
     Capability::TaskObserve,
     Capability::ExternalFetch,
     Capability::ShellExec,
@@ -83,9 +89,17 @@ pub fn role_allows(role: Role, action: Capability) -> bool {
         ),
         Role::Handler => matches!(
             action,
-            ContextRequest | ContextRead | TaskPlan | KnowledgeSubmit | AgentDelegate
+            ContextRequest
+                | ContextRead
+                | TaskPlan
+                | KnowledgeSubmit
+                | AgentDelegate
+                | WorkOrderRead
         ),
-        Role::Agent => matches!(action, TaskObserve | ExternalFetch | ShellExec),
+        Role::Agent => matches!(
+            action,
+            TaskObserve | ExternalFetch | ShellExec | WorkOrderRead | WorkOrderComplete
+        ),
         Role::Master => matches!(
             action,
             KnowledgeRead | KnowledgeOptimize | ProtocolManage | AuditRead
@@ -128,7 +142,10 @@ pub fn authorize(claims: &Claims, req: &ToolRequest) -> AppResult<()> {
     }
     if matches!(
         req.tool,
-        Capability::ExternalFetch | Capability::ShellExec | Capability::TaskObserve
+        Capability::ExternalFetch
+            | Capability::ShellExec
+            | Capability::TaskObserve
+            | Capability::WorkOrderComplete
     ) {
         if claims.work_order_id.is_none() {
             return Err(AppError::forbidden("work_order_required"));

@@ -10,7 +10,7 @@ Phase 0 implements the control server, Vault-backed OAuth credentials, Sign in w
 
 Phase 2 adds Handler context requests, Analyst candidate selection, immutable Context Packs with pinned evidence references, and task-scoped Handler resolution. Packs carry metadata and cautions; full knowledge is loaded through individual references.
 
-General task automation, external fetch and shell adapters, role LLM orchestration, Master optimization, protocols, and the full interface are subsequent phases. An allowed capability with no adapter returns HTTP 501 and performs no action.
+Phase 3 adds bounded OAuth-backed Handler/Analyst/Agent execution loops, scoped Work Order evidence contracts, immutable results and Handler collection. See [execution contracts, API and limits](docs/EXECUTION.md). External fetch and shell adapters, Master optimization, protocols, and the full interface are subsequent phases. An allowed capability with no adapter returns HTTP 501 and performs no action.
 
 The initial model connection uses the official Sign in with ChatGPT route. It does not reuse another application's Codex credentials, call private ChatGPT inference endpoints, or silently fall back to a billed API key.
 
@@ -72,6 +72,8 @@ docker compose -f compose.verify.yaml down --remove-orphans
 GitHub CI runs this database test separately; the database test is intentionally ignored by plain cargo test. After rebuilding and starting the local core, run `./scripts/Verify-Knowledge.ps1 -RestartCore` for the actual authenticated HTTP workflow, isolation and restart checks. It retains tagged synthetic records in a separate verification tenant and saves private evidence under .runtime/evidence.
 
 Run `./scripts/Verify-ContextPacks.ps1 -RestartCore` to verify the Context Pack request, curation, reference resolution, evidence pinning and scope boundaries through actual authenticated HTTP calls. The isolated PostgreSQL verification also covers Context Packs and concurrent delivery retries.
+
+Run `./scripts/Verify-LLMLoop.ps1` with an explicitly connected account to execute an owned synthetic task through all three actual model roles, verify evidence and failure history delivery, retrieve the Agent result, and exercise role/scope and call-budget limits. This makes real ChatGPT-plan inference requests; raw evidence remains private.
 
 See [the design](docs/PLAN.ko.md), [Phase 0 validation](docs/PHASE0.md), [the knowledge API](docs/KNOWLEDGE.md), and [Context Packs and Phase 2 validation](docs/CONTEXT_PACKS.md). This is a new Rust implementation inspired by workflow concepts from Artex; it does not include Artex source code.
 

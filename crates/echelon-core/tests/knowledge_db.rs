@@ -1,7 +1,7 @@
 use echelon_core::{
-    context, knowledge,
+    context, execution, knowledge,
     policy::{Claims, Role},
-    unix_time,
+    unix_time, work,
 };
 use serde_json::{Value, json};
 use sqlx::{PgPool, postgres::PgPoolOptions};
@@ -27,6 +27,136 @@ fn id(value: &Value) -> Uuid {
 }
 fn source() -> Value {
     json!({"category":"data","title":"가상 기술문서 위치","storage_mode":"reference","sources":[{"uri":"https://example.com/manual","locator":"synthetic section"}],"tags":["시스템:예시","업무:검증"]})
+}
+
+#[tokio::test]
+#[ignore = "requires the isolated compose.verify.yaml PostgreSQL database"]
+async fn work_orders_scope_results_and_interrupted_runs() {
+    let pool = PgPoolOptions::new()
+        .max_connections(8)
+        .connect(&std::env::var("DATABASE_URL").unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT current_database()")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        "echelon_verification"
+    );
+    sqlx::migrate!("../../migrations").run(&pool).await.unwrap();
+    let tenant = Uuid::new_v4();
+    let task = Uuid::new_v4();
+    let other = Uuid::new_v4();
+    sqlx::query("INSERT INTO tenants(id,name) VALUES($1,'Owned execution verification')")
+        .bind(tenant)
+        .execute(&pool)
+        .await
+        .unwrap();
+    for id in [task, other] {
+        sqlx::query("INSERT INTO tasks(id,tenant_id,goal) VALUES($1,$2,'Synthetic work goal')")
+            .bind(id)
+            .bind(tenant)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    let h = actor(tenant, task, Role::Handler);
+    let a = actor(tenant, task, Role::Analyst);
+    let submission = submit(&pool, &h, source(), None).await;
+    let submission = accept(&pool, &a, &submission).await;
+    let request=context::request(&pool,&h,&json!({"request_id":Uuid::new_v4(),"criteria":{"need":"Synthetic work","tags":["업무:검증"]}})).await.unwrap();
+    let pack=context::curate(&pool,&a,&json!({"op":"deliver","request_id":request["request"]["id"],"selections":[{"item_id":submission["submission"]["item_id"],"version":1,"reason":"Registered evidence"}]})).await.unwrap();
+    let reference =
+        json!({"pack_id":pack["pack"]["id"],"ref_id":pack["pack"]["knowledge"][0]["ref_id"]});
+    let contract = json!({"target":"synthetic:summary","objective":"Summarize supplied evidence","expected_output":"Cited summary","references":[reference]});
+    assert_eq!(
+        work::delegate(&pool, &a, &contract).await.unwrap_err().code,
+        "role_denied"
+    );
+    assert!(
+        work::delegate(&pool, &actor(tenant, other, Role::Handler), &contract)
+            .await
+            .is_err()
+    );
+    let order = work::delegate(&pool, &h, &contract).await.unwrap();
+    let order_id = id(&order["work_order_id"]);
+    let mut agent = actor(tenant, task, Role::Agent);
+    agent.work_order_id = Some(order_id);
+    agent.targets = vec!["synthetic:summary".into()];
+    let loaded = work::read(&pool, &agent, &json!({"work_order_id":order_id}))
+        .await
+        .unwrap();
+    assert_eq!(
+        loaded["contract"]["evidence"][0]["resolved"]["reference"]["version"],
+        1
+    );
+    assert!(
+        work::read(&pool, &agent, &json!({"work_order_id":Uuid::new_v4()}))
+            .await
+            .is_err()
+    );
+    assert!(
+        work::read(
+            &pool,
+            &actor(tenant, other, Role::Handler),
+            &json!({"work_order_id":order_id})
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(
+        work::complete(&pool, &h, &json!({}))
+            .await
+            .unwrap_err()
+            .code,
+        "role_denied"
+    );
+    assert_eq!(
+        work::complete(
+            &pool,
+            &agent,
+            &json!({"outcome":"completed","summary":"Missing evidence"})
+        )
+        .await
+        .unwrap_err()
+        .code,
+        "work_evidence_required"
+    );
+    assert_eq!(work::complete(&pool,&agent,&json!({"outcome":"completed","summary":"Wrong evidence","evidence":[{"pack_id":Uuid::new_v4(),"ref_id":Uuid::new_v4()}]})).await.unwrap_err().code,"work_evidence_denied");
+    let result = json!({"outcome":"completed","summary":"Cited synthetic source location","evidence":[reference],"limitations":["No external collection"]});
+    let (left, right) = tokio::join!(
+        work::complete(&pool, &agent, &result),
+        work::complete(&pool, &agent, &result)
+    );
+    assert_eq!(usize::from(left.is_ok()) + usize::from(right.is_ok()), 1);
+    assert_eq!(
+        work::read(&pool, &h, &json!({"work_order_id":order_id}))
+            .await
+            .unwrap()["result"],
+        result
+    );
+    assert!(
+        sqlx::query("UPDATE work_order_results SET result='{}' WHERE work_order_id=$1")
+            .bind(order_id)
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+    let run = Uuid::new_v4();
+    sqlx::query("INSERT INTO execution_runs(id,tenant_id,task_id,request_key,config,state,status) VALUES($1,$2,$3,$4,'{}','{}','running')").bind(run).bind(tenant).bind(task).bind(Uuid::new_v4()).execute(&pool).await.unwrap();
+    assert!(sqlx::query("INSERT INTO execution_runs(id,tenant_id,task_id,request_key,config,state,status) VALUES($1,$2,$3,$4,'{}','{}','running')").bind(Uuid::new_v4()).bind(tenant).bind(task).bind(Uuid::new_v4()).execute(&pool).await.is_err());
+    execution::interrupt(&pool).await.unwrap();
+    let observed = execution::read(&pool, run).await.unwrap();
+    assert_eq!(observed["status"], "interrupted");
+    assert_eq!(observed["calls"], 0);
+    assert!(
+        sqlx::query("DELETE FROM execution_events WHERE run_id=$1")
+            .bind(run)
+            .execute(&pool)
+            .await
+            .is_err()
+    );
 }
 async fn submit(pool: &PgPool, h: &Claims, document: Value, target: Option<(Uuid, i32)>) -> Value {
     knowledge::submit(pool,h,&json!({"op":"submit","request_id":Uuid::new_v4(),"document":document,"target_id":target.map(|t|t.0),"base_version":target.map(|t|t.1),"rationale":"Owned synthetic verification"})).await.unwrap()

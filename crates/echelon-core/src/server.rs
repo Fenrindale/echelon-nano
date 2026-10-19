@@ -4,10 +4,10 @@ use crate::{
     config::Config,
     context,
     error::{AppError, AppResult},
-    knowledge,
+    execution, knowledge,
     policy::{self, Capability, Claims, Role, ToolRequest},
     store::{VaultStore, audit},
-    unix_time,
+    unix_time, work,
 };
 use axum::{
     Json, Router,
@@ -82,6 +82,8 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         .connect_with(config.database_options().await?)
         .await?;
     sqlx::migrate!("../../migrations").run(&pool).await?;
+    // An unknown provider/tool outcome must be inspected, never silently replayed after restart.
+    execution::interrupt(&pool).await?;
     let oauth = OAuthService::new(vault.clone(), pool.clone(), host_id, config.callback_uri)?;
     let state = Arc::new(AppState {
         pool,
@@ -144,6 +146,8 @@ pub fn router(state: Shared) -> Router {
         .route("/v1/whoami", get(whoami))
         .route("/v1/permissions/check", post(check))
         .route("/v1/tools/invoke", post(invoke))
+        .route("/v1/operator/runs", post(start_run))
+        .route("/v1/operator/runs/{id}", get(read_run))
         .layer(DefaultBodyLimit::max(65536))
         .layer(middleware::from_fn(security_headers))
         .with_state(state)
@@ -380,10 +384,14 @@ async fn invoke(
     Json(req): Json<ToolRequest>,
 ) -> AppResult<Json<Value>> {
     let a = actor(&s, &h)?;
+    invoke_as(&s, &a, &req).await.map(Json)
+}
+
+pub async fn invoke_as(s: &AppState, a: &Claims, req: &ToolRequest) -> AppResult<Value> {
     let role = format!("{:?}", a.role).to_lowercase();
     let action =
         serde_json::to_value(req.tool).map_err(|_| AppError::internal("capability_invalid"))?;
-    if let Err(error) = policy::authorize(&a, &req) {
+    if let Err(error) = policy::authorize(a, req) {
         audit(
             &s.pool,
             Some(a.tenant_id),
@@ -403,7 +411,7 @@ async fn invoke(
             return Err(AppError::forbidden("work_order_inactive"));
         }
     }
-    let result = dispatch(&s, &a, &req).await;
+    let result = dispatch(s, a, req).await;
     let outcome = match &result {
         Ok(_) => "completed",
         Err(e) if e.status == StatusCode::NOT_IMPLEMENTED => "not_implemented",
@@ -419,7 +427,7 @@ async fn invoke(
         json!({}),
     )
     .await?;
-    result.map(Json)
+    result
 }
 async fn dispatch(s: &AppState, a: &Claims, req: &ToolRequest) -> AppResult<Value> {
     match req.tool {
@@ -440,22 +448,9 @@ async fn dispatch(s: &AppState, a: &Claims, req: &ToolRequest) -> AppResult<Valu
                 .map_err(|_| AppError::internal("task_plan_failed"))?;
             Ok(json!({"planned":true}))
         }
-        Capability::AgentDelegate => {
-            let target = req.input["target"]
-                .as_str()
-                .filter(|s| !s.is_empty() && s.len() <= 500)
-                .ok_or_else(|| AppError::bad("target_required"))?;
-            let id = Uuid::new_v4();
-            sqlx::query("INSERT INTO work_orders(id,tenant_id,task_id,target) VALUES($1,$2,$3,$4)")
-                .bind(id)
-                .bind(a.tenant_id)
-                .bind(a.task_id)
-                .bind(target)
-                .execute(&s.pool)
-                .await
-                .map_err(|_| AppError::internal("delegation_failed"))?;
-            Ok(json!({"work_order_id":id,"status":"ready"}))
-        }
+        Capability::AgentDelegate => work::delegate(&s.pool, a, &req.input).await,
+        Capability::WorkOrderRead => work::read(&s.pool, a, &req.input).await,
+        Capability::WorkOrderComplete => work::complete(&s.pool, a, &req.input).await,
         Capability::TaskObserve => {
             let id = Uuid::new_v4();
             sqlx::query("INSERT INTO observations(id,tenant_id,task_id,work_order_id,content) VALUES($1,$2,$3,$4,$5)")
@@ -485,4 +480,27 @@ async fn operator_audit(State(s): State<Shared>, h: HeaderMap) -> AppResult<Json
         json!({"counts":rows.into_iter().map(|r|json!({"action":r.get::<String,_>("action"),
         "outcome":r.get::<String,_>("outcome"),"count":r.get::<i64,_>("count")})).collect::<Vec<_>>()}),
     ))
+}
+
+async fn start_run(
+    State(s): State<Shared>,
+    h: HeaderMap,
+    Json(req): Json<execution::StartRun>,
+) -> AppResult<Json<Value>> {
+    operator(&s, &h)?;
+    let (value, fresh) = execution::start(&s.pool, &s.oauth, req).await?;
+    if fresh {
+        let id = serde_json::from_value(value["id"].clone())
+            .map_err(|_| AppError::internal("run_id_invalid"))?;
+        tokio::spawn(execution::drive(s, id));
+    }
+    Ok(Json(value))
+}
+async fn read_run(
+    State(s): State<Shared>,
+    h: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<Value>> {
+    operator(&s, &h)?;
+    execution::read(&s.pool, id).await.map(Json)
 }

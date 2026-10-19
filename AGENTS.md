@@ -11,6 +11,7 @@ Read README.md, docs/PLAN.ko.md and docs/PHASE0.md before changing the architect
 - For knowledge changes, run `scripts/Verify-Knowledge.ps1 -RestartCore` against the local core. Preserve submitted payloads, negative evidence and prior revisions; use expected versions for updates.
 - For Context Packs, run `scripts/Verify-ContextPacks.ps1 -RestartCore`. Handler access must remain bound to an explicitly delivered pack, its target Task and its immutable references; keep the central knowledge.read capability unavailable to Handler.
 - `scripts/Verify-LiveOAuth.ps1` requires an explicitly connected account and makes small real inference and refresh requests. Report its result separately from unit tests.
+- For role execution changes, run `scripts/Verify-LLMLoop.ps1` with the explicitly connected account. Preserve terminal-response gating, role/phase checks, pinned Work Order evidence, result collection, bounded calls and fail-stop restart behavior. Do not replay unknown provider or tool outcomes automatically.
 - Run `scripts/Test-PublicContent.ps1` and `git diff --check` before publishing.
 
 ## Boundaries
