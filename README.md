@@ -1,16 +1,20 @@
 # Echelon Nano
 
-Rust and Docker foundations for a shared-knowledge work agent system.
+Shared knowledge and bounded work agents, built with Rust and Docker. Local beta 0.2.
 
 Analyst curates registered knowledge, Handler plans and delegates work, Agent executes a scoped Work Order, and Master audits and optimizes knowledge. Role capabilities are enforced by the server and signed, short-lived scope tokens.
 
 ## Current scope
 
-Phase 0 implements the control server, Vault-backed OAuth credentials, Sign in with ChatGPT, streamed connection probes, serialized refresh rotation, and isolated role verification containers. Phase 1 adds PostgreSQL central knowledge with Data/Info/Intel, versioned tags and reference edges, immutable failure history, and Handler submission → Analyst adoption or rejection.
+The first beta includes all four roles, Data/Info/Intel knowledge, immutable revisions and failure history, pinned Context Packs, scoped Work Orders, artifact recovery, pause/cancel/explicit resume, and separate knowledge retention and Master audit stages.
 
-Phase 2 adds Handler context requests, Analyst candidate selection, immutable Context Packs with pinned evidence references, and task-scoped Handler resolution. Packs carry metadata and cautions; full knowledge is loaded through individual references.
+Master reviews activity and repetition, proposes versioned merges/splits/revisions and protocols, and queues separate verification requests. Semantic changes go through operator review; exact duplicates can be linked without deleting either original. Active protocols load their pinned information sets directly and use a tenant- and policy-aware cache.
 
-Phase 3 adds bounded OAuth-backed Handler/Analyst/Agent execution loops, scoped Work Order evidence contracts, immutable results and Handler collection. See [execution contracts, API and limits](docs/EXECUTION.md). External fetch and shell adapters, Master optimization, protocols, and the full interface are subsequent phases. An allowed capability with no adapter returns HTTP 501 and performs no action.
+The Korean operations console includes Tasks with Brief/Path/Broadcast/Knowledge/Outputs, Central, Protocols, Dreaming, Vault, and Settings. The dark visual theme has one editable accent color with contrast correction. The local console opens directly without a password or pairing code. An automatic HttpOnly session supports CSRF protection; a user login system is deferred.
+
+Agent tools include exact-URL read-only HTTP requests through a Vault-backed Secret Broker, immutable file artifacts, and a dedicated Linux Worker. Shell children run under an unprivileged UID, with resource limits, no network syscalls, no credentials or host mounts, and a temporary job directory. Initial document workflows use UTF-8 Markdown, CSV and source files; arbitrary Office/PDF processing adapters are outside this beta.
+
+See the [beta guide and API contracts](docs/BETA.md), [execution contracts](docs/EXECUTION.md), and [implementation evidence](docs/IMPLEMENTATION.md). Vector search, object storage, WCM, app-server, additional business write connectors and remote multi-user hosting remain the optional extensions identified in the design.
 
 The initial model connection uses the official Sign in with ChatGPT route. It does not reuse another application's Codex credentials, call private ChatGPT inference endpoints, or silently fall back to a billed API key.
 
@@ -31,9 +35,10 @@ From the repository root, run:
 ./scripts/Initialize-Local.ps1
 ./scripts/Verify-Roles.ps1
 ./scripts/Start-Login.ps1
+./scripts/Open-Console.ps1
 ```
 
-The last command opens the official account selector and consent flow. After the callback reports success:
+Start-Login opens the official account selector and consent flow for model access. Open-Console opens the local workspace directly. After the OAuth callback reports success:
 
 ```powershell
 ./scripts/Verify-LiveOAuth.ps1
@@ -41,7 +46,7 @@ The last command opens the official account selector and consent flow. After the
 
 The live verifier uses the connected account's model catalog, completes a fixed synthetic inference, sends four concurrent refresh requests for the same generation, then completes another inference. It must observe response.completed for success. A listed model is not sufficient proof of access.
 
-The control page is available at http://127.0.0.1:18431. Operational APIs require a local operator credential. Do not publish this localhost setup directly to the internet.
+The console is available at http://127.0.0.1:18431. Anyone using this local console has operator access; there is no user authentication gate. Browser sessions are issued automatically and cookie mutations require a CSRF token. Direct automation uses the local operator credential, while model roles still require signed scope tokens. This installation targets one local operator with loopback-only port binding.
 
 ## Credentials and storage
 
@@ -52,6 +57,8 @@ The local Vault instance uses persistent file storage on an internal Docker netw
 After restarting a sealed Vault, rerun Initialize-Local.ps1 -SkipBuild to restore it and rotate the scoped application token. Keep an independent protected backup of the recovery material; DPAPI recovery is tied to the Windows user and machine.
 
 All .runtime content is private and ignored by Git and Docker. Keep evidence, credentials and database volumes out of public issues and commits.
+
+`./scripts/Backup-Local.ps1 -VerifyRestore` stops this project's writers, creates separate database/artifact and encrypted Vault-storage archives, and restores the database into an empty isolated verification container. It then restores the working stack. Keep independent protected recovery material: this command does not include unseal credentials or rehearse a Vault disaster restore.
 
 ## Verification
 
@@ -74,6 +81,16 @@ GitHub CI runs this database test separately; the database test is intentionally
 Run `./scripts/Verify-ContextPacks.ps1 -RestartCore` to verify the Context Pack request, curation, reference resolution, evidence pinning and scope boundaries through actual authenticated HTTP calls. The isolated PostgreSQL verification also covers Context Packs and concurrent delivery retries.
 
 Run `./scripts/Verify-LLMLoop.ps1` with an explicitly connected account to execute an owned synthetic task through all three actual model roles, verify evidence and failure history delivery, retrieve the Agent result, and exercise role/scope and call-budget limits. This makes real ChatGPT-plan inference requests; raw evidence remains private.
+
+Run `./scripts/Verify-Beta.ps1` for the actual broker, Vault rotation, Worker limits, artifact replay and console session boundaries. `./scripts/Verify-WorkScenarios.ps1` makes real OAuth calls for report generation, constrained source changes, request classification, Master protocol proposals and protocol reuse. It measures a controlled Handler/Agent baseline, Analyst selection and protocol reuse, with setup/audit costs shown separately. `./scripts/Verify-Recovery.ps1` deliberately interrupts only this project's core while a synthetic Worker job is running, then checks explicit resume, a single job execution, and SSE cursor replay. Run recovery when no unrelated Echelon Task is active.
+
+Compose's parallel build can reject non-ASCII Windows workspace paths on some Docker Desktop versions. Initialize-Local uses sequential `docker build` commands for the same runtime and Worker targets. Direct commands are also available:
+
+```powershell
+docker build --target runtime -t echelon-nano:local .
+docker build --target worker -t echelon-nano-worker:local .
+./scripts/Initialize-Local.ps1 -SkipBuild
+```
 
 See [the design](docs/PLAN.ko.md), [Phase 0 validation](docs/PHASE0.md), [the knowledge API](docs/KNOWLEDGE.md), and [Context Packs and Phase 2 validation](docs/CONTEXT_PACKS.md). This is a new Rust implementation inspired by workflow concepts from Artex; it does not include Artex source code.
 

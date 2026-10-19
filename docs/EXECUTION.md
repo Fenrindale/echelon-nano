@@ -1,6 +1,6 @@
 # 실제 역할 LLM 실행 루프
 
-Phase 3는 이미 연결한 ChatGPT 계정으로 Handler → Analyst → Handler → Agent → Handler를 실행한다. 모델이 각 단계의 도구와 입력을 선택하고 Rust 서버가 역할·단계·회사·Task·Work Order·근거 범위를 검사한 뒤 기존 도메인 API로 전달한다. 프롬프트는 권한 부여 수단이 아니다.
+베타 0.2는 이미 연결한 ChatGPT 계정으로 Handler → Analyst → Handler → Agent → Handler를 실행하고, 선택한 지식 제출·Analyst 채택과 별도 Master 감사까지 연결한다. Rust 서버가 역할·단계·회사·Task·Work Order·근거 범위를 검사한다. 프롬프트는 권한 부여 수단이 아니다. 전체 운영 계약은 [베타 가이드](BETA.md)를 따른다.
 
 ## 실행 경로
 
@@ -10,7 +10,7 @@ Phase 3는 이미 연결한 ChatGPT 계정으로 Handler → Analyst → Handler
 4. Agent가 자기 Work Order를 조회한다. 계약에 지정한 버전의 문서·해시·출처·주의 이력이 증거 스냅샷으로 전달된다. Agent는 중앙 DB와 다른 Work Order를 탐색할 수 없다. 관찰을 남기고 근거가 연결된 결과를 반환한다.
 5. Handler가 저장된 Agent 결과를 다시 조회하고 목표 달성 여부를 판단한다. Agent의 blocked/failed 결과를 completed로 올릴 수 없다. 루프 완료와 업무 결과의 completed/blocked/failed는 별도 값이다.
 
-현재 Agent는 제공된 자료를 분석하고 결과를 작성한다. 외부 fetch와 shell은 계속 501이다. 실행 도구를 활성화하지 않았으므로 URL 접속·파일 수정·배포 등을 수행했다고 표시하지 않는다. Handler의 중앙 지식 제출·Analyst 채택 API는 유지되지만 이 실행 루프가 자동으로 채택을 진행하지는 않는다. Master, 다중 Agent 병렬 실행, UI 실행 패널도 후속 범위다.
+Agent는 허용한 URL의 읽기, 격리 코드 실행과 실제 산출물 회수를 수행할 수 있다. `retain_knowledge`를 선택하면 Handler가 재사용 항목을 제출하고 Analyst가 지정한 제출만 채택·반려한다. `dream_after`는 이후 별도 Master 감사·정리 검토안 단계를 실행한다. 후처리 오류가 이미 확정된 업무 결과를 바꾸지 않는다. 한 Task의 Work Order는 순차 처리하며 여러 Task 실행은 서버의 동시성 한도 안에서 진행한다.
 
 ## 운영자 API
 
@@ -31,7 +31,7 @@ Phase 3는 이미 연결한 ChatGPT 계정으로 Handler → Analyst → Handler
 
 먼저 기존 API로 실제 Task를 만들고 연결 계정의 모델 카탈로그에서 모델을 선택한다. 같은 Task·request_id·설정의 재요청은 원래 run ID만 반환한다. 설정이 달라지면 409다. 한 Task에서는 한 실행만 진행할 수 있다. 서버가 비동기로 실행하며 `GET /v1/operator/runs/{id}`로 상태, 역할별 호출·도구 이벤트, Pack/Work Order ID와 최종 결과를 조회한다. 내부 모델 대화 전문과 자격증명은 이 응답에 포함하지 않는다.
 
-상태는 `running`, `completed`, `failed`, `exhausted`, `interrupted`다. `completed` 상태에서도 `result.outcome`을 확인해야 한다. 호출·도구 이벤트는 append-only다. Work Order 결과는 행 잠금과 고유 키로 한 번만 확정하고 수정·삭제·TRUNCATE를 거부한다.
+상태는 `queued`, `running`, `paused`, `cancelled`, `completed`, `failed`, `exhausted`, `interrupted`다. `completed` 상태에서도 `result.outcome`을 확인해야 한다. Work Order 계약·결과, 관찰, 완료 효과와 도구 이벤트는 불변 이력이다. `POST /v1/operator/runs/{id}/control`의 `action`은 `pause`, `resume`, `cancel`이다.
 
 ## 모델 연결과 제한
 
@@ -41,7 +41,7 @@ Responses 요청은 `store:false`, `stream:true`, 입력 배열, namespace 안�
 
 설정한 호출 수는 1–48회, 누적 토큰 예산은 1,000–300,000이다. 총 실행은 30분, 개별 HTTP 추론은 120초, 스트림은 2 MiB, 모델 입력은 256 KiB로 제한한다. OAuth 경로는 `max_output_tokens`를 지원하지 않으므로 토큰 예산은 완료된 응답의 usage로 확인하며 한 응답만큼 초과할 수 있다. 이는 제공자 과금 상한 기능이 아니다.
 
-도구 호출 직전에 pending 이벤트, 성공 후 결과와 체크포인트를 저장한다. DB·감사 오류는 이미 효과가 발생했을 가능성이 있으므로 즉시 멈춘다. 서버 재시작 시 진행 중 실행은 interrupted로 표시하며 자동 재시도하거나 중간 도구 효과를 재생하지 않는다. 마지막 체크포인트 뒤에 생성된 Pack·Work Order가 있다면 운영자가 감사 기록을 확인한 뒤 새 요청 키로 재실행해야 한다. 자동 재개와 분산 실행 보장은 아직 제공하지 않는다.
+효과 실행 전에 모델 결정과 체크포인트·pending 원장을 저장한다. 효과는 run/call ID에서 고정 키를 얻고 같은 ID의 다른 요청은 거부한다. DB·감사 오류는 즉시 멈춘다. 서버 재시작 시 진행 중 기록은 interrupted로 표시하며 제공자 호출을 자동 반복하지 않는다. 운영자의 명시적 재개는 완료 원장·기존 Pack·Work Order·산출물을 재사용한다. 살아 있는 Worker의 동일 작업은 원래 결과를 회수한다. 지원하는 재조정은 관찰용 GET와 임시 파일 작업뿐이다. 제공자 실패와 불완전 스트림은 멈추고, 완료 응답의 중첩 JSON 형식 오류만 효과 실행 없이 최대 세 번 보정한다.
 
 문서의 명령문은 증거 데이터로 취급한다. 도구 스키마에서 감춘 기능을 모델이 만들어 내도 동일한 서버 권한과 단계 검사를 받는다. 이는 모델이 항상 올바른 판단을 한다는 보장은 아니며, 분석 결과의 의미적 정확성은 별도 검토가 필요하다.
 
@@ -63,7 +63,9 @@ docker compose up -d --no-deps core
 
 LLM 검증은 명시적으로 연결한 계정에 실제 모델 요청을 보낸다. 합성 Data/Info/Intel과 실패한 이전 개정을 별도 tenant에 남긴다. 실제 세 역할의 완료 응답, Context Pack·참조·계획·지시·결과 회수, 과거 실패의 Agent 전달, 권한·Task 범위 거부와 1회 호출 예산 소진을 확인한다. 원본 실행 기록과 합성 자산 목록은 비공개 `.runtime/evidence`에 보관한다. 단위·격리 DB 테스트와 실제 계정 실행 결과는 구분해 보고한다.
 
-## 2026년 10월 19일 검증 결과
+## 이전 Phase 3 기술 검증 기록 · 2026년 10월 19일
+
+아래는 베타 확장 전 19기능·세 역할의 기록이다. 최신 22기능·네 역할·실무·복구 결과는 [구현 검증표](IMPLEMENTATION.md)를 따른다.
 
 | 검증 | 관찰 결과 |
 | --- | --- |

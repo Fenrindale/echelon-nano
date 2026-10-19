@@ -13,6 +13,10 @@ Read README.md, docs/PLAN.ko.md and docs/PHASE0.md before changing the architect
 - `scripts/Verify-LiveOAuth.ps1` requires an explicitly connected account and makes small real inference and refresh requests. Report its result separately from unit tests.
 - For role execution changes, run `scripts/Verify-LLMLoop.ps1` with the explicitly connected account. Preserve terminal-response gating, role/phase checks, pinned Work Order evidence, result collection, bounded calls and fail-stop restart behavior. Do not replay unknown provider or tool outcomes automatically.
 - Run `scripts/Test-PublicContent.ps1` and `git diff --check` before publishing.
+- For beta tools and console changes, run `scripts/Verify-Beta.ps1`. Changes to the full workflow also need `scripts/Verify-WorkScenarios.ps1` with the explicitly connected OAuth account. Keep the controlled performance sample and setup/retry costs distinguishable.
+- Verify checkpoint changes with `scripts/Verify-Recovery.ps1` when no other Echelon run is active; it intentionally kills only this project's core, preserves Worker state and checks explicit resume and SSE replay.
+- Worker children must inherit the child-only seccomp policy. The RPC controller's capabilities and token must never reach the unprivileged process. Do not add general network access, mounts or credentials to jobs.
+- Add new migrations after applied versions. Keep Work Order contracts, observations, completed effects and terminal execution checkpoints immutable.
 
 ## Boundaries
 

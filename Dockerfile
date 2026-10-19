@@ -1,4 +1,11 @@
 # syntax=docker/dockerfile:1
+FROM node:22.21.1-bookworm AS ui
+WORKDIR /web
+COPY web/package*.json ./
+RUN --mount=type=cache,target=/root/.npm npm ci --ignore-scripts
+COPY web ./
+RUN npm test && npm run build
+
 FROM rust:1.90-bookworm AS source
 WORKDIR /work
 COPY Cargo.toml rust-toolchain.toml ./
@@ -17,6 +24,7 @@ COPY --from=formatted /work/crates /crates
 
 FROM source AS checks
 COPY Cargo.lock ./
+COPY --from=ui /web/dist /work/ui-dist
 RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/work/target \
     cargo fmt --all --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo test --workspace --locked && \
     cargo test --test knowledge_db --no-run --locked --message-format=json > /tmp/knowledge-artifacts.json && \
@@ -31,6 +39,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,targe
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
 COPY --from=build /usr/local/bin/echelon /usr/local/bin/echelon
+COPY --from=ui /web/dist /app/ui
 USER 10001:10001
 EXPOSE 8080
 ENTRYPOINT ["/usr/local/bin/echelon"]
@@ -40,3 +49,9 @@ FROM runtime AS knowledge-tests
 COPY --from=checks /usr/local/bin/knowledge-db-tests /usr/local/bin/knowledge-db-tests
 ENTRYPOINT ["/usr/local/bin/knowledge-db-tests"]
 CMD ["--ignored", "--nocapture", "--test-threads=1"]
+
+FROM runtime AS worker
+USER 0:0
+RUN apt-get update && apt-get install -y --no-install-recommends python3 git libseccomp2 && rm -rf /var/lib/apt/lists/* && mkdir -p /root/.broker /jobs && chmod 0700 /root /root/.broker
+EXPOSE 9090
+CMD ["worker"]

@@ -93,6 +93,8 @@ pub struct Assessment {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Document {
+    #[serde(default = "allow_external", skip_serializing_if = "is_allowed")]
+    pub external_model_allowed: bool,
     pub category: Category,
     pub title: String,
     pub storage_mode: StorageMode,
@@ -110,9 +112,17 @@ pub struct Document {
     pub outcome: Outcome,
     #[serde(default = "current")]
     pub freshness: Freshness,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_until: Option<u64>,
     #[serde(default)]
     pub applicability: String,
     pub assessment: Option<Assessment>,
+}
+fn allow_external() -> bool {
+    true
+}
+fn is_allowed(v: &bool) -> bool {
+    *v
 }
 
 fn bounded(value: &str, max: usize) -> bool {
@@ -183,6 +193,7 @@ impl Document {
             || self.applicability.len() > 2000
             || self.sources.len() > 12
             || self.relations.len() > 32
+            || self.valid_until.is_some_and(|v| v == 0 || v > 253402300799)
         {
             return Err(invalid());
         }
@@ -279,6 +290,18 @@ impl Document {
         Ok(())
     }
 }
+pub fn effective_freshness(document: &Value) -> &str {
+    let explicit = document["freshness"].as_str().unwrap_or("current");
+    if explicit != "superseded"
+        && document["valid_until"]
+            .as_u64()
+            .is_some_and(|v| v <= crate::unix_time())
+    {
+        "expired"
+    } else {
+        explicit
+    }
+}
 
 #[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
@@ -354,7 +377,7 @@ enum ReadInput {
     },
 }
 
-async fn lock_tenant(tx: &mut Transaction<'_, Postgres>, tenant: Uuid) -> AppResult<()> {
+pub(crate) async fn lock_tenant(tx: &mut Transaction<'_, Postgres>, tenant: Uuid) -> AppResult<()> {
     // Serialize graph writes within one tenant, including concurrent dependency edits.
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('knowledge:' || $1::text,0))")
         .bind(tenant.to_string())
@@ -374,7 +397,7 @@ async fn event(
         .execute(&mut **tx).await.map_err(database)?;
     Ok(())
 }
-async fn check_relations(
+pub(crate) async fn check_relations(
     tx: &mut Transaction<'_, Postgres>,
     tenant: Uuid,
     item: Option<Uuid>,
@@ -424,6 +447,47 @@ pub async fn submit(pool: &PgPool, a: &Claims, input: &Value) -> AppResult<Value
                 return Err(invalid());
             }
             document.validate()?;
+            let contract: Value =
+                sqlx::query_scalar("SELECT contract FROM tasks WHERE tenant_id=$1 AND id=$2")
+                    .bind(a.tenant_id)
+                    .bind(a.task_id)
+                    .fetch_one(pool)
+                    .await
+                    .map_err(database)?;
+            if contract["model_access"] == "blocked" {
+                document.external_model_allowed = false;
+            }
+            for source in &document.sources {
+                let uri = url::Url::parse(&source.uri).map_err(|_| invalid())?;
+                if uri.scheme() == "artifact" {
+                    let artifact: Uuid = uri
+                        .host_str()
+                        .and_then(|h| Uuid::parse_str(h).ok())
+                        .ok_or_else(invalid)?;
+                    let row=sqlx::query("SELECT f.task_id,t.contract FROM artifacts f JOIN tasks t ON t.tenant_id=f.tenant_id AND t.id=f.task_id WHERE f.tenant_id=$1 AND f.id=$2").bind(a.tenant_id).bind(artifact).fetch_optional(pool).await.map_err(database)?.ok_or_else(missing)?;
+                    if row.get::<Uuid, _>("task_id") != a.task_id {
+                        let permitted:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM context_pack_refs p JOIN knowledge_revisions r ON r.tenant_id=p.tenant_id AND r.item_id=p.item_id AND r.version=p.version WHERE p.tenant_id=$1 AND p.task_id=$2 AND r.document->'sources' @> $3::jsonb)").bind(a.tenant_id).bind(a.task_id).bind(json!([{"uri":source.uri}])).fetch_one(pool).await.map_err(database)?;
+                        if !permitted {
+                            return Err(AppError::forbidden("artifact_source_scope_denied"));
+                        }
+                    }
+                    if row.get::<Value, _>("contract")["model_access"] == "blocked" {
+                        document.external_model_allowed = false;
+                    }
+                }
+            }
+            for relation in &document.relations {
+                let allowed:Option<bool>=sqlx::query_scalar("SELECT k.external_model_allowed AND COALESCE((r.document->>'external_model_allowed')::bool,true) FROM knowledge_revisions r JOIN knowledge_items k ON k.tenant_id=r.tenant_id AND k.id=r.item_id WHERE r.tenant_id=$1 AND r.item_id=$2 AND r.version=$3").bind(a.tenant_id).bind(relation.target_id).bind(relation.target_version).fetch_optional(pool).await.map_err(database)?;
+                if allowed == Some(false) {
+                    document.external_model_allowed = false;
+                }
+            }
+            if let Some(target) = target_id {
+                let allowed:Option<bool>=sqlx::query_scalar("SELECT COALESCE((r.document->>'external_model_allowed')::bool,true) FROM knowledge_items k JOIN knowledge_revisions r ON r.tenant_id=k.tenant_id AND r.item_id=k.id AND r.version=k.version WHERE k.tenant_id=$1 AND k.id=$2").bind(a.tenant_id).bind(target).fetch_optional(pool).await.map_err(database)?;
+                if allowed == Some(false) {
+                    document.external_model_allowed = false;
+                }
+            }
             let value = encoded(&document)?;
             let mut tx = pool.begin().await.map_err(database)?;
             // Retrying the same Task request must not create another queue entry.
@@ -525,6 +589,10 @@ pub async fn publish(pool: &PgPool, a: &Claims, input: &Value) -> AppResult<Valu
                 1
             };
             let mut document: Document = parse(&row.get::<Value, _>("document"))?;
+            let blocked:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM tasks WHERE tenant_id=$1 AND id=$2 AND contract->>'model_access'='blocked')").bind(a.tenant_id).bind(row.get::<Uuid,_>("source_task_id")).fetch_one(&mut *tx).await.map_err(database)?;
+            if blocked {
+                document.external_model_allowed = false;
+            }
             if let Some(category) = req.category {
                 document.category = category;
             }
@@ -612,7 +680,7 @@ pub async fn classify(pool: &PgPool, a: &Claims, input: &Value) -> AppResult<Val
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn append_revision(
+pub(crate) async fn append_revision(
     tx: &mut Transaction<'_, Postgres>,
     a: &Claims,
     id: Uuid,
@@ -644,6 +712,11 @@ async fn append_revision(
     sqlx::query("UPDATE knowledge_items SET version=$3,category=$4,title=$5,truth_state=$6,outcome=$7,updated_at=now() WHERE tenant_id=$1 AND id=$2")
         .bind(a.tenant_id).bind(id).bind(version).bind(label(&doc.category)?).bind(&doc.title).bind(label(&doc.truth_state)?).bind(label(&doc.outcome)?)
         .execute(&mut **tx).await.map_err(database)?;
+    let related: Vec<Uuid> = doc.relations.iter().map(|r| r.target_id).collect();
+    let restricted:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM knowledge_items WHERE tenant_id=$1 AND id=ANY($2) AND NOT external_model_allowed)").bind(a.tenant_id).bind(related).fetch_one(&mut **tx).await.map_err(database)?;
+    if !doc.external_model_allowed || restricted {
+        sqlx::query("WITH RECURSIVE restricted(id) AS (SELECT $2::uuid UNION SELECT e.source_id FROM knowledge_edges e JOIN restricted r ON r.id=e.target_id WHERE e.tenant_id=$1) UPDATE knowledge_items SET external_model_allowed=false WHERE tenant_id=$1 AND id IN (SELECT id FROM restricted)").bind(a.tenant_id).bind(id).execute(&mut **tx).await.map_err(database)?;
+    }
     Ok(())
 }
 
@@ -693,18 +766,18 @@ pub async fn read(pool: &PgPool, a: &Claims, input: &Value) -> AppResult<Value> 
                         .replace('_', "\\_")
                 )
             });
-            let rows=sqlx::query("SELECT k.id,k.version,r.document,EXISTS(SELECT 1 FROM knowledge_revisions h WHERE h.tenant_id=k.tenant_id AND h.item_id=k.id AND (h.document->>'truth_state'='refuted' OR h.document->>'outcome'='failed')) AS has_negative_history FROM knowledge_items k JOIN knowledge_revisions r ON r.tenant_id=k.tenant_id AND r.item_id=k.id AND r.version=k.version WHERE k.tenant_id=$1 AND ($2::text IS NULL OR k.category=$2) AND NOT EXISTS(SELECT 1 FROM unnest($3::text[]) wanted(tag) WHERE NOT EXISTS(SELECT 1 FROM knowledge_tags t WHERE t.tenant_id=k.tenant_id AND t.item_id=k.id AND t.version=k.version AND t.tag=wanted.tag)) AND ($4::text IS NULL OR k.title ILIKE $4 OR r.document->>'content' ILIKE $4) AND (NOT $5 OR EXISTS(SELECT 1 FROM knowledge_revisions h WHERE h.tenant_id=k.tenant_id AND h.item_id=k.id AND (h.document->>'truth_state'='refuted' OR h.document->>'outcome'='failed'))) AND ($6::uuid IS NULL OR k.id>$6) ORDER BY k.id LIMIT $7")
+            let rows=sqlx::query("SELECT k.id,k.version,k.external_model_allowed,r.document,EXISTS(SELECT 1 FROM knowledge_revisions h WHERE h.tenant_id=k.tenant_id AND h.item_id=k.id AND (h.document->>'truth_state'='refuted' OR h.document->>'outcome'='failed')) AS has_negative_history FROM knowledge_items k JOIN knowledge_revisions r ON r.tenant_id=k.tenant_id AND r.item_id=k.id AND r.version=k.version WHERE k.tenant_id=$1 AND ($2::text IS NULL OR k.category=$2) AND NOT EXISTS(SELECT 1 FROM unnest($3::text[]) wanted(tag) WHERE NOT EXISTS(SELECT 1 FROM knowledge_tags t WHERE t.tenant_id=k.tenant_id AND t.item_id=k.id AND t.version=k.version AND t.tag=wanted.tag)) AND ($4::text IS NULL OR k.title ILIKE $4 OR r.document->>'content' ILIKE $4) AND (NOT $5 OR EXISTS(SELECT 1 FROM knowledge_revisions h WHERE h.tenant_id=k.tenant_id AND h.item_id=k.id AND (h.document->>'truth_state'='refuted' OR h.document->>'outcome'='failed'))) AND ($6::uuid IS NULL OR k.id>$6) ORDER BY k.id LIMIT $7")
                 .bind(a.tenant_id).bind(category.map(|c|label(&c)).transpose()?).bind(tags).bind(query).bind(negative_history).bind(after_id).bind(limit)
                 .fetch_all(pool).await.map_err(database)?;
             let items:Vec<Value>=rows.iter().map(|r| { let d:Value=r.get("document");json!({"id":r.get::<Uuid,_>("id"),"version":r.get::<i32,_>("version"),
-                "category":d["category"],"title":d["title"],"tags":d["tags"],"truth_state":d["truth_state"],"outcome":d["outcome"],"freshness":d["freshness"],"has_negative_history":r.get::<bool,_>("has_negative_history")}) }).collect();
+                "category":d["category"],"title":d["title"],"tags":d["tags"],"truth_state":d["truth_state"],"outcome":d["outcome"],"freshness":effective_freshness(&d),"external_model_allowed":r.get::<bool,_>("external_model_allowed"),"has_negative_history":r.get::<bool,_>("has_negative_history")}) }).collect();
             Ok(json!({"next_after_id":items.last().map(|v|v["id"].clone()),"items":items}))
         }
         ReadInput::Get { item_id, version } => {
             if version.is_some_and(|v| v < 1) {
                 return Err(invalid());
             }
-            let row=sqlx::query("SELECT r.*,r.created_at::text AS recorded_at FROM knowledge_items k JOIN knowledge_revisions r ON r.tenant_id=k.tenant_id AND r.item_id=k.id AND r.version=COALESCE($3,k.version) WHERE k.tenant_id=$1 AND k.id=$2")
+            let row=sqlx::query("SELECT r.*,k.external_model_allowed AS effective_model_access,r.created_at::text AS recorded_at FROM knowledge_items k JOIN knowledge_revisions r ON r.tenant_id=k.tenant_id AND r.item_id=k.id AND r.version=COALESCE($3,k.version) WHERE k.tenant_id=$1 AND k.id=$2")
                 .bind(a.tenant_id).bind(item_id).bind(version).fetch_optional(pool).await.map_err(database)?.ok_or_else(missing)?;
             let version: i32 = row.get("version");
             let mut warnings = dependency_warnings(pool, a.tenant_id, item_id, version).await?;
@@ -713,7 +786,7 @@ pub async fn read(pool: &PgPool, a: &Claims, input: &Value) -> AppResult<Value> 
             let negative=sqlx::query("SELECT version,document->>'truth_state' AS truth_state,document->>'outcome' AS outcome FROM knowledge_revisions WHERE tenant_id=$1 AND item_id=$2 AND (document->>'truth_state'='refuted' OR document->>'outcome'='failed') ORDER BY version DESC LIMIT 101")
                 .bind(a.tenant_id).bind(item_id).fetch_all(pool).await.map_err(database)?;
             Ok(
-                json!({"item":revision_json(&row),"dependency_warnings":warnings,"dependency_warnings_truncated":warnings_truncated,
+                json!({"item":revision_json(&row),"external_model_allowed":row.get::<bool,_>("effective_model_access"),"effective_freshness":effective_freshness(&row.get::<Value,_>("document")),"dependency_warnings":warnings,"dependency_warnings_truncated":warnings_truncated,
                     "negative_history_truncated":negative.len()>100,"negative_history":negative.iter().take(100).map(|r|json!({"version":r.get::<i32,_>("version"),"truth_state":r.get::<String,_>("truth_state"),"outcome":r.get::<String,_>("outcome")})).collect::<Vec<_>>()}),
             )
         }
@@ -783,7 +856,7 @@ async fn dependency_warnings(
     item: Uuid,
     version: i32,
 ) -> AppResult<Vec<Value>> {
-    let rows=sqlx::query("WITH RECURSIVE dependencies(item_id,version) AS (SELECT target_id,target_version FROM knowledge_edges WHERE tenant_id=$1 AND source_id=$2 AND source_version=$3 AND kind IN ('references','derived_from','depends_on') UNION SELECT e.target_id,e.target_version FROM knowledge_edges e JOIN dependencies d ON d.item_id=e.source_id AND d.version=e.source_version WHERE e.tenant_id=$1 AND e.kind IN ('references','derived_from','depends_on')) SELECT d.item_id,d.version AS pinned_version,k.version AS current_version,k.truth_state,k.outcome,r.document->>'freshness' AS freshness FROM dependencies d JOIN knowledge_items k ON k.tenant_id=$1 AND k.id=d.item_id JOIN knowledge_revisions r ON r.tenant_id=k.tenant_id AND r.item_id=k.id AND r.version=k.version WHERE k.version<>d.version OR k.truth_state='refuted' OR k.outcome='failed' OR r.document->>'freshness'<>'current' ORDER BY d.item_id,d.version LIMIT 101")
+    let rows=sqlx::query("WITH RECURSIVE dependencies(item_id,version) AS (SELECT target_id,target_version FROM knowledge_edges WHERE tenant_id=$1 AND source_id=$2 AND source_version=$3 AND kind IN ('references','derived_from','depends_on') UNION SELECT e.target_id,e.target_version FROM knowledge_edges e JOIN dependencies d ON d.item_id=e.source_id AND d.version=e.source_version WHERE e.tenant_id=$1 AND e.kind IN ('references','derived_from','depends_on')) SELECT d.item_id,d.version AS pinned_version,k.version AS current_version,k.truth_state,k.outcome,CASE WHEN r.document->>'freshness'='superseded' THEN 'superseded' WHEN (r.document->>'valid_until')::bigint<=extract(epoch from now()) THEN 'expired' ELSE r.document->>'freshness' END AS freshness FROM dependencies d JOIN knowledge_items k ON k.tenant_id=$1 AND k.id=d.item_id JOIN knowledge_revisions r ON r.tenant_id=k.tenant_id AND r.item_id=k.id AND r.version=k.version WHERE k.version<>d.version OR k.truth_state='refuted' OR k.outcome='failed' OR r.document->>'freshness'<>'current' OR (r.document->>'valid_until')::bigint<=extract(epoch from now()) ORDER BY d.item_id,d.version LIMIT 101")
         .bind(tenant).bind(item).bind(version).fetch_all(pool).await.map_err(database)?;
     Ok(rows.iter().map(|r|json!({"item_id":r.get::<Uuid,_>("item_id"),"pinned_version":r.get::<i32,_>("pinned_version"),"current_version":r.get::<i32,_>("current_version"),"truth_state":r.get::<String,_>("truth_state"),"outcome":r.get::<String,_>("outcome"),"freshness":r.get::<String,_>("freshness")})).collect())
 }

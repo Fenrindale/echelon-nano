@@ -40,6 +40,10 @@ pub enum Capability {
     WorkOrderRead,
     #[serde(rename = "work_order.complete")]
     WorkOrderComplete,
+    #[serde(rename = "artifact.read")]
+    ArtifactRead,
+    #[serde(rename = "artifact.write")]
+    ArtifactWrite,
     #[serde(rename = "task.observe")]
     TaskObserve,
     #[serde(rename = "external.fetch")]
@@ -50,6 +54,8 @@ pub enum Capability {
     KnowledgeOptimize,
     #[serde(rename = "protocol.manage")]
     ProtocolManage,
+    #[serde(rename = "protocol.read")]
+    ProtocolRead,
     #[serde(rename = "audit.read")]
     AuditRead,
     #[serde(rename = "audit.rewrite")]
@@ -58,7 +64,7 @@ pub enum Capability {
     VaultRawRead,
 }
 
-pub const ALL: [Capability; 19] = [
+pub const ALL: [Capability; 22] = [
     Capability::KnowledgeRead,
     Capability::KnowledgeClassify,
     Capability::KnowledgePublish,
@@ -70,11 +76,14 @@ pub const ALL: [Capability; 19] = [
     Capability::AgentDelegate,
     Capability::WorkOrderRead,
     Capability::WorkOrderComplete,
+    Capability::ArtifactRead,
+    Capability::ArtifactWrite,
     Capability::TaskObserve,
     Capability::ExternalFetch,
     Capability::ShellExec,
     Capability::KnowledgeOptimize,
     Capability::ProtocolManage,
+    Capability::ProtocolRead,
     Capability::AuditRead,
     Capability::AuditRewrite,
     Capability::VaultRawRead,
@@ -85,7 +94,7 @@ pub fn role_allows(role: Role, action: Capability) -> bool {
     match role {
         Role::Analyst => matches!(
             action,
-            KnowledgeRead | KnowledgeClassify | KnowledgePublish | ContextCurate
+            KnowledgeRead | KnowledgeClassify | KnowledgePublish | ContextCurate | ProtocolRead
         ),
         Role::Handler => matches!(
             action,
@@ -95,14 +104,21 @@ pub fn role_allows(role: Role, action: Capability) -> bool {
                 | KnowledgeSubmit
                 | AgentDelegate
                 | WorkOrderRead
+                | ArtifactRead
         ),
         Role::Agent => matches!(
             action,
-            TaskObserve | ExternalFetch | ShellExec | WorkOrderRead | WorkOrderComplete
+            TaskObserve
+                | ExternalFetch
+                | ShellExec
+                | WorkOrderRead
+                | WorkOrderComplete
+                | ArtifactRead
+                | ArtifactWrite
         ),
         Role::Master => matches!(
             action,
-            KnowledgeRead | KnowledgeOptimize | ProtocolManage | AuditRead
+            KnowledgeRead | KnowledgeOptimize | ProtocolManage | ProtocolRead | AuditRead
         ),
     }
 }
@@ -146,6 +162,7 @@ pub fn authorize(claims: &Claims, req: &ToolRequest) -> AppResult<()> {
             | Capability::ShellExec
             | Capability::TaskObserve
             | Capability::WorkOrderComplete
+            | Capability::ArtifactWrite
     ) {
         if claims.work_order_id.is_none() {
             return Err(AppError::forbidden("work_order_required"));

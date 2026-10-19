@@ -6,6 +6,8 @@ Initialize-PrivateDirectory $bootstrap
 Initialize-PrivateDirectory (Join-Path $script:RuntimeRoot 'roles')
 Initialize-PrivateDirectory (Join-Path $script:RuntimeRoot 'evidence')
 $passwordPath = Join-Path $bootstrap 'postgres-password'
+$workerPath = Join-Path $bootstrap 'worker-token'
+if (-not (Test-Path -LiteralPath $workerPath)) { Write-PrivateText $workerPath (New-RuntimeSecret) }
 if (-not (Test-Path -LiteralPath $passwordPath)) { Write-PrivateText $passwordPath (New-RuntimeSecret) }
 $operatorPath = Join-Path $script:RuntimeRoot 'operator.dpapi'
 if (Test-Path -LiteralPath $operatorPath) { $operator = Get-OperatorToken }
@@ -21,7 +23,13 @@ if (Test-Path -LiteralPath $recoveryProtected) {
     [IO.File]::WriteAllBytes($recoveryPlain, (Unprotect-RuntimeBytes $recoveryProtected))
 }
 try {
-    if (-not $SkipBuild) { Invoke-Compose @('build','core','bootstrap') }
+    if (-not $SkipBuild) {
+        # Direct builds also support Windows workspaces whose path contains non-ASCII characters.
+        & docker build --target runtime -t echelon-nano:local $script:ProjectRoot
+        if($LASTEXITCODE -ne 0){throw 'Core runtime build failed.'}
+        & docker build --target worker -t echelon-nano-worker:local $script:ProjectRoot
+        if($LASTEXITCODE -ne 0){throw 'Worker runtime build failed.'}
+    }
     Invoke-Compose @('up','-d','postgres','vault')
     Start-Sleep -Seconds 2
     Invoke-Compose @('run','--rm','bootstrap')
@@ -33,7 +41,7 @@ try {
     if (Test-Path -LiteralPath $operatorInput) { Remove-Item -LiteralPath $operatorInput }
     $operator = $null
 }
-Invoke-Compose @('up','-d','--force-recreate','core')
+Invoke-Compose @('up','-d','--force-recreate','core','worker')
 $ready = $false
 for ($i=0; $i -lt 30; $i++) {
     try {

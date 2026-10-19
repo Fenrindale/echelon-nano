@@ -37,7 +37,7 @@ function Wait-Loop([string]$Id,[switch]$RefreshInFlight) {
     do {
         $value=Invoke-Echelon -Path "/v1/operator/runs/$Id"
         Write-PrivateText (Join-Path $script:RuntimeRoot 'evidence/llm-loop-latest.json') ($value | ConvertTo-Json -Depth 20)
-        if($value.status -ne 'running'){return $value}
+        if($value.status -notin @('queued','running')){return $value}
         $completed=@($value.events | Where-Object kind -eq 'model.completed')
         if($RefreshInFlight -and -not $refreshed -and $completed.Count -gt 0) {
             $generation=[long]$completed[0].details.credential_generation

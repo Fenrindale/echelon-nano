@@ -14,6 +14,8 @@ jobs:
         run: docker build --target checks .
       - name: Build the non-root runtime image
         run: docker build --target runtime -t echelon-nano:ci .
+      - name: Build the isolated Worker and its child syscall policy
+        run: docker build --target worker -t echelon-nano-worker:ci .
       - name: PostgreSQL knowledge, Context Packs, Work Orders and immutable history
         run: docker compose -f compose.verify.yaml up --build --abort-on-container-exit --exit-code-from tests
       - name: Remove the isolated verification containers

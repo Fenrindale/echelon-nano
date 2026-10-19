@@ -1,7 +1,7 @@
 use echelon_core::{
-    context, execution, knowledge,
+    context, execution, knowledge, maintenance,
     policy::{Claims, Role},
-    unix_time, work,
+    protocol, unix_time, work, workspace,
 };
 use serde_json::{Value, json};
 use sqlx::{PgPool, postgres::PgPoolOptions};
@@ -21,6 +21,373 @@ fn actor(tenant: Uuid, task: Uuid, role: Role) -> Claims {
         exp: unix_time() + 900,
         jti: Uuid::new_v4(),
     }
+}
+
+#[tokio::test]
+#[ignore = "requires the isolated compose.verify.yaml PostgreSQL database"]
+async fn beta_protocol_maintenance_artifacts_and_effect_history() {
+    let pool = PgPoolOptions::new()
+        .max_connections(12)
+        .connect(&std::env::var("DATABASE_URL").unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT current_database()")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        "echelon_verification"
+    );
+    sqlx::migrate!("../../migrations").run(&pool).await.unwrap();
+    let tenant = Uuid::new_v4();
+    let task = Uuid::new_v4();
+    let other = Uuid::new_v4();
+    sqlx::query("INSERT INTO tenants(id,name) VALUES($1,'Owned beta fixture')")
+        .bind(tenant)
+        .execute(&pool)
+        .await
+        .unwrap();
+    for t in [task, other] {
+        sqlx::query("INSERT INTO tasks(id,tenant_id,goal,contract) VALUES($1,$2,'Synthetic beta task','{\"max_work_orders\":2,\"allowed_tools\":[\"artifact.write\"]}')").bind(t).bind(tenant).execute(&pool).await.unwrap();
+    }
+    let h = actor(tenant, task, Role::Handler);
+    let a = actor(tenant, task, Role::Analyst);
+    let m = actor(tenant, task, Role::Master);
+    let file = workspace::put_artifact(
+        &pool,
+        &h,
+        &json!({"request_id":Uuid::new_v4(),"name":"input.txt","content":"Owned input"}),
+        true,
+    )
+    .await
+    .unwrap();
+    let file_id = id(&file["artifact"]["id"]);
+    assert!(
+        workspace::artifact(&pool, &actor(tenant, other, Role::Handler), file_id)
+            .await
+            .is_err()
+    );
+    assert!(
+        workspace::put_artifact(
+            &pool,
+            &a,
+            &json!({"request_id":Uuid::new_v4(),"name":"x","content":"forbidden"}),
+            false
+        )
+        .await
+        .is_err()
+    );
+    let first = accept(&pool, &a, &submit(&pool, &h, source(), None).await).await;
+    let first_id = id(&first["submission"]["item_id"]);
+    let second = accept(&pool, &a, &submit(&pool, &h, source(), None).await).await;
+    let second_id = id(&second["submission"]["item_id"]);
+    let duplicate = maintenance::optimize(&pool, &m, &json!({"op":"deduplicate"}))
+        .await
+        .unwrap();
+    assert_eq!(duplicate["linked"].as_array().unwrap().len(), 1);
+    let protocol_doc = json!({"codename":"알파","description":"Owned report procedure","references":[{"item_id":first_id,"version":1,"required":true}],"steps":["Read pinned evidence","Create report"],"completion_conditions":["Cited report exists"],"owner":"fixture","status":"candidate","source_tasks":[task]});
+    let proposal=maintenance::propose(&pool,&m,&json!({"request_id":Uuid::new_v4(),"kind":"protocol","reason":"Repeated owned procedure","payload":{"protocol_id":null,"expected_version":null,"document":protocol_doc}})).await.unwrap();
+    let proposal_id = id(&proposal["proposal_id"]);
+    assert!(maintenance::propose(&pool, &a, &json!({})).await.is_err());
+    let decision = maintenance::decide(
+        &pool,
+        maintenance::Decision {
+            tenant_id: tenant,
+            proposal_id,
+            accept: true,
+            reason: "Reviewed fixture".into(),
+            activate_protocol: true,
+        },
+    )
+    .await
+    .unwrap();
+    let protocol_id = id(&decision["decision"]["changes"][0]["protocol_id"]);
+    let p = protocol::load(&pool, tenant, protocol_id, None)
+        .await
+        .unwrap();
+    assert_eq!(p["document"]["status"], "active");
+    assert_eq!(p["document"]["references"][0]["version"], 2);
+    let cached = protocol::load(&pool, tenant, protocol_id, None)
+        .await
+        .unwrap();
+    assert_eq!(cached["cache_hit"], true);
+    assert_eq!(cached["cache_key"], p["cache_key"]);
+    let tagged = get(&pool, &a, first_id).await;
+    assert!(
+        tagged["item"]["document"]["tags"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("프로토콜:알파"))
+    );
+    assert!(
+        protocol::load(&pool, Uuid::new_v4(), protocol_id, None)
+            .await
+            .is_err()
+    );
+    let request=context::request(&pool,&h,&json!({"request_id":Uuid::new_v4(),"criteria":{"need":"Protocol direct load","protocol_id":protocol_id}})).await.unwrap();
+    let delivered = context::curate(
+        &pool,
+        &a,
+        &json!({"op":"deliver","request_id":request["request"]["id"],"selections":[]}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(delivered["pack"]["selection_mode"], "protocol_direct");
+    assert!(delivered["pack"]["reference_count"].as_u64().unwrap() > 0);
+    let mut revised = tagged["item"]["document"].clone();
+    revised["content"] = json!("Updated owned instruction");
+    revised["storage_mode"] = json!("hybrid");
+    accept(
+        &pool,
+        &a,
+        &submit(&pool, &h, revised, Some((first_id, 2))).await,
+    )
+    .await;
+    let changed = protocol::load(&pool, tenant, protocol_id, None)
+        .await
+        .unwrap();
+    assert_eq!(changed["review_required"], true);
+    assert_ne!(changed["cache_key"], p["cache_key"]);
+    assert_eq!(changed["document"]["references"][0]["version"], 2);
+    let merge=maintenance::propose(&pool,&m,&json!({"request_id":Uuid::new_v4(),"kind":"merge","reason":"Reviewed semantic merge","payload":{"bases":[{"item_id":first_id,"version":3},{"item_id":second_id,"version":1}],"replacements":[{"target_id":null,"document":source()}]}})).await.unwrap();
+    let merge_id = id(&merge["proposal_id"]);
+    let merged = maintenance::decide(
+        &pool,
+        maintenance::Decision {
+            tenant_id: tenant,
+            proposal_id: merge_id,
+            accept: true,
+            reason: "Approved merge".into(),
+            activate_protocol: false,
+        },
+    )
+    .await
+    .unwrap();
+    let merged_id = id(&merged["decision"]["changes"][0]["item_id"]);
+    assert_eq!(
+        get(&pool, &a, first_id).await["item"]["document"]["freshness"],
+        "superseded"
+    );
+    assert_eq!(
+        get(&pool, &a, merged_id).await["item"]["document"]["relations"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let split=maintenance::propose(&pool,&m,&json!({"request_id":Uuid::new_v4(),"kind":"split","reason":"Split reviewed concepts","payload":{"bases":[{"item_id":merged_id,"version":1}],"replacements":[{"target_id":null,"document":source()},{"target_id":null,"document":source()}]}})).await.unwrap();
+    maintenance::decide(
+        &pool,
+        maintenance::Decision {
+            tenant_id: tenant,
+            proposal_id: id(&split["proposal_id"]),
+            accept: true,
+            reason: "Approved split".into(),
+            activate_protocol: false,
+        },
+    )
+    .await
+    .unwrap();
+    let verify=maintenance::propose(&pool,&m,&json!({"request_id":Uuid::new_v4(),"kind":"verification","reason":"Needs a separate work task","payload":{"item_id":first_id}})).await.unwrap();
+    maintenance::decide(
+        &pool,
+        maintenance::Decision {
+            tenant_id: tenant,
+            proposal_id: id(&verify["proposal_id"]),
+            accept: true,
+            reason: "Queue review only".into(),
+            activate_protocol: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM work_orders WHERE tenant_id=$1")
+            .bind(tenant)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        0
+    );
+    let order_request = json!({"request_id":Uuid::new_v4(),"target":"owned:files","objective":"Follow the selected pinned protocol","expected_output":"Owned artifact","references":[{"pack_id":delivered["pack"]["id"],"ref_id":delivered["pack"]["knowledge"][0]["ref_id"]}],"protocol_parameters":{}});
+    let wo = work::delegate(&pool, &h, &order_request).await.unwrap();
+    let bound = work::read(&pool, &h, &json!({"work_order_id":wo["work_order_id"]}))
+        .await
+        .unwrap();
+    assert_eq!(bound["contract"]["protocol"]["id"], json!(protocol_id));
+    assert_eq!(bound["contract"]["protocol"]["version"], 1);
+    assert_eq!(
+        bound["contract"]["protocol"]["steps"][0],
+        "Read pinned evidence"
+    );
+    let replay = work::delegate(&pool, &h, &order_request).await.unwrap();
+    assert_eq!(wo["work_order_id"], replay["work_order_id"]);
+    let mut agent = actor(tenant, task, Role::Agent);
+    agent.work_order_id = Some(id(&wo["work_order_id"]));
+    assert!(workspace::artifact(&pool, &agent, file_id).await.is_err());
+    let output_input =
+        json!({"request_id":Uuid::new_v4(),"name":"result.md","content":"Owned result"});
+    let output = workspace::put_artifact(&pool, &agent, &output_input, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        workspace::put_artifact(&pool, &agent, &output_input, false)
+            .await
+            .unwrap()["artifact"],
+        output["artifact"]
+    );
+    let mut conflict = output_input.clone();
+    conflict["content"] = json!("different");
+    assert_eq!(
+        workspace::put_artifact(&pool, &agent, &conflict, false)
+            .await
+            .unwrap_err()
+            .code,
+        "artifact_idempotency_conflict"
+    );
+    let private_task = actor(tenant, other, Role::Handler);
+    sqlx::query(
+        "UPDATE tasks SET contract=contract || '{\"model_access\":\"blocked\"}' WHERE id=$1",
+    )
+    .bind(other)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let private = accept(
+        &pool,
+        &a,
+        &submit(&pool, &private_task, source(), None).await,
+    )
+    .await;
+    let private_id = id(&private["submission"]["item_id"]);
+    let private_doc = get(&pool, &a, private_id).await;
+    assert_eq!(
+        private_doc["item"]["document"]["external_model_allowed"],
+        false
+    );
+    let mut derived = source();
+    derived["relations"] =
+        json!([{"kind":"derived_from","target_id":private_id,"target_version":1}]);
+    let derived = accept(&pool, &a, &submit(&pool, &h, derived, None).await).await;
+    assert_eq!(
+        get(&pool, &a, id(&derived["submission"]["item_id"])).await["item"]["document"]["external_model_allowed"],
+        false
+    );
+    let mut restricted_doc = get(&pool, &a, first_id).await["item"]["document"].clone();
+    restricted_doc["external_model_allowed"] = json!(false);
+    accept(
+        &pool,
+        &a,
+        &submit(&pool, &h, restricted_doc, Some((first_id, 4))).await,
+    )
+    .await;
+    let revoked = protocol::load(&pool, tenant, protocol_id, None)
+        .await
+        .unwrap();
+    assert_eq!(revoked["document"]["external_model_allowed"], false);
+    assert_ne!(revoked["cache_key"], changed["cache_key"]);
+    let private_proposal=maintenance::propose(&pool,&m,&json!({"request_id":Uuid::new_v4(),"kind":"revise","reason":"DO_NOT_TRANSMIT_PRIVATE_PROPOSAL","payload":{"bases":[{"item_id":first_id,"version":5}],"replacements":[{"target_id":first_id,"document":source()}]}})).await.unwrap();
+    let listed = maintenance::list(&pool, tenant).await.unwrap();
+    let pending = listed["proposals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["id"] == private_proposal["proposal_id"])
+        .unwrap();
+    assert_eq!(pending["external_model_allowed"], false);
+    let mut masked = pending.clone();
+    execution::sanitize_for_model(&mut masked);
+    assert!(
+        !masked
+            .to_string()
+            .contains("DO_NOT_TRANSMIT_PRIVATE_PROPOSAL")
+    );
+    let fixture_run = Uuid::new_v4();
+    sqlx::query("INSERT INTO execution_runs(id,tenant_id,task_id,request_key,config,state,status) VALUES($1,$2,$3,$4,'{}','{}','paused')").bind(fixture_run).bind(tenant).bind(task).bind(Uuid::new_v4()).execute(&pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO execution_actions(run_id,call_id,request) VALUES($1,'owned-call','{}')",
+    )
+    .bind(fixture_run)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE execution_actions SET outcome='{\"ok\":true}' WHERE run_id=$1")
+        .bind(fixture_run)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(
+        sqlx::query("UPDATE execution_actions SET outcome='{}' WHERE run_id=$1")
+            .bind(fixture_run)
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+    assert!(
+        sqlx::query("UPDATE execution_runs SET config='{\"untrusted\":true}' WHERE id=$1")
+            .bind(fixture_run)
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+    assert!(
+        sqlx::query("UPDATE work_orders SET target='different' WHERE id=$1")
+            .bind(agent.work_order_id)
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+    let mut timed_doc = source();
+    timed_doc["valid_until"] = json!(unix_time() + 3);
+    let timed = accept(&pool, &a, &submit(&pool, &h, timed_doc, None).await).await;
+    let timed_id = id(&timed["submission"]["item_id"]);
+    let mut timed_protocol = protocol_doc.clone();
+    timed_protocol["codename"] = json!("시계");
+    timed_protocol["status"] = json!("active");
+    timed_protocol["references"] = json!([{"item_id":timed_id,"version":1,"required":true}]);
+    let mut timed_tx = pool.begin().await.unwrap();
+    let written = protocol::write(
+        &mut timed_tx,
+        &m,
+        None,
+        None,
+        serde_json::from_value(timed_protocol).unwrap(),
+        "Owned deadline cache verification",
+    )
+    .await
+    .unwrap();
+    timed_tx.commit().await.unwrap();
+    let timed_protocol_id = id(&written["protocol_id"]);
+    let before_expiry = protocol::load(&pool, tenant, timed_protocol_id, None)
+        .await
+        .unwrap();
+    assert_eq!(before_expiry["review_required"], false);
+    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+    let after_expiry = protocol::load(&pool, tenant, timed_protocol_id, None)
+        .await
+        .unwrap();
+    assert_eq!(after_expiry["review_required"], true);
+    assert_ne!(after_expiry["cache_key"], before_expiry["cache_key"]);
+    let timed_item = get(&pool, &a, timed_id).await;
+    assert_eq!(timed_item["effective_freshness"], "expired");
+    assert_eq!(timed_item["item"]["document"]["freshness"], "current");
+    assert_eq!(timed_item["item"]["version"], 2);
+    for sql in [
+        "DELETE FROM artifacts WHERE tenant_id=$1",
+        "DELETE FROM protocol_revisions WHERE tenant_id=$1",
+        "UPDATE maintenance_proposals SET payload='{}' WHERE tenant_id=$1",
+        "DELETE FROM activity_events WHERE tenant_id=$1",
+        "DELETE FROM task_inputs WHERE tenant_id=$1",
+    ] {
+        if sql.contains("task_inputs") {
+            sqlx::query("INSERT INTO task_inputs(id,tenant_id,task_id,content) VALUES($1,$2,$3,'Owned note')").bind(Uuid::new_v4()).bind(tenant).bind(task).execute(&pool).await.unwrap();
+        }
+        assert!(
+            sqlx::query(sql).bind(tenant).execute(&pool).await.is_err(),
+            "{sql}"
+        );
+    }
+    pool.close().await;
 }
 fn id(value: &Value) -> Uuid {
     Uuid::parse_str(value.as_str().unwrap()).unwrap()

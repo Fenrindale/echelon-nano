@@ -85,19 +85,51 @@ services:
       VAULT_ADDR: http://vault:8200
       VAULT_TOKEN_FILE: /run/secrets/vault-core-token
       ECHELON_CALLBACK_URI: http://127.0.0.1:18431/auth/callback
-    secrets: [postgres-password, vault-core-token]
+    secrets: [postgres-password, vault-core-token, worker-token]
     depends_on:
       postgres:
         condition: service_healthy
       vault:
         condition: service_started
-    networks: [roles, data, secrets, provider]
+    networks: [roles, data, secrets, provider, tools]
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
     tmpfs: [/tmp]
     pids_limit: 128
     mem_limit: 512m
+
+  worker:
+    image: echelon-nano-worker:local
+    build:
+      context: .
+      target: worker
+    command: [worker]
+    user: '0:0'
+    volumes: [./.runtime/bootstrap/worker-token:/root/.broker/token:ro]
+    networks: [tools]
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [SETUID, SETGID, CHOWN, KILL, DAC_OVERRIDE]
+    security_opt: [no-new-privileges:true]
+    tmpfs: ["/jobs:rw,nosuid,nodev,size=32m,mode=0755"]
+    pids_limit: 64
+    mem_limit: 320m
+    cpus: 1.0
+
+  fixture:
+    image: echelon-nano-worker:local
+    profiles: [verify-api]
+    entrypoint: [/usr/bin/python3, /fixture/api.py]
+    command: []
+    user: '10003:10003'
+    volumes: [./scripts/fixtures/api.py:/fixture/api.py:ro]
+    networks: [tools]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 16
+    mem_limit: 64m
 
   analyst:
     <<: *role
@@ -124,6 +156,8 @@ networks:
   secrets:
     internal: true
   provider: {}
+  tools:
+    internal: true
 
 volumes:
   postgres-data: {}
@@ -134,3 +168,5 @@ secrets:
     file: ./.runtime/bootstrap/postgres-password
   vault-core-token:
     file: ./.runtime/bootstrap/vault-core-token
+  worker-token:
+    file: ./.runtime/bootstrap/worker-token

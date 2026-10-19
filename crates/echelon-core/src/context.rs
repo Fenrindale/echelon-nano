@@ -57,6 +57,10 @@ fn pagination(n: i64) -> AppResult<()> {
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Criteria {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    protocol_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    protocol_version: Option<i32>,
     need: String,
     #[serde(default)]
     query: String,
@@ -101,7 +105,12 @@ impl Criteria {
             Category::Intel => 2,
         });
         self.categories.dedup();
-        if self.tags.is_empty() && self.query.is_empty() {
+        if self.protocol_version.is_some_and(|v| v < 1)
+            || (self.protocol_id.is_none() && self.protocol_version.is_some())
+        {
+            return Err(invalid());
+        }
+        if self.tags.is_empty() && self.query.is_empty() && self.protocol_id.is_none() {
             return Err(AppError::bad("context_search_scope_required"));
         }
         Ok(())
@@ -146,7 +155,6 @@ impl Delivery {
         if self.selections.len() > 16
             || self.gaps.len() > 8
             || self.gaps.iter().any(|s| !bounded(s, 500))
-            || (self.selections.is_empty() && self.gaps.is_empty())
         {
             return Err(invalid());
         }
@@ -233,6 +241,14 @@ pub async fn request(pool: &PgPool, a: &Claims, input: &Value) -> AppResult<Valu
     require(a, Role::Handler)?;
     let mut req: RequestInput = parse(input)?;
     req.criteria.normalize()?;
+    if let Some(id) = req.criteria.protocol_id {
+        let p = crate::protocol::load(pool, a.tenant_id, id, req.criteria.protocol_version).await?;
+        if p["current_status"] != "active" || p["document"]["status"] != "active" {
+            return Err(conflict("protocol_not_active"));
+        }
+        req.criteria.protocol_version =
+            Some(serde_json::from_value(p["version"].clone()).map_err(|_| invalid())?);
+    }
     let criteria = encode(&req.criteria)?;
     let mut tx = pool.begin().await.map_err(database)?;
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))")
@@ -301,9 +317,12 @@ async fn matches(
         .map_err(database)
 }
 fn preview(document: &Value) -> Value {
+    if document["external_model_allowed"] == false {
+        return json!({"external_model_allowed":false,"title":document["title"]});
+    }
     let applicability = document["applicability"].as_str().unwrap_or_default();
     json!({"category":document["category"],"title":document["title"],"truth_state":document["truth_state"],
-        "outcome":document["outcome"],"freshness":document["freshness"],"applicability_excerpt":applicability.chars().take(120).collect::<String>(),
+        "outcome":document["outcome"],"freshness":crate::knowledge::effective_freshness(document),"valid_until":document["valid_until"],"applicability_excerpt":applicability.chars().take(120).collect::<String>(),
         "applicability_truncated":applicability.chars().count()>120})
 }
 pub async fn curate(pool: &PgPool, a: &Claims, input: &Value) -> AppResult<Value> {
@@ -369,6 +388,15 @@ pub async fn curate(pool: &PgPool, a: &Claims, input: &Value) -> AppResult<Value
             .map_err(database)?
             .ok_or_else(missing)?;
             let criteria: Criteria = parse(&criteria)?;
+            if let Some(id) = criteria.protocol_id {
+                let rows=sqlx::query("SELECT m.item_id,m.item_version AS version,r.document FROM protocol_members m JOIN knowledge_revisions r ON r.tenant_id=m.tenant_id AND r.item_id=m.item_id AND r.version=m.item_version WHERE m.tenant_id=$1 AND m.protocol_id=$2 AND m.protocol_version=$3 ORDER BY m.item_id,m.item_version LIMIT $4 OFFSET $5")
+                    .bind(a.tenant_id).bind(id).bind(criteria.protocol_version).bind(limit+1).bind(offset).fetch_all(&mut *tx).await.map_err(database)?;
+                let more = rows.len() > limit as usize;
+                let candidates=rows.iter().take(limit as usize).map(|r|{let d:Value=r.get("document");json!({"item_id":r.get::<Uuid,_>("item_id"),"version":r.get::<i32,_>("version"),"score":1,"preview":preview(&d)})}).collect::<Vec<_>>();
+                return Ok(
+                    json!({"candidates":candidates,"next_offset":if more{Some(offset+limit)}else{None},"selection_mode":"protocol_direct","protocol_id":id,"protocol_version":criteria.protocol_version}),
+                );
+            }
             let rows = matches(&mut tx, a.tenant_id, &criteria, false, limit + 1, offset).await?;
             let more = rows.len() > limit as usize;
             let candidates=rows.iter().take(limit as usize).map(|r|{let document:Value=r.get("document");json!({"item_id":r.get::<Uuid,_>("item_id"),"version":r.get::<i32,_>("version"),"score":r.get::<i64,_>("score"),"preview":preview(&document)})}).collect::<Vec<_>>();
@@ -406,7 +434,7 @@ fn negative(document: &Value) -> bool {
 fn caution(document: &Value) -> bool {
     negative(document)
         || document["truth_state"] == "conflicted"
-        || document["freshness"] != "current"
+        || crate::knowledge::effective_freshness(document) != "current"
 }
 
 const CLOSURE: &str = "WITH RECURSIVE closure(item_id,version) AS (SELECT * FROM unnest($2::uuid[],$3::int[]) UNION SELECT n.item_id,n.version FROM closure c CROSS JOIN LATERAL (SELECT e.target_id AS item_id,e.target_version AS version FROM knowledge_edges e WHERE e.tenant_id=$1 AND e.source_id=c.item_id AND e.source_version=c.version UNION SELECT r.item_id,r.version FROM knowledge_revisions r WHERE r.tenant_id=$1 AND r.item_id=c.item_id AND (r.document->>'truth_state'='refuted' OR r.document->>'outcome'='failed') UNION SELECT k.id,k.version FROM knowledge_items k WHERE k.tenant_id=$1 AND k.id=c.item_id UNION SELECT e.source_id,e.source_version FROM knowledge_edges e JOIN knowledge_items k ON k.tenant_id=e.tenant_id AND k.id=e.source_id AND k.version=e.source_version WHERE e.tenant_id=$1 AND e.target_id=c.item_id AND e.kind='contradicts') n) SELECT item_id,version FROM closure LIMIT $4";
@@ -447,6 +475,10 @@ async fn deliver(pool: &PgPool, a: &Claims, delivery: Delivery) -> AppResult<Val
         .await
         .map_err(database)?;
     let criteria: Criteria = parse(&row.get::<Value, _>("criteria"))?;
+    if criteria.protocol_id.is_none() && delivery.selections.is_empty() && delivery.gaps.is_empty()
+    {
+        return Err(invalid());
+    }
     let task: Uuid = row.get("task_id");
     let mut roots = BTreeMap::new();
     let mut seeds = BTreeSet::new();
@@ -462,17 +494,35 @@ async fn deliver(pool: &PgPool, a: &Claims, delivery: Delivery) -> AppResult<Val
         );
         seeds.insert((selected.item_id, selected.version));
     }
-    let matching_negative = matches(
-        &mut tx,
-        a.tenant_id,
-        &criteria,
-        true,
-        criteria.max_references + 1,
-        0,
-    )
-    .await?;
+    let matching_negative = if criteria.protocol_id.is_some() {
+        vec![]
+    } else {
+        matches(
+            &mut tx,
+            a.tenant_id,
+            &criteria,
+            true,
+            criteria.max_references + 1,
+            0,
+        )
+        .await?
+    };
     for r in matching_negative {
         seeds.insert((r.get("item_id"), r.get("version")));
+    }
+    if let Some(id) = criteria.protocol_id {
+        let members=sqlx::query("SELECT item_id,item_version FROM protocol_members WHERE tenant_id=$1 AND protocol_id=$2 AND protocol_version=$3 AND required")
+            .bind(a.tenant_id).bind(id).bind(criteria.protocol_version).fetch_all(&mut *tx).await.map_err(database)?;
+        for member in members {
+            let pair = (
+                member.get::<Uuid, _>("item_id"),
+                member.get::<i32, _>("item_version"),
+            );
+            seeds.insert(pair);
+            roots
+                .entry(pair)
+                .or_insert("Required protocol evidence".into());
+        }
     }
     if seeds.len() > criteria.max_references as usize {
         return Err(conflict("context_reference_budget_exceeded"));
@@ -538,7 +588,7 @@ async fn deliver(pool: &PgPool, a: &Claims, delivery: Delivery) -> AppResult<Val
         if document["truth_state"] == "conflicted" {
             codes.push("conflicted");
         }
-        if document["freshness"] != "current" {
+        if crate::knowledge::effective_freshness(&document) != "current" {
             codes.push("freshness_review");
         }
         if version != current {
@@ -559,7 +609,7 @@ async fn deliver(pool: &PgPool, a: &Claims, delivery: Delivery) -> AppResult<Val
     }
     let manifest = json!({"id":pack_id,"request_id":delivery.request_id,"task_id":task,"goal":row.get::<String,_>("goal_snapshot"),
         "need":criteria.need,"constraints":criteria.constraints,"knowledge":knowledge,"cautions":cautions,"gaps":delivery.gaps,
-        "reference_count":references.len(),"format":"echelon.context.v1"});
+        "reference_count":references.len(),"format":"echelon.context.v1","protocol_id":criteria.protocol_id,"protocol_version":criteria.protocol_version,"selection_mode":if criteria.protocol_id.is_some(){"protocol_direct"}else{"search"}});
     if serde_json::to_vec(&manifest).map_err(|_| invalid())?.len() > criteria.max_manifest_bytes {
         return Err(conflict("context_manifest_budget_exceeded"));
     }
@@ -616,7 +666,7 @@ pub async fn read(pool: &PgPool, a: &Claims, input: &Value) -> AppResult<Value> 
     }
 }
 async fn resolve(pool: &PgPool, a: &Claims, pack: Uuid, reference: Uuid) -> AppResult<Value> {
-    let row=sqlx::query("SELECT f.item_id,f.version,f.document_sha256,r.document,r.source_task_id,r.submission_id,r.created_at::text AS recorded_at,k.version AS current_version,k.truth_state,k.outcome,h.document->>'freshness' AS current_freshness FROM context_pack_refs f JOIN knowledge_revisions r ON r.tenant_id=f.tenant_id AND r.item_id=f.item_id AND r.version=f.version JOIN knowledge_items k ON k.tenant_id=f.tenant_id AND k.id=f.item_id JOIN knowledge_revisions h ON h.tenant_id=k.tenant_id AND h.item_id=k.id AND h.version=k.version WHERE f.tenant_id=$1 AND f.task_id=$2 AND f.pack_id=$3 AND f.id=$4")
+    let row=sqlx::query("SELECT f.item_id,f.version,f.document_sha256,r.document,r.source_task_id,r.submission_id,r.created_at::text AS recorded_at,k.version AS current_version,k.truth_state,k.outcome,CASE WHEN h.document->>'freshness'='superseded' THEN 'superseded' WHEN (h.document->>'valid_until')::bigint<=extract(epoch from now()) THEN 'expired' ELSE h.document->>'freshness' END AS current_freshness FROM context_pack_refs f JOIN knowledge_revisions r ON r.tenant_id=f.tenant_id AND r.item_id=f.item_id AND r.version=f.version JOIN knowledge_items k ON k.tenant_id=f.tenant_id AND k.id=f.item_id JOIN knowledge_revisions h ON h.tenant_id=k.tenant_id AND h.item_id=k.id AND h.version=k.version WHERE f.tenant_id=$1 AND f.task_id=$2 AND f.pack_id=$3 AND f.id=$4")
         .bind(a.tenant_id).bind(a.task_id).bind(pack).bind(reference).fetch_optional(pool).await.map_err(database)?.ok_or_else(missing)?;
     let document: Value = row.get("document");
     let hash: String = row.get("document_sha256");

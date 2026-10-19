@@ -17,6 +17,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     Serve,
+    Worker,
     Bootstrap {
         #[arg(long, default_value = "/bootstrap")]
         directory: PathBuf,
@@ -38,6 +39,7 @@ async fn main() {
         .init();
     let result = match Cli::parse().command {
         Command::Serve => server::run(Config::from_env()).await,
+        Command::Worker => echelon_core::worker::serve().await,
         Command::Bootstrap { directory } => bootstrap::run(&directory)
             .await
             .map(|status| println!("{status}")),

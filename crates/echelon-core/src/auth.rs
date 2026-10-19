@@ -713,7 +713,7 @@ impl OAuthService {
             .bearer_auth(&record.access_token)
             .json(
                 &json!({"model":model,"instructions":instructions,"input":input,
-                "tools":tools,"parallel_tool_calls":false,"store":false,"stream":true,
+                "tools":tools,"tool_choice":"required","parallel_tool_calls":false,"store":false,"stream":true,
                 "include":["reasoning.encrypted_content"]}),
             )
             .send()

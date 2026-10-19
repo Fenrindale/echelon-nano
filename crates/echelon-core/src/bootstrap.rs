@@ -103,6 +103,8 @@ pub async fn run(directory: &Path) -> anyhow::Result<Value> {
             .error_for_status()?;
     }
     let policy = r#"path "echelon/data/oauth/*" { capabilities = ["create","read","update"] }
+path "echelon/data/usersecrets/*" { capabilities = ["create","read","update"] }
+path "echelon/data/providerkeys/*" { capabilities = ["create","read","update"] }
 path "echelon/data/runtime/identity" { capabilities = ["read"] }
 path "echelon/data/runtime/keys" { capabilities = ["read"] }
 path "auth/token/renew-self" { capabilities = ["update"] }

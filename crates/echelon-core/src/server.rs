@@ -1,13 +1,15 @@
 use crate::{
     auth::{Callback, OAuthService, StartLogin},
     bootstrap::{RuntimeKeys, secret_hash},
+    broker,
     config::Config,
-    context,
+    console, context,
     error::{AppError, AppResult},
-    execution, knowledge,
+    execution, knowledge, maintenance,
     policy::{self, Capability, Claims, Role, ToolRequest},
+    protocol,
     store::{VaultStore, audit},
-    unix_time, work,
+    ui_auth, unix_time, work, workspace,
 };
 use axum::{
     Json, Router,
@@ -29,6 +31,7 @@ pub struct AppState {
     pub pool: PgPool,
     pub vault: VaultStore,
     pub oauth: OAuthService,
+    pub slots: Arc<tokio::sync::Semaphore>,
     keys: RuntimeKeys,
     signing_key: Vec<u8>,
 }
@@ -43,7 +46,11 @@ fn bearer(headers: &HeaderMap) -> AppResult<&str> {
         .ok_or_else(AppError::unauthorized)?;
     Ok(token)
 }
-fn operator(state: &AppState, headers: &HeaderMap) -> AppResult<()> {
+pub(crate) async fn operator(state: &AppState, headers: &HeaderMap) -> AppResult<()> {
+    if !headers.contains_key(header::AUTHORIZATION) {
+        ui_auth::session(state, headers).await?;
+        return Ok(());
+    }
     if !bool::from(
         secret_hash(bearer(headers)?)
             .as_bytes()
@@ -89,6 +96,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         pool,
         vault: vault.clone(),
         oauth,
+        slots: Arc::new(tokio::sync::Semaphore::new(2)),
         keys,
         signing_key,
     });
@@ -101,6 +109,14 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             }
         }
     });
+    let pending: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM execution_runs WHERE status='queued' ORDER BY created_at",
+    )
+    .fetch_all(&state.pool)
+    .await?;
+    for id in pending {
+        tokio::spawn(execution::drive(state.clone(), id));
+    }
     let app = router(state);
     let listener = tokio::net::TcpListener::bind(&config.listen).await?;
     tracing::info!(
@@ -129,6 +145,7 @@ async fn shutdown() {
 
 pub fn router(state: Shared) -> Router {
     Router::new()
+        .merge(console::routes())
         .route("/", get(home))
         .route("/healthz", get(health))
         .route("/readyz", get(ready))
@@ -148,8 +165,9 @@ pub fn router(state: Shared) -> Router {
         .route("/v1/tools/invoke", post(invoke))
         .route("/v1/operator/runs", post(start_run))
         .route("/v1/operator/runs/{id}", get(read_run))
-        .layer(DefaultBodyLimit::max(65536))
+        .layer(DefaultBodyLimit::max(2097152))
         .layer(middleware::from_fn(security_headers))
+        .layer(middleware::from_fn_with_state(state.clone(), ui_auth::csrf))
         .with_state(state)
 }
 async fn security_headers(request: axum::extract::Request, next: middleware::Next) -> Response {
@@ -158,11 +176,15 @@ async fn security_headers(request: axum::extract::Request, next: middleware::Nex
     headers.insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
     headers.insert("referrer-policy", "no-referrer".parse().unwrap());
     headers.insert("x-content-type-options", "nosniff".parse().unwrap());
-    headers.insert("content-security-policy","default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'".parse().unwrap());
+    headers.insert("content-security-policy","default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'".parse().unwrap());
     response
 }
-async fn home() -> Html<&'static str> {
-    Html(include_str!("home.html"))
+async fn home() -> Html<String> {
+    Html(
+        tokio::fs::read_to_string("/app/ui/index.html")
+            .await
+            .unwrap_or_else(|_| include_str!("home.html").to_owned()),
+    )
 }
 async fn health() -> Json<Value> {
     Json(json!({"status":"ok","version":env!("CARGO_PKG_VERSION")}))
@@ -178,14 +200,26 @@ async fn ready(State(state): State<Shared>) -> AppResult<Json<Value>> {
             "vault_unavailable",
         ));
     }
-    Ok(Json(json!({"status":"ready","database":true,"vault":true})))
+    let worker = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(1))
+        .build()
+        .map_err(|_| AppError::internal("worker_health_client_failed"))?
+        .get("http://worker:9090/healthz")
+        .send()
+        .await
+        .is_ok_and(|r| r.status().is_success());
+    Ok(Json(
+        json!({"status":"ready","database":true,"vault":true,"worker":worker}),
+    ))
 }
 async fn start_login(
     State(s): State<Shared>,
     h: HeaderMap,
     Json(req): Json<StartLogin>,
 ) -> AppResult<Json<crate::auth::LoginStart>> {
-    operator(&s, &h)?;
+    operator(&s, &h).await?;
     Ok(Json(s.oauth.start(req).await?))
 }
 async fn attempt(
@@ -193,7 +227,7 @@ async fn attempt(
     h: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<crate::auth::AttemptStatus>> {
-    operator(&s, &h)?;
+    operator(&s, &h).await?;
     Ok(Json(s.oauth.attempt(id).await?))
 }
 async fn callback(State(s): State<Shared>, Query(req): Query<Callback>) -> Response {
@@ -203,7 +237,7 @@ async fn callback(State(s): State<Shared>, Query(req): Query<Callback>) -> Respo
     }
 }
 async fn connections(State(s): State<Shared>, h: HeaderMap) -> AppResult<Json<Value>> {
-    operator(&s, &h)?;
+    operator(&s, &h).await?;
     Ok(Json(s.oauth.connections().await?))
 }
 #[derive(Deserialize)]
@@ -217,7 +251,7 @@ async fn refresh(
     Path(id): Path<String>,
     Json(req): Json<Refresh>,
 ) -> AppResult<Json<Value>> {
-    operator(&s, &h)?;
+    operator(&s, &h).await?;
     Ok(Json(
         s.oauth
             .refresh(&id, Some(req.expected_generation), true)
@@ -229,7 +263,7 @@ async fn models(
     h: HeaderMap,
     Path(id): Path<String>,
 ) -> AppResult<Json<Value>> {
-    operator(&s, &h)?;
+    operator(&s, &h).await?;
     Ok(Json(s.oauth.models(&id).await?))
 }
 #[derive(Deserialize)]
@@ -243,7 +277,7 @@ async fn probe(
     Path(id): Path<String>,
     Json(req): Json<Probe>,
 ) -> AppResult<Json<Value>> {
-    operator(&s, &h)?;
+    operator(&s, &h).await?;
     Ok(Json(s.oauth.probe(&id, &req.model).await?))
 }
 #[derive(Deserialize)]
@@ -252,17 +286,25 @@ struct CreateTask {
     tenant_id: Uuid,
     tenant_name: String,
     goal: String,
+    #[serde(default)]
+    contract: workspace::TaskContract,
 }
 async fn create_task(
     State(s): State<Shared>,
     h: HeaderMap,
     Json(req): Json<CreateTask>,
 ) -> AppResult<Json<Value>> {
-    operator(&s, &h)?;
-    if req.tenant_name.len() > 200 || req.goal.len() > 4000 {
+    operator(&s, &h).await?;
+    if req.tenant_name.trim().is_empty()
+        || req.goal.trim().is_empty()
+        || req.tenant_name.len() > 200
+        || req.goal.len() > 4000
+    {
         return Err(AppError::bad("input_too_large"));
     }
+    req.contract.validate()?;
     let id = Uuid::new_v4();
+    console::validate_contract(&s.pool, req.tenant_id, id, &req.contract).await?;
     let mut tx = s
         .pool
         .begin()
@@ -274,10 +316,11 @@ async fn create_task(
         .execute(&mut *tx)
         .await
         .map_err(|_| AppError::internal("task_create_failed"))?;
-    sqlx::query("INSERT INTO tasks(id,tenant_id,goal) VALUES($1,$2,$3)")
+    sqlx::query("INSERT INTO tasks(id,tenant_id,goal,contract) VALUES($1,$2,$3,$4)")
         .bind(id)
         .bind(req.tenant_id)
         .bind(req.goal)
+        .bind(json!(req.contract))
         .execute(&mut *tx)
         .await
         .map_err(|_| AppError::internal("task_create_failed"))?;
@@ -306,7 +349,7 @@ async fn issue_token(
     h: HeaderMap,
     Json(req): Json<IssueToken>,
 ) -> AppResult<Json<Value>> {
-    operator(&s, &h)?;
+    operator(&s, &h).await?;
     if req.ttl_seconds == 0
         || req.ttl_seconds > 900
         || req.targets.len() > 16
@@ -360,7 +403,7 @@ async fn whoami(State(s): State<Shared>, h: HeaderMap) -> AppResult<Json<Value>>
     ))
 }
 async fn matrix(State(s): State<Shared>, h: HeaderMap) -> AppResult<Json<Value>> {
-    operator(&s, &h)?;
+    operator(&s, &h).await?;
     Ok(Json(
         json!({"roles":([Role::Analyst,Role::Handler,Role::Agent,Role::Master].map(|role|json!({
             "role":role,"capabilities":policy::ALL.into_iter().filter(|action|policy::role_allows(role,*action)).collect::<Vec<_>>()
@@ -405,7 +448,7 @@ pub async fn invoke_as(s: &AppState, a: &Claims, req: &ToolRequest) -> AppResult
         return Err(error);
     }
     if a.role == Role::Agent {
-        let valid:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM work_orders WHERE id=$1 AND tenant_id=$2 AND task_id=$3 AND status='ready')")
+        let valid:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM work_orders w JOIN tasks t ON t.tenant_id=w.tenant_id AND t.id=w.task_id WHERE w.id=$1 AND w.tenant_id=$2 AND w.task_id=$3 AND w.status='ready' AND t.status NOT IN ('cancelled','paused','waiting_input','completed','failed','blocked'))")
             .bind(a.work_order_id).bind(a.tenant_id).bind(a.task_id).fetch_one(&s.pool).await.map_err(|_|AppError::internal("database_unavailable"))?;
         if !valid {
             return Err(AppError::forbidden("work_order_inactive"));
@@ -435,11 +478,21 @@ async fn dispatch(s: &AppState, a: &Claims, req: &ToolRequest) -> AppResult<Valu
         Capability::KnowledgeSubmit => knowledge::submit(&s.pool, a, &req.input).await,
         Capability::KnowledgePublish => knowledge::publish(&s.pool, a, &req.input).await,
         Capability::KnowledgeClassify => knowledge::classify(&s.pool, a, &req.input).await,
+        Capability::KnowledgeOptimize => maintenance::optimize(&s.pool, a, &req.input).await,
+        Capability::ProtocolRead => protocol::read(&s.pool, a, &req.input).await,
+        Capability::ProtocolManage => {
+            if a.role != Role::Master {
+                return Err(AppError::forbidden("role_denied"));
+            }
+            let mut input = req.input.clone();
+            input["kind"] = json!("protocol");
+            maintenance::propose(&s.pool, a, &input).await
+        }
         Capability::ContextRequest => context::request(&s.pool, a, &req.input).await,
         Capability::ContextCurate => context::curate(&s.pool, a, &req.input).await,
         Capability::ContextRead => context::read(&s.pool, a, &req.input).await,
         Capability::TaskPlan => {
-            sqlx::query("UPDATE tasks SET plan=$1,status='ready' WHERE id=$2 AND tenant_id=$3")
+            sqlx::query("UPDATE tasks SET plan=$1,status=CASE WHEN status='draft' THEN 'ready' ELSE status END,updated_at=now() WHERE id=$2 AND tenant_id=$3")
                 .bind(&req.input)
                 .bind(a.task_id)
                 .bind(a.tenant_id)
@@ -451,11 +504,36 @@ async fn dispatch(s: &AppState, a: &Claims, req: &ToolRequest) -> AppResult<Valu
         Capability::AgentDelegate => work::delegate(&s.pool, a, &req.input).await,
         Capability::WorkOrderRead => work::read(&s.pool, a, &req.input).await,
         Capability::WorkOrderComplete => work::complete(&s.pool, a, &req.input).await,
+        Capability::ExternalFetch | Capability::ShellExec => broker::invoke(s, a, req).await,
+        Capability::ArtifactRead => workspace::read_artifact(&s.pool, a, &req.input).await,
+        Capability::ArtifactWrite => {
+            let policy = broker::order_policy(&s.pool, a).await?;
+            if !policy.allowed_tools.iter().any(|t| t == "artifact.write") {
+                return Err(AppError::forbidden("work_tool_denied"));
+            }
+            workspace::put_artifact(&s.pool, a, &req.input, false).await
+        }
         Capability::TaskObserve => {
             let id = Uuid::new_v4();
-            sqlx::query("INSERT INTO observations(id,tenant_id,task_id,work_order_id,content) VALUES($1,$2,$3,$4,$5)")
-                .bind(id).bind(a.tenant_id).bind(a.task_id).bind(a.work_order_id).bind(&req.input)
+            let key: Option<Uuid> = req
+                .input
+                .get("request_id")
+                .map(|v| serde_json::from_value(v.clone()))
+                .transpose()
+                .map_err(|_| workspace::bad())?;
+            sqlx::query("INSERT INTO observations(id,tenant_id,task_id,work_order_id,content,request_key) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING")
+                .bind(id).bind(a.tenant_id).bind(a.task_id).bind(a.work_order_id).bind(&req.input).bind(key)
                 .execute(&s.pool).await.map_err(|_|AppError::internal("observation_failed"))?;
+            if let Some(key) = key {
+                let row=sqlx::query("SELECT id,content FROM observations WHERE tenant_id=$1 AND task_id=$2 AND work_order_id=$3 AND request_key=$4").bind(a.tenant_id).bind(a.task_id).bind(a.work_order_id).bind(key).fetch_one(&s.pool).await.map_err(workspace::db)?;
+                if row.get::<Value, _>("content") != req.input {
+                    return Err(AppError::new(
+                        StatusCode::CONFLICT,
+                        "observation_idempotency_conflict",
+                    ));
+                }
+                return Ok(json!({"observation_id":row.get::<Uuid,_>("id")}));
+            }
             Ok(json!({"observation_id":id}))
         }
         Capability::AuditRead => {
@@ -473,7 +551,7 @@ async fn dispatch(s: &AppState, a: &Claims, req: &ToolRequest) -> AppResult<Valu
     }
 }
 async fn operator_audit(State(s): State<Shared>, h: HeaderMap) -> AppResult<Json<Value>> {
-    operator(&s, &h)?;
+    operator(&s, &h).await?;
     let rows=sqlx::query("SELECT action,outcome,count(*) AS count FROM audit_records GROUP BY action,outcome ORDER BY action,outcome")
         .fetch_all(&s.pool).await.map_err(|_|AppError::internal("database_unavailable"))?;
     Ok(Json(
@@ -487,8 +565,8 @@ async fn start_run(
     h: HeaderMap,
     Json(req): Json<execution::StartRun>,
 ) -> AppResult<Json<Value>> {
-    operator(&s, &h)?;
-    let (value, fresh) = execution::start(&s.pool, &s.oauth, req).await?;
+    operator(&s, &h).await?;
+    let (value, fresh) = execution::start(&s, req).await?;
     if fresh {
         let id = serde_json::from_value(value["id"].clone())
             .map_err(|_| AppError::internal("run_id_invalid"))?;
@@ -501,6 +579,6 @@ async fn read_run(
     h: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<Value>> {
-    operator(&s, &h)?;
+    operator(&s, &h).await?;
     execution::read(&s.pool, id).await.map(Json)
 }
