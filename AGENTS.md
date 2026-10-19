@@ -9,6 +9,7 @@ Read README.md, docs/PLAN.ko.md and docs/PHASE0.md before changing the architect
 - On the configured Windows development machine, `scripts/Verify-Roles.ps1` creates owned synthetic records and checks actual dispatch and isolation.
 - Run the isolated PostgreSQL test with `docker compose -f compose.verify.yaml up --build --abort-on-container-exit --exit-code-from tests`, then remove only that verification project with `docker compose -f compose.verify.yaml down --remove-orphans`. Never point the destructive fixture test at the working database.
 - For knowledge changes, run `scripts/Verify-Knowledge.ps1 -RestartCore` against the local core. Preserve submitted payloads, negative evidence and prior revisions; use expected versions for updates.
+- For Context Packs, run `scripts/Verify-ContextPacks.ps1 -RestartCore`. Handler access must remain bound to an explicitly delivered pack, its target Task and its immutable references; keep the central knowledge.read capability unavailable to Handler.
 - `scripts/Verify-LiveOAuth.ps1` requires an explicitly connected account and makes small real inference and refresh requests. Report its result separately from unit tests.
 - Run `scripts/Test-PublicContent.ps1` and `git diff --check` before publishing.
 

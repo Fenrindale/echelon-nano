@@ -14,7 +14,7 @@ jobs:
         run: docker build --target checks .
       - name: Build the non-root runtime image
         run: docker build --target runtime -t echelon-nano:ci .
-      - name: PostgreSQL knowledge workflow and immutable history
+      - name: PostgreSQL knowledge, Context Packs and immutable history
         run: docker compose -f compose.verify.yaml up --build --abort-on-container-exit --exit-code-from tests
       - name: Remove the isolated verification containers
         if: always()

@@ -2,6 +2,7 @@ use crate::{
     auth::{Callback, OAuthService, StartLogin},
     bootstrap::{RuntimeKeys, secret_hash},
     config::Config,
+    context,
     error::{AppError, AppResult},
     knowledge,
     policy::{self, Capability, Claims, Role, ToolRequest},
@@ -426,6 +427,9 @@ async fn dispatch(s: &AppState, a: &Claims, req: &ToolRequest) -> AppResult<Valu
         Capability::KnowledgeSubmit => knowledge::submit(&s.pool, a, &req.input).await,
         Capability::KnowledgePublish => knowledge::publish(&s.pool, a, &req.input).await,
         Capability::KnowledgeClassify => knowledge::classify(&s.pool, a, &req.input).await,
+        Capability::ContextRequest => context::request(&s.pool, a, &req.input).await,
+        Capability::ContextCurate => context::curate(&s.pool, a, &req.input).await,
+        Capability::ContextRead => context::read(&s.pool, a, &req.input).await,
         Capability::TaskPlan => {
             sqlx::query("UPDATE tasks SET plan=$1,status='ready' WHERE id=$2 AND tenant_id=$3")
                 .bind(&req.input)

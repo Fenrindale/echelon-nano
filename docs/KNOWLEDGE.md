@@ -1,5 +1,7 @@
 # 중앙 지식 API와 Phase 1 검증
 
+이 문서는 Phase 1 중앙 지식 API와 검증 기록이다. 후속 Analyst→Handler 전달은 [Context Pack 문서](CONTEXT_PACKS.md)를 따른다.
+
 중앙 지식은 tenant 안에서 여러 Task가 공유한다. 고정 ID인 `knowledge_items`와 변경 불가 스냅샷인 `knowledge_revisions`를 분리했다. 태그와 참조도 개정별로 보관한다. Task는 출처이며 중앙 항목의 수명과 동일하지 않다.
 
 ## 저장과 분류

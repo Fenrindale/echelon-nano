@@ -1,5 +1,5 @@
 use echelon_core::{
-    knowledge,
+    context, knowledge,
     policy::{Claims, Role},
     unix_time,
 };
@@ -361,5 +361,418 @@ async fn central_knowledge_transactions_and_history() {
     .await
     .unwrap();
     assert_eq!(audit_count, 7);
+    pool.close().await;
+}
+
+fn pack_headers(pack: &Value) -> Vec<&Value> {
+    pack["knowledge"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(pack["cautions"].as_array().unwrap())
+        .collect()
+}
+async fn context_request(pool: &PgPool, h: &Claims, key: Uuid, extra: Value) -> Value {
+    let mut criteria =
+        json!({"need":"근거와 과거 실패를 확인하여 가상 보고서를 작성","tags":["시스템:예시"]});
+    for (key, value) in extra.as_object().unwrap() {
+        criteria[key] = value.clone();
+    }
+    context::request(pool, h, &json!({"request_id":key,"criteria":criteria}))
+        .await
+        .unwrap()
+}
+fn delivery(request: &Value, item: Uuid, version: i32) -> Value {
+    json!({"op":"deliver","request_id":request["request"]["id"],"selections":[{"item_id":item,"version":version,"reason":"Registered report rule and its evidence"}],"gaps":[]})
+}
+
+#[tokio::test]
+#[ignore = "requires the isolated compose.verify.yaml PostgreSQL database"]
+async fn context_packs_pin_evidence_and_scope_reference_access() {
+    let pool = PgPoolOptions::new()
+        .max_connections(8)
+        .connect(&std::env::var("DATABASE_URL").unwrap())
+        .await
+        .unwrap();
+    let db: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(db, "echelon_verification");
+    sqlx::migrate!("../../migrations").run(&pool).await.unwrap();
+    let tenant = Uuid::new_v4();
+    let foreign = Uuid::new_v4();
+    for t in [tenant, foreign] {
+        sqlx::query("INSERT INTO tenants(id,name) VALUES($1,'Context fixture')")
+            .bind(t)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    let source_task = Uuid::new_v4();
+    let handler_task = Uuid::new_v4();
+    let analyst_task = Uuid::new_v4();
+    let foreign_task = Uuid::new_v4();
+    for (t, task) in [
+        (tenant, source_task),
+        (tenant, handler_task),
+        (tenant, analyst_task),
+        (foreign, foreign_task),
+    ] {
+        sqlx::query(
+            "INSERT INTO tasks(id,tenant_id,goal) VALUES($1,$2,'Frozen synthetic Task goal')",
+        )
+        .bind(task)
+        .bind(t)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    let source_h = actor(tenant, source_task, Role::Handler);
+    let h = actor(tenant, handler_task, Role::Handler);
+    let a = actor(tenant, analyst_task, Role::Analyst);
+    let foreign_a = actor(foreign, foreign_task, Role::Analyst);
+    let base = submit(&pool, &source_h, source(), None).await;
+    let root = id(&accept(&pool, &a, &base).await["submission"]["item_id"]);
+    let rule_doc = json!({"category":"info","title":"가상 보고 규칙","storage_mode":"excerpt","content":"RULE_BODY_VERSION_ONE","tags":["시스템:예시"],"relations":[{"kind":"derived_from","target_id":root,"target_version":1}]});
+    let rule_sub = submit(&pool, &source_h, rule_doc.clone(), None).await;
+    let rule = id(&accept(&pool, &a, &rule_sub).await["submission"]["item_id"]);
+    let mut failure = source();
+    failure["truth_state"] = json!("refuted");
+    failure["outcome"] = json!("failed");
+    failure["assessment"] = json!({"conditions":"Fixture account","attempted_action":"Generate a fixture report","observed":"SYNTHETIC_FAILURE_DETAIL","reason":"Fixture grant absent","avoid":"Repeat with the same grant","retry_when":"The grant is independently proven"});
+    let failed = submit(&pool, &source_h, failure.clone(), Some((root, 1))).await;
+    accept(&pool, &a, &failed).await;
+    let corrected = submit(&pool, &source_h, source(), Some((root, 2))).await;
+    accept(&pool, &a, &corrected).await;
+    failure["title"] = json!("Separate matching failure");
+    let additional = submit(&pool, &source_h, failure.clone(), None).await;
+    let separate = id(&accept(&pool, &a, &additional).await["submission"]["item_id"]);
+    failure["tags"] = json!(["scope:unrelated"]);
+    let unrelated = submit(&pool, &source_h, failure, None).await;
+    let unrelated_id = id(&accept(&pool, &a, &unrelated).await["submission"]["item_id"]);
+    let opposition = json!({"category":"intel","title":"Registered counter-evidence","storage_mode":"excerpt","content":"COUNTER_EVIDENCE_BODY","tags":["scope:counter"],"relations":[{"kind":"contradicts","target_id":rule,"target_version":1}]});
+    let counter = submit(&pool, &source_h, opposition, None).await;
+    let counter_id = id(&accept(&pool, &a, &counter).await["submission"]["item_id"]);
+
+    let key = Uuid::new_v4();
+    let request = context_request(&pool, &h, key, json!({})).await;
+    assert_eq!(request["request"]["status"], "pending");
+    assert_eq!(
+        context_request(&pool, &h, key, json!({})).await["replayed"],
+        true
+    );
+    assert_eq!(
+        context::request(
+            &pool,
+            &h,
+            &json!({"request_id":key,"criteria":{"need":"Changed intent","tags":["시스템:예시"]}})
+        )
+        .await
+        .unwrap_err()
+        .code,
+        "context_request_conflict"
+    );
+    let request_id = request["request"]["id"].clone();
+    assert_eq!(
+        context::read(
+            &pool,
+            &source_h,
+            &json!({"op":"request","request_id":request_id})
+        )
+        .await
+        .unwrap_err()
+        .status
+        .as_u16(),
+        404
+    );
+    assert_eq!(
+        context::curate(
+            &pool,
+            &foreign_a,
+            &json!({"op":"request","request_id":request_id})
+        )
+        .await
+        .unwrap_err()
+        .status
+        .as_u16(),
+        404
+    );
+    let candidates = context::curate(
+        &pool,
+        &a,
+        &json!({"op":"candidates","request_id":request_id}),
+    )
+    .await
+    .unwrap();
+    assert!(
+        candidates["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["item_id"] == json!(root) && c["version"] == 2)
+    );
+    assert!(
+        !serde_json::to_string(&candidates)
+            .unwrap()
+            .contains("RULE_BODY_VERSION_ONE")
+    );
+    let query = delivery(&request, rule, 1);
+    let keyword_request = context_request(&pool, &h, Uuid::new_v4(), json!({"query":"보고"})).await;
+    let keyword_candidates = context::curate(
+        &pool,
+        &a,
+        &json!({"op":"candidates","request_id":keyword_request["request"]["id"]}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        keyword_candidates["candidates"].as_array().unwrap().len(),
+        1
+    );
+    assert_eq!(keyword_candidates["candidates"][0]["item_id"], json!(rule));
+    let literal_request = context_request(&pool, &h, Uuid::new_v4(), json!({"query":"%"})).await;
+    assert!(
+        context::curate(
+            &pool,
+            &a,
+            &json!({"op":"candidates","request_id":literal_request["request"]["id"]})
+        )
+        .await
+        .unwrap()["candidates"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        context::curate(&pool, &h, &query)
+            .await
+            .unwrap_err()
+            .status
+            .as_u16(),
+        403
+    );
+    let delivered = context::curate(&pool, &a, &query).await.unwrap();
+    let pack = &delivered["pack"];
+    let pack_id = id(&pack["id"]);
+    assert_eq!(
+        context::curate(&pool, &a, &json!({"op":"pack","pack_id":pack_id}))
+            .await
+            .unwrap()["pack"],
+        *pack
+    );
+    assert_eq!(
+        context::curate(&pool, &foreign_a, &json!({"op":"pack","pack_id":pack_id}))
+            .await
+            .unwrap_err()
+            .status
+            .as_u16(),
+        404
+    );
+    assert_eq!(pack["goal"], "Frozen synthetic Task goal");
+    assert_eq!(pack["reference_count"], 6);
+    let headers = pack_headers(pack);
+    assert!(!headers.iter().any(|r| r["item_id"] == json!(unrelated_id)));
+    assert!(
+        pack["cautions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["item_id"] == json!(root) && r["version"] == 2)
+    );
+    assert!(
+        pack["cautions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["item_id"] == json!(separate))
+    );
+    assert!(pack["cautions"].as_array().unwrap().iter().any(|r| {
+        r["item_id"] == json!(counter_id)
+            && r["reason_codes"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("contradiction_related"))
+    }));
+    let manifest_text = serde_json::to_string(pack).unwrap();
+    assert!(!manifest_text.contains("RULE_BODY_VERSION_ONE"));
+    assert!(!manifest_text.contains("SYNTHETIC_FAILURE_DETAIL"));
+    assert_eq!(
+        context::curate(&pool, &a, &query).await.unwrap()["pack"],
+        *pack
+    );
+    assert_eq!(
+        context::read(&pool, &h, &json!({"op":"pack","pack_id":pack_id}))
+            .await
+            .unwrap()["pack"],
+        *pack
+    );
+    let rule_ref = id(&headers
+        .iter()
+        .find(|r| r["item_id"] == json!(rule))
+        .unwrap()["ref_id"]);
+    let resolved = context::read(
+        &pool,
+        &h,
+        &json!({"op":"resolve","pack_id":pack_id,"ref_id":rule_ref}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(resolved["document"]["content"], "RULE_BODY_VERSION_ONE");
+    assert_eq!(resolved["links"].as_array().unwrap().len(), 1);
+    let root_ref = resolved["links"][0]["ref_id"].clone();
+    assert_eq!(
+        context::read(
+            &pool,
+            &h,
+            &json!({"op":"resolve","pack_id":pack_id,"ref_id":root_ref})
+        )
+        .await
+        .unwrap()["reference"]["version"],
+        1
+    );
+    let failed_ref = id(&headers
+        .iter()
+        .find(|r| r["item_id"] == json!(root) && r["version"] == 2)
+        .unwrap()["ref_id"]);
+    assert_eq!(
+        context::read(
+            &pool,
+            &h,
+            &json!({"op":"resolve","pack_id":pack_id,"ref_id":failed_ref})
+        )
+        .await
+        .unwrap()["document"]["assessment"]["observed"],
+        "SYNTHETIC_FAILURE_DETAIL"
+    );
+    for stranger in [&source_h, &actor(foreign, foreign_task, Role::Handler)] {
+        assert_eq!(
+            context::read(&pool, stranger, &json!({"op":"pack","pack_id":pack_id}))
+                .await
+                .unwrap_err()
+                .status
+                .as_u16(),
+            404
+        );
+        assert_eq!(
+            context::read(
+                &pool,
+                stranger,
+                &json!({"op":"resolve","pack_id":pack_id,"ref_id":rule_ref})
+            )
+            .await
+            .unwrap_err()
+            .status
+            .as_u16(),
+            404
+        );
+    }
+    assert_eq!(
+        context::read(
+            &pool,
+            &h,
+            &json!({"op":"resolve","pack_id":pack_id,"ref_id":Uuid::new_v4()})
+        )
+        .await
+        .unwrap_err()
+        .status
+        .as_u16(),
+        404
+    );
+    let mut new_rule = rule_doc;
+    new_rule["content"] = json!("RULE_BODY_VERSION_TWO");
+    let new_sub = submit(&pool, &source_h, new_rule, Some((rule, 1))).await;
+    accept(&pool, &a, &new_sub).await;
+    let old = context::read(
+        &pool,
+        &h,
+        &json!({"op":"resolve","pack_id":pack_id,"ref_id":rule_ref}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(old["document"]["content"], "RULE_BODY_VERSION_ONE");
+    assert_eq!(old["live_notice"]["current_version"], 2);
+    assert_eq!(old["live_notice"]["version_changed"], true);
+    assert_eq!(
+        context::read(&pool, &h, &json!({"op":"pack","pack_id":pack_id}))
+            .await
+            .unwrap()["pack"],
+        *pack
+    );
+    let concurrent = context_request(&pool, &h, Uuid::new_v4(), json!({})).await;
+    let payload = delivery(&concurrent, rule, 1);
+    let (first, second) = tokio::join!(
+        context::curate(&pool, &a, &payload),
+        context::curate(&pool, &a, &payload)
+    );
+    let first = first.unwrap();
+    let second = second.unwrap();
+    assert_eq!(first["pack"], second["pack"]);
+    assert_ne!(first["replayed"], second["replayed"]);
+    assert_eq!(
+        context::read(
+            &pool,
+            &h,
+            &json!({"op":"resolve","pack_id":first["pack"]["id"],"ref_id":rule_ref})
+        )
+        .await
+        .unwrap_err()
+        .status
+        .as_u16(),
+        404
+    );
+    for (extra, code) in [
+        (
+            json!({"max_references":1}),
+            "context_reference_budget_exceeded",
+        ),
+        (
+            json!({"max_manifest_bytes":1024}),
+            "context_manifest_budget_exceeded",
+        ),
+    ] {
+        let small = context_request(&pool, &h, Uuid::new_v4(), extra).await;
+        assert_eq!(
+            context::curate(&pool, &a, &delivery(&small, rule, 1))
+                .await
+                .unwrap_err()
+                .code,
+            code
+        );
+        let state = context::read(
+            &pool,
+            &h,
+            &json!({"op":"request","request_id":small["request"]["id"]}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(state["request"]["status"], "pending");
+        assert!(state["request"]["pack_id"].is_null());
+    }
+    let empty = context_request(
+        &pool,
+        &h,
+        Uuid::new_v4(),
+        json!({"tags":["scope:no-match"]}),
+    )
+    .await;
+    let empty_pack=context::curate(&pool,&a,&json!({"op":"deliver","request_id":empty["request"]["id"],"selections":[],"gaps":["No registered source matches the requested scope"]})).await.unwrap();
+    assert_eq!(empty_pack["pack"]["reference_count"], 0);
+    for sql in [
+        "UPDATE context_packs SET manifest='{}' WHERE tenant_id=$1",
+        "DELETE FROM context_pack_refs WHERE tenant_id=$1",
+        "DELETE FROM context_requests WHERE tenant_id=$1",
+        "UPDATE context_requests SET criteria='{}' WHERE tenant_id=$1",
+    ] {
+        assert!(sqlx::query(sql).bind(tenant).execute(&pool).await.is_err());
+    }
+    assert!(
+        sqlx::query("TRUNCATE context_requests,context_packs,context_pack_refs")
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+    let leaks:i64=sqlx::query_scalar("SELECT count(*) FROM audit_records WHERE tenant_id=$1 AND (details::text LIKE '%RULE_BODY%' OR details::text LIKE '%SYNTHETIC_FAILURE_DETAIL%')").bind(tenant).fetch_one(&pool).await.unwrap();
+    assert_eq!(leaks, 0);
     pool.close().await;
 }

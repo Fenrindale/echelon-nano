@@ -39,4 +39,4 @@ CMD ["serve"]
 FROM runtime AS knowledge-tests
 COPY --from=checks /usr/local/bin/knowledge-db-tests /usr/local/bin/knowledge-db-tests
 ENTRYPOINT ["/usr/local/bin/knowledge-db-tests"]
-CMD ["--ignored", "--nocapture"]
+CMD ["--ignored", "--nocapture", "--test-threads=1"]

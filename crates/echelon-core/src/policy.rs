@@ -26,6 +26,10 @@ pub enum Capability {
     KnowledgePublish,
     #[serde(rename = "context.request")]
     ContextRequest,
+    #[serde(rename = "context.curate")]
+    ContextCurate,
+    #[serde(rename = "context.read")]
+    ContextRead,
     #[serde(rename = "task.plan")]
     TaskPlan,
     #[serde(rename = "knowledge.submit")]
@@ -50,11 +54,13 @@ pub enum Capability {
     VaultRawRead,
 }
 
-pub const ALL: [Capability; 15] = [
+pub const ALL: [Capability; 17] = [
     Capability::KnowledgeRead,
     Capability::KnowledgeClassify,
     Capability::KnowledgePublish,
     Capability::ContextRequest,
+    Capability::ContextCurate,
+    Capability::ContextRead,
     Capability::TaskPlan,
     Capability::KnowledgeSubmit,
     Capability::AgentDelegate,
@@ -71,10 +77,13 @@ pub const ALL: [Capability; 15] = [
 pub fn role_allows(role: Role, action: Capability) -> bool {
     use Capability::*;
     match role {
-        Role::Analyst => matches!(action, KnowledgeRead | KnowledgeClassify | KnowledgePublish),
+        Role::Analyst => matches!(
+            action,
+            KnowledgeRead | KnowledgeClassify | KnowledgePublish | ContextCurate
+        ),
         Role::Handler => matches!(
             action,
-            ContextRequest | TaskPlan | KnowledgeSubmit | AgentDelegate
+            ContextRequest | ContextRead | TaskPlan | KnowledgeSubmit | AgentDelegate
         ),
         Role::Agent => matches!(action, TaskObserve | ExternalFetch | ShellExec),
         Role::Master => matches!(
@@ -188,6 +197,20 @@ mod tests {
         assert!(!role_allows(Role::Handler, Capability::KnowledgePublish));
         assert!(!role_allows(Role::Master, Capability::ShellExec));
         assert!(!role_allows(Role::Master, Capability::AgentDelegate));
+        for role in [Role::Analyst, Role::Handler, Role::Agent, Role::Master] {
+            assert_eq!(
+                role_allows(role, Capability::ContextRequest),
+                role == Role::Handler
+            );
+            assert_eq!(
+                role_allows(role, Capability::ContextRead),
+                role == Role::Handler
+            );
+            assert_eq!(
+                role_allows(role, Capability::ContextCurate),
+                role == Role::Analyst
+            );
+        }
     }
     #[test]
     fn scope_work_order_and_target_are_independent_gates() {

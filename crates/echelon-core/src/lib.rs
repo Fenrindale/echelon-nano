@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod bootstrap;
 pub mod config;
+pub mod context;
 pub mod error;
 pub mod knowledge;
 pub mod policy;
