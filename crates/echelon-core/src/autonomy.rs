@@ -24,6 +24,8 @@ pub struct Launch {
 pub struct Settings {
     pub model: String,
     pub max_calls: u32,
+    /// Legacy request compatibility; token usage is observed, never capped.
+    #[serde(default)]
     pub max_total_tokens: u64,
     #[serde(default)]
     pub retain_knowledge: bool,
@@ -46,7 +48,7 @@ impl Settings {
         let mut c = base.clone();
         c.model = self.model.clone();
         c.max_calls = self.max_calls;
-        c.max_total_tokens = self.max_total_tokens;
+        c.max_total_tokens = 0;
         c.retain_knowledge = self.retain_knowledge;
         c.dream_after = self.dream_after;
         c.mode = self.mode.clone();
@@ -57,7 +59,7 @@ impl Settings {
     }
     pub fn validate(&self, catalog: &Value) -> AppResult<()> {
         if !(16..=48).contains(&self.max_calls)
-            || !(10000..=300000).contains(&self.max_total_tokens)
+            || self.mode == "work" && self.max_calls < 32
             || !matches!(self.mode.as_str(), "work" | "dream")
             || !catalog["models"]
                 .as_array()
@@ -169,7 +171,7 @@ pub async fn launch(s: &AppState, r: Launch) -> AppResult<(Value, bool)> {
         model,
         target: format!("task:{task}"),
         max_calls: 48,
-        max_total_tokens: 300000,
+        max_total_tokens: 0,
         mode: mode(),
         protocol_id: None,
         protocol_version: None,
@@ -296,6 +298,29 @@ pub async fn catalog(s: &AppState, c: &StartRun, models: &Value) -> AppResult<Va
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn automatic_work_uses_call_guard_and_observes_tokens_without_a_cap() {
+        let mut settings: Settings = serde_json::from_value(
+            json!({"model":"owned","mode":"work","max_calls":16,"max_total_tokens":10000}),
+        )
+        .unwrap();
+        let catalog = json!({"models":[{"slug":"owned"}]});
+        assert!(settings.validate(&catalog).is_err());
+        settings.max_calls = 32;
+        assert!(settings.validate(&catalog).is_ok());
+        for legacy_tokens in [0, 1, u64::MAX] {
+            settings.max_total_tokens = legacy_tokens;
+            assert!(settings.validate(&catalog).is_ok());
+        }
+        let omitted: Settings =
+            serde_json::from_value(json!({"model":"owned","max_calls":48})).unwrap();
+        assert_eq!(omitted.max_total_tokens, 0);
+        assert!(omitted.validate(&catalog).is_ok());
+        settings.mode = "dream".into();
+        settings.max_calls = 16;
+        settings.max_total_tokens = 10000;
+        assert!(settings.validate(&catalog).is_ok());
+    }
     #[test]
     fn attachment_identity_uses_bytes_and_rejects_duplicate_or_oversize_inputs() {
         let mut file: workspace::ArtifactInput = serde_json::from_value(

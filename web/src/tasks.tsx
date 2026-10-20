@@ -376,7 +376,7 @@ export function TaskDetail({
 
                 </div>
                 <p className="prose muted">{t.goal}</p>
-                {run.data?.handler_settings && <p className="muted">Handler 설정 · {run.data.handler_settings.model} · 최대 {run.data.handler_settings.max_calls}회 / {formatNumber(run.data.handler_settings.max_total_tokens)} 토큰 · {run.data.contract_finalized ? "계약 확정" : "근거 확인 중"}</p>}
+                {run.data?.handler_settings && <p className="muted">Handler 설정 · {run.data.handler_settings.model} · 최대 {run.data.handler_settings.max_calls}회 · 토큰 제한 없음 · 사용량 집계 중 · {run.data.contract_finalized ? "계약 확정" : "근거 확인 중"}</p>}
                 <dl className="brief">
                   <dt>산출물</dt>
                   <dd>{t.contract.output_format || "결과 요약"}</dd>

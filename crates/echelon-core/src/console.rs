@@ -115,7 +115,7 @@ async fn launch_task(
         model,
         target: format!("task:{id}"),
         max_calls: 48,
-        max_total_tokens: 300000,
+        max_total_tokens: 0,
         mode: mode.clone(),
         protocol_id: None,
         protocol_version: None,
@@ -762,10 +762,68 @@ async fn metrics(
     Query(q): Query<Scope>,
 ) -> crate::error::AppResult<Json<Value>> {
     operator(&s, &h).await?;
-    let rows=sqlx::query("SELECT e.role,count(*) AS calls,COALESCE(sum((e.details->'usage'->>'input_tokens')::bigint),0)::bigint AS input_tokens,COALESCE(sum((e.details->'usage'->>'output_tokens')::bigint),0)::bigint AS output_tokens FROM execution_events e JOIN execution_runs r ON r.id=e.run_id WHERE r.tenant_id=$1 AND ($2::uuid IS NULL OR r.task_id=$2) AND e.kind='model.completed' GROUP BY e.role ORDER BY e.role").bind(q.tenant_id).bind(q.task_id).fetch_all(&s.pool).await.map_err(db)?;
-    Ok(Json(
-        json!({"roles":rows.iter().map(|r|json!({"role":r.get::<String,_>("role"),"calls":r.get::<i64,_>("calls"),"input_tokens":r.get::<i64,_>("input_tokens"),"output_tokens":r.get::<i64,_>("output_tokens")})).collect::<Vec<_>>()}),
-    ))
+    // Attribute a completed response to its next tool decision, stopping at the
+    // next inference boundary. These are inference tokens, not tool runtime cost.
+    let rows = sqlx::query(
+        r#"
+        WITH observations AS (
+            SELECT e.role, COALESCE(e.details->>'phase','unknown') AS phase,
+                COALESCE(e.details->>'model','unknown') AS model,
+                COALESCE(n.tool,'unassigned') AS tool,
+                COALESCE((e.details->'usage'->>'input_tokens')::bigint,0) AS input_tokens,
+                COALESCE((e.details->'usage'->>'output_tokens')::bigint,0) AS output_tokens,
+                COALESCE((e.details->'usage'->>'cached_tokens')::bigint,0) AS cached_tokens,
+                COALESCE((e.details->'usage'->>'total_tokens')::bigint,0) AS total_tokens
+            FROM execution_events e JOIN execution_runs r ON r.id=e.run_id
+            LEFT JOIN LATERAL (
+                SELECT CASE WHEN x.kind='tool.pending' THEN x.details->>'tool' END AS tool
+                FROM execution_events x WHERE x.run_id=e.run_id AND x.seq>e.seq
+                    AND x.kind IN ('tool.pending','model.started') ORDER BY x.seq LIMIT 1
+            ) n ON true
+            WHERE r.tenant_id=$1 AND ($2::uuid IS NULL OR r.task_id=$2) AND e.kind='model.completed'
+        ), dimensions AS (
+            SELECT d.dimension,d.name,o.input_tokens,o.output_tokens,o.cached_tokens,o.total_tokens
+            FROM observations o CROSS JOIN LATERAL (VALUES
+                ('role',o.role),('phase',o.phase),('model',o.model),('tool',o.tool)
+            ) d(dimension,name)
+        )
+        SELECT dimension,name,count(*) AS calls,sum(input_tokens)::bigint AS input_tokens,
+            sum(output_tokens)::bigint AS output_tokens,sum(cached_tokens)::bigint AS cached_tokens,
+            sum(total_tokens)::bigint AS total_tokens
+        FROM dimensions GROUP BY dimension,name ORDER BY dimension,name
+    "#,
+    )
+    .bind(q.tenant_id)
+    .bind(q.task_id)
+    .fetch_all(&s.pool)
+    .await
+    .map_err(db)?;
+    let mut result = json!({"token_policy":"observe_only","token_limit_enforced":false,
+        "usage_basis":"completed_provider_responses",
+        "tool_attribution":"inference_tokens_for_next_tool_decision; unassigned includes invalid or interrupted decisions",
+        "roles":[],"phases":[],"models":[],"tools":[]});
+    for row in rows {
+        let dimension: String = row.get("dimension");
+        let collection = match dimension.as_str() {
+            "role" => "roles",
+            "phase" => "phases",
+            "model" => "models",
+            _ => "tools",
+        };
+        let mut entry = json!({"calls":row.get::<i64,_>("calls"),
+            "input_tokens":row.get::<i64,_>("input_tokens"),"output_tokens":row.get::<i64,_>("output_tokens"),
+            "cached_tokens":row.get::<i64,_>("cached_tokens"),"total_tokens":row.get::<i64,_>("total_tokens")});
+        entry[&dimension] = json!(row.get::<String, _>("name"));
+        result[collection]
+            .as_array_mut()
+            .ok_or_else(bad)?
+            .push(entry);
+    }
+    let counts = sqlx::query("SELECT count(*) FILTER (WHERE e.kind='model.started') AS started,count(*) FILTER (WHERE e.kind='model.completed') AS completed FROM execution_events e JOIN execution_runs r ON r.id=e.run_id WHERE r.tenant_id=$1 AND ($2::uuid IS NULL OR r.task_id=$2)")
+        .bind(q.tenant_id).bind(q.task_id).fetch_one(&s.pool).await.map_err(db)?;
+    result["calls_without_completed_usage"] =
+        json!((counts.get::<i64, _>("started") - counts.get::<i64, _>("completed")).max(0));
+    Ok(Json(result))
 }
 #[derive(Deserialize)]
 struct Events {

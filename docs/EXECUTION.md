@@ -26,7 +26,7 @@ Agent는 허용한 URL의 읽기, 격리 코드 실행과 실제 산출물 회�
 }
 ```
 
-응답은 `task_id`, `run_id`, `replayed`를 반환한다. 같은 요청 키와 목표의 재전송은 같은 Task와 실행을 반환한다. 다른 목표로 키를 재사용할 수 없다. 설정 단계가 실패해도 초안을 보존한다. `GET /v1/operator/runs/{id}`의 `handler_settings`와 `contract_finalized`로 Handler 결정을 확인한다. 설정 효과는 체크포인트와 감사 기록에 남고 명시적 재개 시 동일 효과를 복원한다. 자동 실행의 호출 예산은 16–48회, 토큰 예산은 10,000–300,000 안에서 Handler가 결정한다. 연결 계정 선택은 저장된 업무실 기본값 또는 기존 OAuth 연결을 사용하고 임의 API 키로 전환하지 않는다.
+응답은 `task_id`, `run_id`, `replayed`를 반환한다. 같은 요청 키와 목표의 재전송은 같은 Task와 실행을 반환한다. 다른 목표로 키를 재사용할 수 없다. 설정 단계가 실패해도 초안을 보존한다. `GET /v1/operator/runs/{id}`의 `handler_settings`와 `contract_finalized`로 Handler 결정을 확인한다. 설정 효과는 체크포인트와 감사 기록에 남고 명시적 재개 시 동일 효과를 복원한다. 자동 업무 실행의 호출 예산은 32–48회, Dreaming은 16–48회 안에서 Handler가 결정한다. 누적 토큰 상한은 적용하지 않고 사용량을 수집한다. 이전 요청·설정의 `max_total_tokens`는 호환을 위해 받지만 중단 조건에 쓰지 않는다. 새 Handler 설정은 이 값을 요구하지 않는다. 연결 계정 선택은 저장된 업무실 기본값 또는 기존 OAuth 연결을 사용하고 임의 API 키로 전환하지 않는다.
 
 기존 Task는 `POST /v1/operator/tasks/{id}/launch`로 설정 입력 없이 실행한다. 새 방식으로 생성한 Task는 Handler 설정 단계를 다시 수행한다. 기존 수동 계약으로 만든 Task는 기존 제한을 보존한다. 아래 명시적 설정 API는 자동화와 검증용으로 유지한다.
 
@@ -40,8 +40,7 @@ Agent는 허용한 URL의 읽기, 격리 코드 실행과 실제 산출물 회�
   "connection_id": "selected-connected-account",
   "model": "selected-account-model-slug",
   "target": "report:monthly-summary",
-  "max_calls": 32,
-  "max_total_tokens": 100000
+  "max_calls": 32
 }
 ```
 
@@ -59,7 +58,9 @@ Agent는 허용한 URL의 읽기, 격리 코드 실행과 실제 산출물 회�
 
 Responses 요청은 `store:false`, `stream:true`, 입력 배열, namespace 안의 엄격한 함수 스키마를 사용한다. 필요 이력과 암호화된 reasoning 항목은 같은 역할 단계 안에서만 다시 전송한다. 역할 전환 시 다음 역할에 필요한 계약·ID만 넘겨 대화를 새로 시작한다. `response.completed` 전에는 함수 호출을 실행하지 않는다. 실패·불완전·끊긴 스트림은 종료한다.
 
-설정한 호출 수는 1–48회, 누적 토큰 예산은 1,000–300,000이다. 총 실행은 30분, 개별 HTTP 추론은 120초, 스트림은 2 MiB, 모델 입력은 256 KiB로 제한한다. OAuth 경로는 `max_output_tokens`를 지원하지 않으므로 토큰 예산은 완료된 응답의 usage로 확인하며 한 응답만큼 초과할 수 있다. 이는 제공자 과금 상한 기능이 아니다.
+직접 실행 API의 호출 수는 1–48회다. 토큰 사용량으로 실행을 중단하지 않는다. 총 실행 30분, 개별 HTTP 추론 120초, 스트림 2 MiB, 모델 입력 256 KiB와 중지·취소는 유지한다. 연결 계정의 제공자 한도는 별도로 적용된다.
+
+`GET /v1/operator/metrics?tenant_id=...&task_id=...`는 완료 응답의 입력·출력·캐시·총 토큰을 역할·단계·모델·도구 결정별로 집계한다. 도구별 값은 해당 도구를 선택한 모델 응답의 사용량이며 도구 실행 자체의 비용이 아니다. 다음 추론 전 도구 결정이 없으면 `unassigned`로 남긴다. 미완료 응답은 사용량을 추정하지 않고 `calls_without_completed_usage`에 구분한다. 집계 차원 간 수치는 같은 사용량의 다른 분류이므로 합산하지 않는다. 원본 사용량은 불변 실행 이벤트에 보존한다. 실행·집계 응답은 `token_policy:observe_only`, `token_limit_enforced:false`로 현재 정책을 명시하며 잔여 계정 한도·과금은 추정하지 않는다.
 
 효과 실행 전에 모델 결정과 체크포인트·pending 원장을 저장한다. 효과는 run/call ID에서 고정 키를 얻고 같은 ID의 다른 요청은 거부한다. DB·감사 오류는 즉시 멈춘다. 서버 재시작 시 진행 중 기록은 interrupted로 표시하며 제공자 호출을 자동 반복하지 않는다. 운영자의 명시적 재개는 완료 원장·기존 Pack·Work Order·산출물을 재사용한다. 살아 있는 Worker의 동일 작업은 원래 결과를 회수한다. 지원하는 재조정은 관찰용 GET와 임시 파일 작업뿐이다. 제공자 실패와 불완전 스트림은 멈추고, 완료 응답의 중첩 JSON 형식 오류만 효과 실행 없이 최대 세 번 보정한다.
 

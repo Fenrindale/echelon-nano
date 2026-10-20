@@ -54,7 +54,7 @@ Check-Goal ($run.result.outcome -eq 'completed') 'The Handler did not complete t
 $task=Invoke-Echelon "/v1/operator/tasks/$($launch.task_id)?tenant_id=$tenant"
 Check-Goal ($task.contract.output_format.Length -gt 0 -and @($task.contract.completion_conditions).Count -gt 0 -and $task.contract.verification.Length -gt 0) 'Handler did not derive the business contract.'
 Check-Goal ($run.contract_finalized -and $run.handler_settings.model.Length -gt 0) 'Handler did not finalize its execution settings.'
-Check-Goal ($run.handler_settings.max_calls -ge 16 -and $run.handler_settings.max_calls -le 48 -and $run.handler_settings.max_total_tokens -le 300000) 'Handler widened the installed budget ceiling.'
+Check-Goal ($run.handler_settings.max_calls -ge 32 -and $run.handler_settings.max_calls -le 48 -and $run.handler_settings.max_total_tokens -eq 0 -and $run.token_limit_enforced -eq $false) 'Handler did not preserve call guards and observe-only token usage.'
 foreach($tool in @('run.configure','run.configure_contract')){Check-Goal (@($run.events|Where-Object {$_.kind -eq 'tool.completed' -and $_.details.tool -eq $tool}).Count -eq 1) "Handler configuration effect is missing or duplicated: $tool"}
 foreach($role in @('handler','analyst','agent')){Check-Goal (@($run.events|Where-Object {$_.kind -eq 'model.completed' -and $_.role -eq $role}).Count -gt 0) "Missing actual model role: $role"}
 $outputs=@($task.artifacts|Where-Object {$_.work_order_id -and ($_.name -like '*.md' -or $_.media_type -eq 'text/markdown')})
