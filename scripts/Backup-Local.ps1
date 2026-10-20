@@ -4,6 +4,12 @@ Push-Location $script:ProjectRoot
 try {
 $active=& docker compose exec -T postgres psql -U echelon -d echelon -Atc "SELECT count(*) FROM execution_runs WHERE status IN ('queued','running')"
 if($LASTEXITCODE -ne 0 -or [long]("$active".Trim()) -ne 0){throw 'Pause and reconcile active Echelon work before taking a consistent backup.'}
+$corpusTable=& docker compose exec -T postgres psql -U echelon -d echelon -Atc "SELECT to_regclass('knowledge_ingestion_jobs') IS NOT NULL"
+if($LASTEXITCODE -ne 0){throw 'Could not inspect corpus work before backup.'}
+if("$corpusTable".Trim() -eq 't'){
+ $corpusActive=& docker compose exec -T postgres psql -U echelon -d echelon -Atc "SELECT count(*) FROM knowledge_ingestion_jobs WHERE status IN ('queued','running')"
+ if($LASTEXITCODE -ne 0 -or [long]("$corpusActive".Trim()) -ne 0){throw 'Pause and reconcile active body ingestion before taking a consistent backup.'}
+}
 if($VerifyRestore){
  $verificationRunning=@(& docker compose -f compose.verify.yaml ps --status running -q)
  if($LASTEXITCODE -ne 0 -or $verificationRunning.Count){throw 'The isolated verification project must be stopped before restore verification.'}

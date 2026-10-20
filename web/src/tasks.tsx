@@ -227,6 +227,22 @@ export function TaskDetail({
   );
   const t = data.data;
   const latest = t?.runs?.[0];
+  const ingestions = useAsync(
+    () => api(`/v1/operator/ingestions?${query({ tenant_id: w.tenant, task_id: id })}`),
+    [id, w.revision],
+  );
+  const ingestion = ingestions.data?.jobs?.[0];
+  const ingestActive = ingestion && ["queued", "running"].includes(ingestion.status);
+  async function controlIngestion(action: string) {
+    try {
+      if (action === "resume" && ingestion.inflight && !window.confirm("중단 당시 모델 요청의 결과가 확인되지 않았습니다. 해당 요청을 다시 수행할 수 있습니다. 재개할까요?")) return;
+      await api(`/v1/operator/ingestions/${ingestion.id}/control`, "POST", {
+        tenant_id: w.tenant, task_id: id, action,
+        acknowledge_unknown_request: action === "resume" && !!ingestion.inflight,
+      });
+      w.refresh();
+    } catch (e) { setError(e); }
+  }
   const run = useAsync(
     () =>
       latest ? api(`/v1/operator/runs/${latest.id}`) : Promise.resolve(null),
@@ -291,7 +307,12 @@ export function TaskDetail({
           </div>
         </div>
         <div className="button-group">
-          {active ? (
+          {ingestActive ? (
+            <>
+              <button onClick={() => controlIngestion("pause")}>본문 처리 일시정지</button>
+              <button className="danger-button" onClick={() => controlIngestion("cancel")}>본문 처리 취소</button>
+            </>
+          ) : active ? (
             <>
               <button onClick={() => act("pause")}>일시정지</button>
               <button className="danger-button" onClick={() => act("cancel")}>
@@ -335,6 +356,20 @@ export function TaskDetail({
         </div>
       </div>
       <ErrorBox error={error || run.error} />
+      {ingestion && (
+        <section className="panel">
+          <div className="section-heading"><h2>대화 본문 지식화</h2><Badge value={ingestion.status} /></div>
+          <p className="prose">{ingestion.goal}</p>
+          {ingestion.source_manifest.coverage && <p className="muted">본문 있는 대화 {ingestion.source_manifest.coverage.available_body_conversations}개 · 본문 없는 대화 {ingestion.source_manifest.coverage.metadata_only_conversations}개 · 원문 메시지 {formatNumber(ingestion.source_manifest.coverage.original_messages)}개</p>}
+          <p>본문 구간 {ingestion.completed_units} / {ingestion.total_units} · 후보 {ingestion.proposed}개 · 채택 {(ingestion.accepted || []).map((x: Json) => `${x.category.toUpperCase()} ${x.count}`).join(" / ") || "심사 대기"}</p>
+          <p className="muted">{formatNumber(ingestion.total_tokens)} tokens · {ingestion.model_calls} calls · 토큰 제한 없음 · 원문 근거와 제출·채택 이력 보존</p>
+          {ingestion.plan && <p className="muted">Handler 분석 방향: {ingestion.plan.focus}</p>}
+          {ingestion.error_code && <ErrorBox error={`본문 처리 중단: ${ingestion.error_code}`} />}
+          {["paused", "interrupted", "failed"].includes(ingestion.status) && <button className="primary" onClick={() => controlIngestion("resume")}>본문 처리 이어 실행</button>}
+          {ingestion.result?.handler && <p className="prose">{ingestion.result.handler.summary}</p>}
+          <p className="muted">{ingestion.events?.[0]?.kind} {ingestion.events?.[0]?.ordinal != null ? `· 구간 ${ingestion.events[0].ordinal + 1}` : ""}</p>
+        </section>
+      )}
       {latest?.error_code && (
         <div className="notice warning">
           실행 중단: {latest.error_code} · {run.data?.phase} 단계. 중단 시점과
@@ -423,7 +458,7 @@ export function TaskDetail({
               </section>
               <section className="panel">
                 <h2>첨부파일</h2>
-                <FileUpload task={id} contract={t.contract} automatic={t.automatic} disabled={active} />
+                <FileUpload task={id} contract={t.contract} automatic={t.automatic} disabled={active || ingestActive} />
                 {active && <p className="muted">실행을 일시정지한 뒤 파일을 추가할 수 있습니다.</p>}
                 {t.artifacts.filter((f: Json) => !f.work_order_id).map((f: Json) => (
                   <div className="file-row" key={f.id}>
@@ -436,7 +471,7 @@ export function TaskDetail({
               </section>
               {result && (
                 <section className="panel">
-                  <h2>업무 결과</h2>
+                  <h2>{ingestion ? "이전 실행 결과" : "업무 결과"}</h2>
                   <Badge value={result.outcome} />
                   <p className="prose">{result.summary}</p>
                 </section>

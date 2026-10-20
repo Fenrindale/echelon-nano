@@ -8,6 +8,7 @@ pub mod context;
 pub mod credentials;
 pub mod error;
 pub mod execution;
+pub mod ingestion;
 pub mod knowledge;
 pub mod maintenance;
 pub mod policy;

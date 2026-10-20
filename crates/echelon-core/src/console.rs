@@ -284,7 +284,7 @@ async fn update_task(
             .await
             .map_err(db)?
             .ok_or_else(missing)?;
-    let active:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM execution_runs WHERE task_id=$1 AND status IN ('queued','running'))").bind(id).fetch_one(&mut *tx).await.map_err(db)?;
+    let active:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM execution_runs WHERE task_id=$1 AND status IN ('queued','running')) OR EXISTS(SELECT 1 FROM knowledge_ingestion_jobs WHERE task_id=$1 AND status IN ('queued','running'))").bind(id).fetch_one(&mut *tx).await.map_err(db)?;
     if active {
         return Err(crate::error::AppError::new(
             axum::http::StatusCode::CONFLICT,
@@ -781,6 +781,15 @@ async fn metrics(
                     AND x.kind IN ('tool.pending','model.started') ORDER BY x.seq LIMIT 1
             ) n ON true
             WHERE r.tenant_id=$1 AND ($2::uuid IS NULL OR r.task_id=$2) AND e.kind='model.completed'
+            UNION ALL
+            SELECT e.actor_role,COALESCE(e.details->>'phase','unknown'),
+                COALESCE(e.details->>'model','unknown'),COALESCE(e.details->>'phase','unassigned'),
+                COALESCE((e.details->'usage'->>'input_tokens')::bigint,0),
+                COALESCE((e.details->'usage'->>'output_tokens')::bigint,0),
+                COALESCE((e.details->'usage'->>'cached_tokens')::bigint,0),
+                COALESCE((e.details->'usage'->>'total_tokens')::bigint,0)
+            FROM knowledge_ingestion_events e JOIN knowledge_ingestion_jobs j ON j.id=e.job_id
+            WHERE j.tenant_id=$1 AND ($2::uuid IS NULL OR j.task_id=$2) AND e.kind='model.completed'
         ), dimensions AS (
             SELECT d.dimension,d.name,o.input_tokens,o.output_tokens,o.cached_tokens,o.total_tokens
             FROM observations o CROSS JOIN LATERAL (VALUES
@@ -819,7 +828,7 @@ async fn metrics(
             .ok_or_else(bad)?
             .push(entry);
     }
-    let counts = sqlx::query("SELECT count(*) FILTER (WHERE e.kind='model.started') AS started,count(*) FILTER (WHERE e.kind='model.completed') AS completed FROM execution_events e JOIN execution_runs r ON r.id=e.run_id WHERE r.tenant_id=$1 AND ($2::uuid IS NULL OR r.task_id=$2)")
+    let counts = sqlx::query("SELECT count(*) FILTER (WHERE kind='model.started') AS started,count(*) FILTER (WHERE kind='model.completed') AS completed FROM (SELECT e.kind FROM execution_events e JOIN execution_runs r ON r.id=e.run_id WHERE r.tenant_id=$1 AND ($2::uuid IS NULL OR r.task_id=$2) UNION ALL SELECT e.kind FROM knowledge_ingestion_events e JOIN knowledge_ingestion_jobs j ON j.id=e.job_id WHERE j.tenant_id=$1 AND ($2::uuid IS NULL OR j.task_id=$2)) events")
         .bind(q.tenant_id).bind(q.task_id).fetch_one(&s.pool).await.map_err(db)?;
     result["calls_without_completed_usage"] =
         json!((counts.get::<i64, _>("started") - counts.get::<i64, _>("completed")).max(0));

@@ -25,6 +25,105 @@ fn actor(tenant: Uuid, task: Uuid, role: Role) -> Claims {
 
 #[tokio::test]
 #[ignore = "requires the isolated compose.verify.yaml PostgreSQL database"]
+async fn body_ingestion_preserves_sources_checkpoints_and_role_owned_adoption() {
+    let pool = PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&std::env::var("DATABASE_URL").unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT current_database()")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        "echelon_verification"
+    );
+    sqlx::migrate!("../../migrations").run(&pool).await.unwrap();
+    let tenant = Uuid::new_v4();
+    let task = Uuid::new_v4();
+    let job = Uuid::new_v4();
+    sqlx::query("INSERT INTO tenants(id,name) VALUES($1,'Owned corpus fixture')")
+        .bind(tenant)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO tasks(id,tenant_id,goal) VALUES($1,$2,'Owned body analysis')")
+        .bind(task)
+        .bind(tenant)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO knowledge_ingestion_jobs(id,tenant_id,task_id,request_key,goal,source_manifest) VALUES($1,$2,$3,$4,'Read actual owned source','{}')").bind(job).bind(tenant).bind(task).bind(Uuid::new_v4()).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO knowledge_ingestion_units(job_id,ordinal,source_id,locator,metadata,payload,input_sha256,sanitized_sha256) VALUES($1,0,'owned-body','messages 0-1','{}','[]','raw-hash','sanitized-hash')").bind(job).execute(&pool).await.unwrap();
+    assert!(
+        sqlx::query("UPDATE knowledge_ingestion_units SET payload='[1]' WHERE job_id=$1")
+            .bind(job)
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+    sqlx::query("UPDATE knowledge_ingestion_units SET state='{\"published\":{}}',status='done' WHERE job_id=$1").bind(job).execute(&pool).await.unwrap();
+    assert!(
+        sqlx::query("UPDATE knowledge_ingestion_units SET state='{}' WHERE job_id=$1")
+            .bind(job)
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+    sqlx::query("INSERT INTO knowledge_ingestion_events(job_id,actor_role,kind,details) VALUES($1,'handler','owned-checkpoint','{}')").bind(job).execute(&pool).await.unwrap();
+    assert!(
+        sqlx::query("DELETE FROM knowledge_ingestion_events WHERE job_id=$1")
+            .bind(job)
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+    let relayed:i64=sqlx::query_scalar("SELECT count(*) FROM activity_events WHERE task_id=$1 AND kind='ingestion.owned-checkpoint'").bind(task).fetch_one(&pool).await.unwrap();
+    assert_eq!(relayed, 1);
+    let document = json!({"category":"info","storage_mode":"excerpt","title":"Owned reusable deployment rule","content":"Preserve failed deployment evidence until an independent later build verifies recovery.","tags":["owned-body"],"sources":[{"uri":"https://example.com/owned-body","locator":"Owned fixture"}],"assessment":null});
+    let input = json!({"op":"submit","request_id":Uuid::new_v4(),"document":document,"rationale":"Actual source-derived rule"});
+    assert!(
+        knowledge::submit(&pool, &actor(tenant, task, Role::Analyst), &input)
+            .await
+            .is_err()
+    );
+    let submitted = knowledge::submit(&pool, &actor(tenant, task, Role::Handler), &input)
+        .await
+        .unwrap();
+    let decision = json!({"submission_id":submitted["submission"]["id"],"decision":"accept","reason":"Grounded owned fixture"});
+    assert!(
+        knowledge::publish(&pool, &actor(tenant, task, Role::Agent), &decision)
+            .await
+            .is_err()
+    );
+    let adopted = knowledge::publish(&pool, &actor(tenant, task, Role::Analyst), &decision)
+        .await
+        .unwrap();
+    assert_eq!(adopted["submission"]["status"], "accepted");
+    sqlx::query("UPDATE knowledge_ingestion_jobs SET status='completed',result=$2 WHERE id=$1")
+        .bind(job)
+        .bind(json!({"receipt":adopted}))
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(
+        sqlx::query("UPDATE knowledge_ingestion_jobs SET status='running' WHERE id=$1")
+            .bind(job)
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+    assert!(
+        sqlx::query("DELETE FROM knowledge_ingestion_jobs WHERE id=$1")
+            .bind(job)
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires the isolated compose.verify.yaml PostgreSQL database"]
 async fn credential_metadata_preserves_source_scope_and_append_only_checks() {
     let pool = PgPoolOptions::new()
         .max_connections(4)

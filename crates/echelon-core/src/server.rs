@@ -93,6 +93,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     sqlx::migrate!("../../migrations").run(&pool).await?;
     // An unknown provider/tool outcome must be inspected, never silently replayed after restart.
     execution::interrupt(&pool).await?;
+    crate::ingestion::interrupt(&pool).await?;
     let oauth = OAuthService::new(vault.clone(), pool.clone(), host_id, config.callback_uri)?;
     let state = Arc::new(AppState {
         pool,
@@ -119,6 +120,9 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     .await?;
     for id in pending {
         tokio::spawn(execution::drive(state.clone(), id));
+    }
+    for id in crate::ingestion::queued(&state.pool).await? {
+        tokio::spawn(crate::ingestion::drive(state.clone(), id));
     }
     let app = router(state);
     let listener = tokio::net::TcpListener::bind(&config.listen).await?;
@@ -149,6 +153,7 @@ async fn shutdown() {
 pub fn router(state: Shared) -> Router {
     Router::new()
         .merge(console::routes())
+        .merge(crate::ingestion::routes())
         .route("/", get(home))
         .route("/healthz", get(health))
         .route("/readyz", get(ready))

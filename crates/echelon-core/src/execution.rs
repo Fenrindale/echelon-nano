@@ -262,7 +262,7 @@ pub async fn start(s: &AppState, c: StartRun) -> AppResult<(Value, bool)> {
         .map_err(db)?
         .ok_or_else(|| AppError::bad("task_unknown"))?;
     let running: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM execution_runs WHERE task_id=$1 AND status IN ('queued','running'))",
+        "SELECT EXISTS(SELECT 1 FROM execution_runs WHERE task_id=$1 AND status IN ('queued','running')) OR EXISTS(SELECT 1 FROM knowledge_ingestion_jobs WHERE task_id=$1 AND status IN ('queued','running'))",
     )
     .bind(c.task_id)
     .fetch_one(&mut *tx)
@@ -476,6 +476,17 @@ pub async fn control(pool: &PgPool, id: Uuid, action: &str) -> AppResult<bool> {
             false
         }
         "resume" if matches!(status.as_str(), "paused" | "interrupted" | "failed") => {
+            sqlx::query(
+                "SELECT pg_advisory_xact_lock(hashtextextended('execution:' || $1::text,0))",
+            )
+            .bind(task.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
+            let corpus_active:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM knowledge_ingestion_jobs WHERE task_id=$1 AND status IN ('queued','running'))").bind(task).fetch_one(&mut *tx).await.map_err(db)?;
+            if corpus_active {
+                return Err(conflict("task_execution_active"));
+            }
             let mut cfg: StartRun =
                 serde_json::from_value(row.get("config")).map_err(|_| invalid())?;
             let p: Checkpoint = serde_json::from_value(row.get("state")).map_err(|_| invalid())?;
