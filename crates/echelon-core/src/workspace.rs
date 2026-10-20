@@ -132,7 +132,7 @@ pub async fn task_contract(pool: &PgPool, a: &Claims) -> AppResult<TaskContract>
     serde_json::from_value(value).map_err(|_| bad())
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ArtifactInput {
     pub request_id: Uuid,
@@ -151,10 +151,12 @@ pub async fn put_artifact(
     input: &Value,
     operator: bool,
 ) -> AppResult<Value> {
-    if !operator && (a.role != Role::Agent || a.work_order_id.is_none()) {
-        return Err(AppError::forbidden("role_denied"));
-    }
-    let r: ArtifactInput = serde_json::from_value(input.clone()).map_err(|_| bad())?;
+    let mut tx = pool.begin().await.map_err(db)?;
+    let result = put_artifact_tx(&mut tx, a, input, operator).await?;
+    tx.commit().await.map_err(db)?;
+    Ok(result)
+}
+pub fn artifact_body(r: &ArtifactInput) -> AppResult<Vec<u8>> {
     if !safe_name(&r.name)
         || !nonempty(&r.media_type, 100)
         || r.media_type.chars().any(char::is_control)
@@ -169,12 +171,50 @@ pub async fn put_artifact(
     if body.len() > 1048576 {
         return Err(AppError::bad("artifact_budget_exceeded"));
     }
+    Ok(body)
+}
+pub async fn put_artifact_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    a: &Claims,
+    input: &Value,
+    operator: bool,
+) -> AppResult<Value> {
+    if !operator && (a.role != Role::Agent || a.work_order_id.is_none()) {
+        return Err(AppError::forbidden("role_denied"));
+    }
+    let r: ArtifactInput = serde_json::from_value(input.clone()).map_err(|_| bad())?;
+    let body = artifact_body(&r)?;
+    if operator {
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))")
+            .bind(format!("task-input-files:{}:{}", a.tenant_id, a.task_id))
+            .execute(&mut **tx)
+            .await
+            .map_err(db)?;
+        let valid: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM tasks WHERE tenant_id=$1 AND id=$2)")
+                .bind(a.tenant_id)
+                .bind(a.task_id)
+                .fetch_one(&mut **tx)
+                .await
+                .map_err(db)?;
+        if !valid {
+            return Err(missing());
+        }
+        let (count, bytes, duplicate): (i64,i64,bool) = sqlx::query_as("SELECT count(*),COALESCE(sum(octet_length(body)),0)::bigint,COALESCE(bool_or(name=$4),false) FROM artifacts WHERE tenant_id=$1 AND task_id=$2 AND work_order_id IS NULL AND request_key<>$3")
+            .bind(a.tenant_id).bind(a.task_id).bind(r.request_id).bind(&r.name).fetch_one(&mut **tx).await.map_err(db)?;
+        if duplicate {
+            return Err(AppError::bad("attachment_duplicate"));
+        }
+        if count >= 16 || bytes + body.len() as i64 > 4 * 1048576 {
+            return Err(AppError::bad("attachment_budget_exceeded"));
+        }
+    }
     let hash = digest(&body);
     let id = Uuid::new_v4();
     sqlx::query("INSERT INTO artifacts(id,tenant_id,task_id,work_order_id,request_key,name,media_type,sha256,body) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT(tenant_id,task_id,request_key) DO NOTHING")
-        .bind(id).bind(a.tenant_id).bind(a.task_id).bind(if operator{None}else{a.work_order_id}).bind(r.request_id).bind(&r.name).bind(&r.media_type).bind(&hash).bind(body).execute(pool).await.map_err(db)?;
+        .bind(id).bind(a.tenant_id).bind(a.task_id).bind(if operator{None}else{a.work_order_id}).bind(r.request_id).bind(&r.name).bind(&r.media_type).bind(&hash).bind(body).execute(&mut **tx).await.map_err(db)?;
     let row=sqlx::query("SELECT id,name,media_type,sha256,work_order_id,octet_length(body) AS bytes FROM artifacts WHERE tenant_id=$1 AND task_id=$2 AND request_key=$3")
-        .bind(a.tenant_id).bind(a.task_id).bind(r.request_id).fetch_one(pool).await.map_err(db)?;
+        .bind(a.tenant_id).bind(a.task_id).bind(r.request_id).fetch_one(&mut **tx).await.map_err(db)?;
     if row.get::<String, _>("sha256") != hash
         || row.get::<String, _>("name") != r.name
         || row.get::<String, _>("media_type") != r.media_type
@@ -192,7 +232,9 @@ pub fn artifact_header(row: &sqlx::postgres::PgRow) -> Value {
     json!({"id":row.get::<Uuid,_>("id"),"name":row.get::<String,_>("name"),"media_type":row.get::<String,_>("media_type"),"sha256":row.get::<String,_>("sha256"),"bytes":row.get::<i32,_>("bytes"),"work_order_id":row.get::<Option<Uuid>,_>("work_order_id")})
 }
 pub async fn artifact(pool: &PgPool, a: &Claims, id: Uuid) -> AppResult<Value> {
-    if !matches!(a.role, Role::Handler | Role::Agent) {
+    if !matches!(a.role, Role::Handler | Role::Agent)
+        || a.role == Role::Agent && a.work_order_id.is_none()
+    {
         return Err(AppError::forbidden("role_denied"));
     }
     let row=sqlx::query("SELECT id,name,media_type,sha256,work_order_id,octet_length(body) AS bytes,body FROM artifacts WHERE id=$1 AND tenant_id=$2 AND task_id=$3")
@@ -214,9 +256,29 @@ pub async fn read_artifact(pool: &PgPool, a: &Claims, input: &Value) -> AppResul
     #[serde(deny_unknown_fields)]
     struct Read {
         artifact_id: Uuid,
+        offset: Option<usize>,
+        limit: Option<usize>,
     }
     let r: Read = serde_json::from_value(input.clone()).map_err(|_| bad())?;
-    artifact(pool, a, r.artifact_id).await
+    if r.offset.is_some_and(|v| v > 1048576) || r.limit.is_some_and(|v| v == 0 || v > 16000) {
+        return Err(bad());
+    }
+    let value = artifact(pool, a, r.artifact_id).await?;
+    if r.offset.is_none() && r.limit.is_none() {
+        return Ok(value);
+    }
+    Ok(artifact_preview(
+        value,
+        r.offset.unwrap_or(0),
+        r.limit.unwrap_or(4000),
+    ))
+}
+fn artifact_preview(value: Value, offset: usize, limit: usize) -> Value {
+    let content = value["content"].as_str();
+    let preview = content.map(|s| s.chars().skip(offset).take(limit).collect::<String>());
+    let end = offset + preview.as_ref().map_or(0, |s| s.chars().count());
+    let more = content.is_some_and(|s| s.chars().count() > end);
+    json!({"artifact":value["artifact"],"content":preview,"text_readable":content.is_some(),"truncated":more,"next_offset":if more {Some(end)}else{None}})
 }
 pub fn actor(tenant: Uuid, task: Uuid, role: Role) -> Claims {
     Claims {
@@ -237,6 +299,26 @@ pub fn actor(tenant: Uuid, task: Uuid, role: Role) -> Claims {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn previews_preserve_unicode_boundaries_without_dumping_binary_data() {
+        let text = artifact_preview(
+            json!({"artifact":{"id":"owned"},"content":"가😀나다","data_base64":"unused"}),
+            1,
+            2,
+        );
+        assert_eq!(text["content"], "😀나");
+        assert_eq!(text["next_offset"], 3);
+        assert_eq!(text["truncated"], true);
+        assert!(text.get("data_base64").is_none());
+        let binary = artifact_preview(
+            json!({"artifact":{},"content":null,"data_base64":"AP8="}),
+            0,
+            4000,
+        );
+        assert_eq!(binary["text_readable"], false);
+        assert!(binary["content"].is_null());
+        assert!(binary.get("data_base64").is_none());
+    }
     #[test]
     fn paths_and_contracts_are_bounded() {
         for name in ["../secret", "/etc/passwd", "a/../b", "a\\b", "a:b", ""] {

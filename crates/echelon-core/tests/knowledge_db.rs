@@ -25,6 +25,128 @@ fn actor(tenant: Uuid, task: Uuid, role: Role) -> Claims {
 
 #[tokio::test]
 #[ignore = "requires the isolated compose.verify.yaml PostgreSQL database"]
+async fn task_attachments_commit_together_and_keep_scoped_immutable_bytes() {
+    let pool = PgPoolOptions::new()
+        .max_connections(8)
+        .connect(&std::env::var("DATABASE_URL").unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT current_database()")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        "echelon_verification"
+    );
+    sqlx::migrate!("../../migrations").run(&pool).await.unwrap();
+    let tenant = Uuid::new_v4();
+    let task = Uuid::new_v4();
+    let key = Uuid::new_v4();
+    sqlx::query("INSERT INTO tenants(id,name) VALUES($1,'Owned attachment verification')")
+        .bind(tenant)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let files:Vec<workspace::ArtifactInput> = serde_json::from_value(json!([
+        {"request_id":Uuid::new_v4(),"name":"자료.txt","content":"가😀나다"},
+        {"request_id":Uuid::new_v4(),"name":"bytes.bin","media_type":"application/octet-stream","data_base64":"AP8="}
+    ])).unwrap();
+    let manifest = echelon_core::autonomy::attachment_manifest(&files).unwrap();
+    let h = actor(tenant, task, Role::Handler);
+    let mut ids = vec![];
+    for commit in [false, true] {
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("INSERT INTO tasks(id,tenant_id,goal,launch_key,launch_manifest) VALUES($1,$2,'Owned attachments',$3,$4)").bind(task).bind(tenant).bind(key).bind(&manifest).execute(&mut *tx).await.unwrap();
+        ids.clear();
+        for file in &files {
+            let stored = workspace::put_artifact_tx(&mut tx, &h, &json!(file), true)
+                .await
+                .unwrap();
+            ids.push(id(&stored["artifact"]["id"]));
+        }
+        let visible: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM tasks WHERE id=$1)")
+            .bind(task)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(
+            !visible,
+            "Partially uploaded Task was visible before commit"
+        );
+        if commit {
+            tx.commit().await.unwrap();
+        } else {
+            tx.rollback().await.unwrap();
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT count(*) FROM artifacts WHERE task_id=$1")
+                    .bind(task)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap(),
+                0
+            );
+        }
+    }
+    let preview = workspace::read_artifact(
+        &pool,
+        &h,
+        &json!({"artifact_id":ids[0],"offset":1,"limit":2}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(preview["content"], "😀나");
+    assert!(preview.get("data_base64").is_none());
+    let bytes = workspace::read_artifact(&pool, &h, &json!({"artifact_id":ids[1],"limit":4000}))
+        .await
+        .unwrap();
+    assert_eq!(bytes["text_readable"], false);
+    assert_eq!(
+        workspace::artifact(&pool, &h, ids[1]).await.unwrap()["data_base64"],
+        "AP8="
+    );
+    assert!(
+        workspace::read_artifact(
+            &pool,
+            &actor(tenant, Uuid::new_v4(), Role::Handler),
+            &json!({"artifact_id":ids[0],"limit":4000})
+        )
+        .await
+        .is_err()
+    );
+    for role in [Role::Analyst, Role::Master, Role::Agent] {
+        assert!(
+            workspace::read_artifact(
+                &pool,
+                &actor(tenant, task, role),
+                &json!({"artifact_id":ids[0],"limit":4000})
+            )
+            .await
+            .is_err()
+        );
+    }
+    assert!(
+        sqlx::query("UPDATE tasks SET launch_manifest='[]' WHERE id=$1")
+            .bind(task)
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+    assert!(
+        sqlx::query("UPDATE tasks SET goal='changed' WHERE id=$1")
+            .bind(task)
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+    let replay = workspace::put_artifact(&pool, &h, &json!(files[0]), true)
+        .await
+        .unwrap();
+    assert_eq!(id(&replay["artifact"]["id"]), ids[0]);
+    assert_eq!(replay["replayed"], true);
+}
+
+#[tokio::test]
+#[ignore = "requires the isolated compose.verify.yaml PostgreSQL database"]
 async fn beta_protocol_maintenance_artifacts_and_effect_history() {
     let pool = PgPoolOptions::new()
         .max_connections(12)

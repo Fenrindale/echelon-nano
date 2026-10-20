@@ -9,7 +9,7 @@ use crate::{
 };
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::{HeaderMap, header},
     response::{
         IntoResponse, Response, Sse,
@@ -33,7 +33,10 @@ pub fn routes() -> Router<Shared> {
         .route("/v1/operator/tenants", get(tenants).post(create_tenant))
         .route("/v1/operator/tenants/{id}/workspace", post(workspace_open))
         .route("/v1/operator/tasks", get(tasks))
-        .route("/v1/operator/tasks/launch", post(launch_goal))
+        .route(
+            "/v1/operator/tasks/launch",
+            post(launch_goal).layer(DefaultBodyLimit::max(6 * 1048576)),
+        )
         .route("/v1/operator/tasks/{id}/launch", post(launch_task))
         .route("/v1/operator/tasks/{id}", get(task).patch(update_task))
         .route("/v1/operator/tasks/{id}/inputs", post(task_input))
@@ -237,14 +240,14 @@ async fn task(
     Query(q): Query<Scope>,
 ) -> crate::error::AppResult<Json<Value>> {
     operator(&s, &h).await?;
-    let row=sqlx::query("SELECT id,goal,plan,status,contract,archived,created_at::text AS created_at FROM tasks WHERE tenant_id=$1 AND id=$2").bind(q.tenant_id).bind(id).fetch_optional(&s.pool).await.map_err(db)?.ok_or_else(missing)?;
+    let row=sqlx::query("SELECT id,goal,plan,status,contract,archived,launch_key,created_at::text AS created_at FROM tasks WHERE tenant_id=$1 AND id=$2").bind(q.tenant_id).bind(id).fetch_optional(&s.pool).await.map_err(db)?.ok_or_else(missing)?;
     let orders=sqlx::query("SELECT w.id,w.target,w.status,w.contract,r.result FROM work_orders w LEFT JOIN work_order_results r ON r.work_order_id=w.id WHERE w.tenant_id=$1 AND w.task_id=$2 ORDER BY w.created_at LIMIT 100").bind(q.tenant_id).bind(id).fetch_all(&s.pool).await.map_err(db)?;
     let files=sqlx::query("SELECT id,name,media_type,sha256,work_order_id,octet_length(body) AS bytes FROM artifacts WHERE tenant_id=$1 AND task_id=$2 ORDER BY created_at LIMIT 200").bind(q.tenant_id).bind(id).fetch_all(&s.pool).await.map_err(db)?;
     let runs=sqlx::query("SELECT id,status,calls,created_at::text AS created_at,error_code,state->'result' AS result FROM execution_runs WHERE tenant_id=$1 AND task_id=$2 ORDER BY created_at DESC LIMIT 30").bind(q.tenant_id).bind(id).fetch_all(&s.pool).await.map_err(db)?;
     let inputs=sqlx::query("SELECT id,content,created_at::text AS created_at FROM task_inputs WHERE tenant_id=$1 AND task_id=$2 ORDER BY created_at LIMIT 32").bind(q.tenant_id).bind(id).fetch_all(&s.pool).await.map_err(db)?;
     let receipts=sqlx::query("SELECT request_key,work_order_id,tool,status,result FROM tool_receipts WHERE tenant_id=$1 AND task_id=$2 ORDER BY created_at LIMIT 100").bind(q.tenant_id).bind(id).fetch_all(&s.pool).await.map_err(db)?;
     Ok(Json(
-        json!({"id":id,"tenant_id":q.tenant_id,"goal":row.get::<String,_>("goal"),"status":row.get::<String,_>("status"),"plan":row.get::<Value,_>("plan"),"contract":row.get::<Value,_>("contract"),"archived":row.get::<bool,_>("archived"),"work_orders":orders.iter().map(|r|json!({"id":r.get::<Uuid,_>("id"),"target":r.get::<String,_>("target"),"status":r.get::<String,_>("status"),"contract":r.get::<Value,_>("contract"),"result":r.get::<Option<Value>,_>("result")})).collect::<Vec<_>>(),"artifacts":files.iter().map(workspace::artifact_header).collect::<Vec<_>>(),"runs":runs.iter().map(|r|json!({"id":r.get::<Uuid,_>("id"),"status":r.get::<String,_>("status"),"calls":r.get::<i32,_>("calls"),"error_code":r.get::<Option<String>,_>("error_code"),"result":r.get::<Option<Value>,_>("result")})).collect::<Vec<_>>(),"tool_receipts":receipts.iter().map(|r|json!({"request_id":r.get::<Uuid,_>("request_key"),"work_order_id":r.get::<Uuid,_>("work_order_id"),"tool":r.get::<String,_>("tool"),"status":r.get::<String,_>("status"),"result":r.get::<Option<Value>,_>("result")})).collect::<Vec<_>>(),"inputs":inputs.iter().map(|r|json!({"id":r.get::<Uuid,_>("id"),"content":r.get::<String,_>("content"),"created_at":r.get::<String,_>("created_at")})).collect::<Vec<_>>()}),
+        json!({"id":id,"tenant_id":q.tenant_id,"goal":row.get::<String,_>("goal"),"status":row.get::<String,_>("status"),"plan":row.get::<Value,_>("plan"),"contract":row.get::<Value,_>("contract"),"automatic":row.get::<Option<Uuid>,_>("launch_key").is_some(),"archived":row.get::<bool,_>("archived"),"work_orders":orders.iter().map(|r|json!({"id":r.get::<Uuid,_>("id"),"target":r.get::<String,_>("target"),"status":r.get::<String,_>("status"),"contract":r.get::<Value,_>("contract"),"result":r.get::<Option<Value>,_>("result")})).collect::<Vec<_>>(),"artifacts":files.iter().map(workspace::artifact_header).collect::<Vec<_>>(),"runs":runs.iter().map(|r|json!({"id":r.get::<Uuid,_>("id"),"status":r.get::<String,_>("status"),"calls":r.get::<i32,_>("calls"),"error_code":r.get::<Option<String>,_>("error_code"),"result":r.get::<Option<Value>,_>("result")})).collect::<Vec<_>>(),"tool_receipts":receipts.iter().map(|r|json!({"request_id":r.get::<Uuid,_>("request_key"),"work_order_id":r.get::<Uuid,_>("work_order_id"),"tool":r.get::<String,_>("tool"),"status":r.get::<String,_>("status"),"result":r.get::<Option<Value>,_>("result")})).collect::<Vec<_>>(),"inputs":inputs.iter().map(|r|json!({"id":r.get::<Uuid,_>("id"),"content":r.get::<String,_>("content"),"created_at":r.get::<String,_>("created_at")})).collect::<Vec<_>>()}),
     ))
 }
 #[derive(Deserialize)]

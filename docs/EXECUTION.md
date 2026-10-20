@@ -16,7 +16,7 @@ Agent는 허용한 URL의 읽기, 격리 코드 실행과 실제 산출물 회�
 
 ## 운영자 API
 
-콘솔의 기본 경로는 `POST /v1/operator/tasks/launch`다. 업무 입력은 `goal` 하나이며 `tenant_id`와 `request_id`는 클라이언트가 지정하는 범위·멱등 메타데이터다.
+콘솔의 기본 경로는 `POST /v1/operator/tasks/launch`다. 업무 입력은 `goal`과 선택 사항인 `attachments`이며 `tenant_id`와 `request_id`는 클라이언트가 지정하는 범위·멱등 메타데이터다.
 
 ```json
 {
@@ -50,6 +50,8 @@ Agent는 허용한 URL의 읽기, 격리 코드 실행과 실제 산출물 회�
 상태는 `queued`, `running`, `paused`, `cancelled`, `completed`, `failed`, `exhausted`, `interrupted`다. `completed` 상태에서도 `result.outcome`을 확인해야 한다. Work Order 계약·결과, 관찰, 완료 효과와 도구 이벤트는 불변 이력이다. `POST /v1/operator/runs/{id}/control`의 `action`은 `pause`, `resume`, `cancel`이다.
 
 ## 모델 연결과 제한
+
+선택 첨부는 `attachments:[{request_id,name,media_type,data_base64}]`로 전달한다. 각 파일에 안정된 요청 UUID를 사용하며 최대 16개·파일당 1 MiB·합계 4 MiB다. 실행 등록 경로의 JSON 본문 상한은 base64를 고려해 6 MiB이며 다른 API의 2 MiB 상한은 유지한다. 서버가 파일 검증·저장과 Task 생성을 한 트랜잭션에서 처리하고, 파일 요청 ID·이름·형식·SHA256 목록을 불변으로 고정한다. Handler는 `artifact.read {artifact_id,offset:0,limit:4000}`으로 UTF-8 미리보기를 읽고 계약의 `input_artifacts`를 선택한다. 미리보기는 문자 경계에서 잘라 반환하고 전체 base64를 제외한다. 바이너리는 본문을 해석한 것으로 표시하지 않는다. Agent는 자기 Work Order의 입력 허용 목록을 계속 따른다.
 
 공식 Sign in with ChatGPT의 OAuth 자격증명을 Vault에서 사용한다. 각 추론 전에 기존 만료 검사와 직렬화된 갱신을 거친다. 계정 카탈로그에 없는 모델은 시작 시 거부한다. API 키나 다른 계정으로 자동 전환하지 않는다.
 

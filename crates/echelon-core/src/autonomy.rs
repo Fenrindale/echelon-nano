@@ -16,6 +16,8 @@ pub struct Launch {
     pub tenant_id: Uuid,
     pub request_id: Uuid,
     pub goal: String,
+    #[serde(default)]
+    pub attachments: Vec<workspace::ArtifactInput>,
 }
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -106,20 +108,25 @@ pub async fn launch(s: &AppState, r: Launch) -> AppResult<(Value, bool)> {
     if !workspace::nonempty(&r.goal, 4000) {
         return Err(bad());
     }
+    let manifest = attachment_manifest(&r.attachments)?;
     let mut tx = s.pool.begin().await.map_err(db)?;
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))")
         .bind(format!("goal-launch:{}:{}", r.tenant_id, r.request_id))
         .execute(&mut *tx)
         .await
         .map_err(db)?;
-    let old = sqlx::query("SELECT id,goal FROM tasks WHERE tenant_id=$1 AND launch_key=$2")
-        .bind(r.tenant_id)
-        .bind(r.request_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(db)?;
+    let old = sqlx::query(
+        "SELECT id,goal,launch_manifest FROM tasks WHERE tenant_id=$1 AND launch_key=$2",
+    )
+    .bind(r.tenant_id)
+    .bind(r.request_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(db)?;
     let task = if let Some(old) = old {
-        if old.get::<String, _>("goal") != r.goal {
+        if old.get::<String, _>("goal") != r.goal
+            || old.get::<Value, _>("launch_manifest") != manifest
+        {
             return Err(AppError::bad("goal_launch_conflict"));
         }
         old.get("id")
@@ -133,9 +140,13 @@ pub async fn launch(s: &AppState, r: Launch) -> AppResult<(Value, bool)> {
             return Err(missing());
         }
         let task = Uuid::new_v4();
-        sqlx::query("INSERT INTO tasks(id,tenant_id,goal,contract,launch_key) VALUES($1,$2,$3,'{\"kind\":\"work\"}',$4)").bind(task).bind(r.tenant_id).bind(&r.goal).bind(r.request_id).execute(&mut *tx).await.map_err(db)?;
+        sqlx::query("INSERT INTO tasks(id,tenant_id,goal,contract,launch_key,launch_manifest) VALUES($1,$2,$3,'{\"kind\":\"work\"}',$4,$5)").bind(task).bind(r.tenant_id).bind(&r.goal).bind(r.request_id).bind(manifest).execute(&mut *tx).await.map_err(db)?;
         task
     };
+    let actor = workspace::actor(r.tenant_id, task, crate::policy::Role::Handler);
+    for file in &r.attachments {
+        workspace::put_artifact_tx(&mut tx, &actor, &json!(file), true).await?;
+    }
     let existing: Option<Uuid> = sqlx::query_scalar(
         "SELECT id FROM execution_runs WHERE tenant_id=$1 AND task_id=$2 AND request_key=$3",
     )
@@ -173,6 +184,35 @@ pub async fn launch(s: &AppState, r: Launch) -> AppResult<(Value, bool)> {
     Ok((
         json!({"task_id":task,"run_id":run["id"],"replayed":run["replayed"]}),
         spawn,
+    ))
+}
+pub fn attachment_manifest(files: &[workspace::ArtifactInput]) -> AppResult<Value> {
+    let mut names = std::collections::BTreeSet::new();
+    let mut keys = std::collections::BTreeSet::new();
+    let mut total = 0;
+    let mut manifest = vec![];
+    if files.len() > 16 {
+        return Err(AppError::bad("attachment_budget_exceeded"));
+    }
+    for file in files {
+        if !names.insert(&file.name) || !keys.insert(file.request_id) {
+            return Err(AppError::bad("attachment_duplicate"));
+        }
+        let body = workspace::artifact_body(file)?;
+        total += body.len();
+        if total > 4 * 1048576 {
+            return Err(AppError::bad("attachment_budget_exceeded"));
+        }
+        manifest.push(json!({"request_id":file.request_id,"name":file.name,"media_type":file.media_type,"sha256":workspace::digest(&body)}));
+    }
+    Ok(json!(manifest))
+}
+pub async fn input_files(pool: &sqlx::PgPool, tenant: Uuid, task: Uuid) -> AppResult<Value> {
+    let rows=sqlx::query("SELECT id,name,media_type,sha256,work_order_id,octet_length(body) AS bytes FROM artifacts WHERE tenant_id=$1 AND task_id=$2 AND work_order_id IS NULL ORDER BY created_at,id LIMIT 16").bind(tenant).bind(task).fetch_all(pool).await.map_err(db)?;
+    Ok(json!(
+        rows.iter()
+            .map(workspace::artifact_header)
+            .collect::<Vec<_>>()
     ))
 }
 pub fn validate_contract(
@@ -234,8 +274,8 @@ pub async fn catalog(s: &AppState, c: &StartRun, models: &Value) -> AppResult<Va
         .take(16)
         .cloned()
         .collect();
-    let artifacts=sqlx::query("SELECT id,name,media_type,sha256,work_order_id,octet_length(body) AS bytes FROM artifacts WHERE tenant_id=$1 AND task_id=$2 AND work_order_id IS NULL ORDER BY created_at LIMIT 16").bind(c.tenant_id).bind(c.task_id).fetch_all(&s.pool).await.map_err(db)?;
-    let value = json!({"models":models["models"],"protocols":protocols,"secrets":secrets,"input_artifacts":artifacts.iter().map(workspace::artifact_header).collect::<Vec<_>>(),"source_ids":source_ids});
+    let artifacts = input_files(&s.pool, c.tenant_id, c.task_id).await?;
+    let value = json!({"models":models["models"],"protocols":protocols,"secrets":secrets,"input_artifacts":artifacts,"source_ids":source_ids});
     if serde_json::to_vec(&value).map_err(|_| bad())?.len() > 65536 {
         return Err(AppError::bad("setup_catalog_budget_exceeded"));
     }
@@ -245,6 +285,30 @@ pub async fn catalog(s: &AppState, c: &StartRun, models: &Value) -> AppResult<Va
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn attachment_identity_uses_bytes_and_rejects_duplicate_or_oversize_inputs() {
+        let mut file: workspace::ArtifactInput = serde_json::from_value(
+            json!({"request_id":Uuid::new_v4(),"name":"자료.txt","content":"가"}),
+        )
+        .unwrap();
+        let original = attachment_manifest(std::slice::from_ref(&file)).unwrap();
+        file.content = None;
+        file.data_base64 = Some("6rCA".into());
+        assert_eq!(
+            attachment_manifest(std::slice::from_ref(&file)).unwrap(),
+            original
+        );
+        let copy: workspace::ArtifactInput = serde_json::from_value(json!(file)).unwrap();
+        assert!(attachment_manifest(&[file, copy]).is_err());
+        let oversized: workspace::ArtifactInput = serde_json::from_value(
+            json!({"request_id":Uuid::new_v4(),"name":"large.txt","content":"x".repeat(1048577)}),
+        )
+        .unwrap();
+        assert_eq!(
+            attachment_manifest(&[oversized]).unwrap_err().code,
+            "artifact_budget_exceeded"
+        );
+    }
     #[test]
     fn handler_cannot_select_uninstalled_tools_or_unregistered_private_urls() {
         let mut c = TaskContract {

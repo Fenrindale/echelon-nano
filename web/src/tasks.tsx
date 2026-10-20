@@ -10,6 +10,7 @@ import {
   taskTitle,
 } from "./api";
 import { useWorkspace } from "./context";
+import { encodeAttachment, selectAttachments, type Attachment } from "./attachments";
 import {
   Badge,
   Empty,
@@ -135,24 +136,59 @@ export function TaskForm({
   const w = useWorkspace();
   const [goal, setGoal] = useState(initialGoal);
   const [requestId, setRequestId] = useState(key);
+  const [files, setFiles] = useState<Attachment[]>([]);
+  const [fileError, setFileError] = useState<unknown>();
+  const [sending, setSending] = useState(false);
   return (
     <SubmitForm button="Handler에게 맡기기" onSubmit={async () => {
       if (initialContract.model_access === "blocked") {
         throw new Error("외부 모델 전송이 금지된 원본 업무는 자동 실행으로 복제할 수 없습니다.");
       }
-      const r = await api("/v1/operator/tasks/launch", "POST", {
-        tenant_id: w.tenant,
-        request_id: requestId,
-        goal: goal.trim(),
-      });
-      w.refresh();
-      onCreated(r.task_id);
+      setSending(true);
+      try {
+        const attachments = await Promise.all(files.map(encodeAttachment));
+        const r = await api("/v1/operator/tasks/launch", "POST", {
+          tenant_id: w.tenant,
+          request_id: requestId,
+          goal: goal.trim(),
+          attachments,
+        });
+        w.refresh();
+        onCreated(r.task_id);
+      } finally {
+        setSending(false);
+      }
     }}>
       <Field label="업무 목표">
-        <textarea autoFocus required value={goal} maxLength={4000}
+        <textarea autoFocus required value={goal} maxLength={4000} disabled={sending}
           onChange={(e) => { setGoal(e.target.value); setRequestId(key()); }}
           placeholder="완료하고 싶은 업무를 자유롭게 설명해 주세요." />
       </Field>
+      <div className="attachment-picker">
+        <div className="row">
+          <strong>첨부파일 <span className="muted">선택</span></strong>
+          <label className={`button ${sending ? "disabled" : ""}`}>
+            ＋ 파일 선택
+            <input type="file" multiple hidden aria-label="첨부파일 선택" disabled={sending}
+              onChange={(e) => {
+                try {
+                  setFiles(selectAttachments(files, Array.from(e.target.files ?? [])));
+                  setRequestId(key());
+                  setFileError(undefined);
+                } catch (err) { setFileError(err); }
+                e.target.value = "";
+              }} />
+          </label>
+        </div>
+        {files.map((a) => <div className="file-row" key={a.id}>
+          <span className="file-icon">▤</span>
+          <div><strong>{a.file.name}</strong><small>{formatNumber(a.file.size)} bytes</small></div>
+          <button type="button" className="quiet" disabled={sending} aria-label={`${a.file.name} 첨부 취소`}
+            onClick={() => { setFiles(files.filter((f) => f.id !== a.id)); setRequestId(key()); setFileError(undefined); }}>×</button>
+        </div>)}
+        <small className="muted">파일당 1 MiB · 최대 16개 · 합계 4 MiB. 텍스트 분석은 UTF-8 파일을 지원합니다.</small>
+        <ErrorBox error={fileError} />
+      </div>
       <p className="muted">
         Handler가 목표에 맞춰 완료 조건, 산출물, 모델, 예산, 도구와 프로토콜을 정하고 바로 실행합니다.
       </p>
@@ -397,6 +433,19 @@ export function TaskDetail({
                   </details>
                 )}
               </section>
+              <section className="panel">
+                <h2>첨부파일</h2>
+                <FileUpload task={id} contract={t.contract} automatic={t.automatic} disabled={active} />
+                {active && <p className="muted">실행을 일시정지한 뒤 파일을 추가할 수 있습니다.</p>}
+                {t.artifacts.filter((f: Json) => !f.work_order_id).map((f: Json) => (
+                  <div className="file-row" key={f.id}>
+                    <span className="file-icon">▤</span>
+                    <div><strong>{f.name}</strong><small>{formatNumber(f.bytes)} bytes · SHA256 {f.sha256.slice(0, 16)}</small></div>
+                    <a className="button" href={`/v1/operator/artifacts/${f.id}/download?${query({ tenant_id: w.tenant })}`} download>다운로드</a>
+                  </div>
+                ))}
+                {!t.artifacts.some((f: Json) => !f.work_order_id) && <p className="muted">첨부한 파일이 없습니다.</p>}
+              </section>
               {result && (
                 <section className="panel">
                   <h2>업무 결과</h2>
@@ -576,7 +625,7 @@ export function TaskDetail({
               <p className="muted">
                 등록된 입력과 격리 환경의 결과 파일입니다.
               </p>
-              <FileUpload task={id} contract={t.contract} disabled={active} />
+              <FileUpload task={id} contract={t.contract} automatic={t.automatic} disabled={active} />
               {t.artifacts.map((f: Json) => (
                 <div className="file-row" key={f.id}>
                   <span className="file-icon">▤</span>
@@ -655,10 +704,12 @@ export function TaskDetail({
 function FileUpload({
   task,
   contract,
+  automatic,
   disabled,
 }: {
   task: string;
   contract: Json;
+  automatic?: boolean;
   disabled: boolean;
 }) {
   const w = useWorkspace();
@@ -667,7 +718,7 @@ function FileUpload({
   return (
     <div className="upload">
       <label className={`button ${disabled || busy ? "disabled" : ""}`}>
-        {busy ? "등록 중…" : "＋ 입력 파일 등록"}
+        {busy ? "등록 중…" : "＋ 파일 첨부"}
         <input
           type="file"
           hidden
@@ -693,7 +744,7 @@ function FileUpload({
                   data_base64: btoa(binary),
                 },
               });
-              await api(`/v1/operator/tasks/${task}`, "PATCH", {
+              if (!automatic) await api(`/v1/operator/tasks/${task}`, "PATCH", {
                 tenant_id: w.tenant,
                 contract: {
                   ...contract,
