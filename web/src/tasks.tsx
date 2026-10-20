@@ -305,17 +305,13 @@ export function TaskDetail({
                   이어 실행
                 </button>
               )}
-              {!["completed", "cancelled", "failed", "blocked"].includes(
-                t.status,
-              ) && (
                 <button
                   className="primary"
-                  disabled={t.contract.model_access === "blocked"}
+                  disabled={t.archived || t.contract.model_access === "blocked"}
                   onClick={async () => {try{await api(`/v1/operator/tasks/${id}/launch`,"POST",{tenant_id:w.tenant,request_id:key()});w.refresh();}catch(e){setError(e);}}}
                 >
-                  Handler 실행
+                  {["completed", "partial", "cancelled", "failed", "blocked"].includes(t.status) ? "Handler 다시 실행" : "Handler 실행"}
                 </button>
-              )}
               <button onClick={() => setClone(true)}>복제</button>
               <button
                 className="quiet"

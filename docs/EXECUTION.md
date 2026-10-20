@@ -10,7 +10,7 @@
 2. Analyst가 해당 요청의 후보를 페이지 단위로 보고 기존 ID·버전을 골라 `context.curate`로 전달한다. 보지 않은 후보는 선택할 수 없다. 거짓·실패 이력과 의존 근거의 포함은 기존 Context Pack 서버가 보장한다. Analyst는 업무 결론이나 새 원문을 작성하지 않는다.
 3. Handler가 Pack과 필요한 레퍼런스를 조회한다. 모든 caution 근거를 조회하고 계획을 저장해야 지시할 수 있다. Work Order에는 목표·예상 산출물·조회한 레퍼런스를 넣으며 모든 caution 참조를 포함해야 한다.
 4. Agent가 자기 Work Order를 조회한다. 계약에 지정한 버전의 문서·해시·출처·주의 이력이 증거 스냅샷으로 전달된다. Agent는 중앙 DB와 다른 Work Order를 탐색할 수 없다. 관찰을 남기고 근거가 연결된 결과를 반환한다.
-5. Handler가 저장된 Agent 결과를 다시 조회하고 목표 달성 여부를 판단한다. Agent의 blocked/failed 결과를 completed로 올릴 수 없다. 루프 완료와 업무 결과의 completed/blocked/failed는 별도 값이다.
+5. Handler가 저장된 Agent 결과를 다시 조회하고 목표 달성 여부를 판단한다. Agent의 partial/blocked/failed 결과를 completed로 올릴 수 없다. 루프 완료와 업무 결과의 completed/partial/blocked/failed는 별도 값이다.
 
 Agent는 허용한 URL의 읽기, 격리 코드 실행과 실제 산출물 회수를 수행할 수 있다. `retain_knowledge`를 선택하면 Handler가 재사용 항목을 제출하고 Analyst가 지정한 제출만 채택·반려한다. `dream_after`는 이후 별도 Master 감사·정리 검토안 단계를 실행한다. 후처리 오류가 이미 확정된 업무 결과를 바꾸지 않는다. 한 Task의 Work Order는 순차 처리하며 여러 Task 실행은 서버의 동시성 한도 안에서 진행한다.
 
@@ -50,6 +50,8 @@ Agent는 허용한 URL의 읽기, 격리 코드 실행과 실제 산출물 회�
 상태는 `queued`, `running`, `paused`, `cancelled`, `completed`, `failed`, `exhausted`, `interrupted`다. `completed` 상태에서도 `result.outcome`을 확인해야 한다. Work Order 계약·결과, 관찰, 완료 효과와 도구 이벤트는 불변 이력이다. `POST /v1/operator/runs/{id}/control`의 `action`은 `pause`, `resume`, `cancel`이다.
 
 ## 모델 연결과 제한
+
+기밀 첨부는 일반 미리보기 대신 값 없는 목록을 반환한다. Handler는 `credential.inspect` 후 `credential.import`와 필요한 `credential.check`를 계약에 포함해 Agent에게 위임한다. 승인된 커넥터가 없더라도 적재 가능한 입력을 버리지 않고 미검증 범위와 함께 부분 완료로 보고한다. 세부 형식·권한·고정 신원 API와 재사용 계약은 [기밀 처리](CREDENTIALS.md)를 따른다.
 
 선택 첨부는 `attachments:[{request_id,name,media_type,data_base64}]`로 전달한다. 각 파일에 안정된 요청 UUID를 사용하며 최대 16개·파일당 1 MiB·합계 4 MiB다. 실행 등록 경로의 JSON 본문 상한은 base64를 고려해 6 MiB이며 다른 API의 2 MiB 상한은 유지한다. 서버가 파일 검증·저장과 Task 생성을 한 트랜잭션에서 처리하고, 파일 요청 ID·이름·형식·SHA256 목록을 불변으로 고정한다. Handler는 `artifact.read {artifact_id,offset:0,limit:4000}`으로 UTF-8 미리보기를 읽고 계약의 `input_artifacts`를 선택한다. 미리보기는 문자 경계에서 잘라 반환하고 전체 base64를 제외한다. 바이너리는 본문을 해석한 것으로 표시하지 않는다. Agent는 자기 Work Order의 입력 허용 목록을 계속 따른다.
 

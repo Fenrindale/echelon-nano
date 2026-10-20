@@ -5,6 +5,7 @@ pub mod broker;
 pub mod config;
 pub mod console;
 pub mod context;
+pub mod credentials;
 pub mod error;
 pub mod execution;
 pub mod knowledge;

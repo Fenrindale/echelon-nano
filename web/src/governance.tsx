@@ -908,6 +908,11 @@ export function Vault() {
   const w = useWorkspace();
   const [edit, setEdit] = useState<Json | null | undefined>();
   const [error, setError] = useState<unknown>();
+  const [connector, setConnector] = useState<Json | null | undefined>();
+  const credentials = useAsync(
+    () => api(`/v1/operator/credentials?${query({ tenant_id: w.tenant })}`),
+    [w.tenant, w.revision],
+  );
   const r = useAsync(
     () => api(`/v1/operator/secrets?${query({ tenant_id: w.tenant })}`),
     [w.tenant, w.revision],
@@ -922,11 +927,39 @@ export function Vault() {
             Task에는 사용 범위를, 모델에는 불투명한 참조만 전달합니다.
           </p>
         </div>
+        <button onClick={() => setConnector(null)}>＋ 인증 커넥터</button>
         <button className="primary" onClick={() => setEdit(null)}>
           ＋ 기밀 참조 등록
         </button>
       </div>
-      <ErrorBox error={r.error || error} />
+      <ErrorBox error={r.error || credentials.error || error} />
+      <section className="panel">
+        <h2>Task에서 가져온 기밀 묶음</h2>
+        <p className="muted">Agent가 승인된 첨부파일을 서버 경유로 Vault에 보관합니다. 저장 확인과 외부 서비스 인증 결과는 별개입니다.</p>
+        {(credentials.data?.bundles ?? []).map((b: Json) => <div className="secret-row" key={b.id}>
+          <span className="file-icon">⌁</span>
+          <div className="grow">
+            <h3>{b.name}</h3><ID id={b.id} />
+            <p>Vault v{b.vault_version} 저장 확인 · 변수 {b.entry_names.length}개 · 빈 값 {b.empty_names.length}개</p>
+            <details><summary>변수명 보기 · 값 비공개</summary><Tags tags={b.entry_names} /></details>
+            {(credentials.data?.checks ?? []).filter((check: Json) => check.result.bundle_id === b.id).map((check: Json) => <p key={check.result.check_id}>
+              인증 기록 · 커넥터 <ID id={check.result.connector_id} /> v{check.result.connector_version} · <Badge value={check.result.observation.status} />
+              <small> {check.checked_at}</small>
+            </p>)}
+          </div>
+          <Badge value="stored" />
+        </div>)}
+        {!credentials.data?.bundles?.length && <Empty title="Task에서 가져온 기밀 묶음이 없습니다" />}
+      </section>
+      <section className="panel">
+        <div className="row"><h2>승인된 인증 커넥터</h2></div>
+        <p className="muted">업무실에서 승인한 대상에만 고정된 계정 조회 요청을 보냅니다. 첨부파일의 주소가 접속 권한을 부여하지 않습니다.</p>
+        {(credentials.data?.connectors ?? []).map((c: Json) => <div className="secret-row" key={c.id}>
+          <div className="grow"><h3>{c.name}</h3><p>{c.kind} · v{c.version} · {c.enabled ? "사용 가능" : "사용 중지"}</p><small>{c.base_url}</small><ID id={c.id} /></div>
+          <button onClick={() => setConnector(c)}>범위 수정</button>
+        </div>)}
+        {!credentials.data?.connectors?.length && <Empty title="승인된 인증 커넥터가 없습니다" />}
+      </section>
       <div className="panel">
         {r.data?.secrets?.map((s: Json) => (
           <div className="secret-row" key={s.id}>
@@ -978,8 +1011,44 @@ export function Vault() {
           <SecretForm secret={edit} onDone={() => setEdit(undefined)} />
         </Modal>
       )}
+      {connector !== undefined && <Modal title={connector ? "인증 커넥터 수정" : "인증 커넥터 등록"} onClose={() => setConnector(undefined)}>
+        <CredentialConnectorForm connector={connector} onDone={() => setConnector(undefined)} />
+      </Modal>}
     </>
   );
+}
+function CredentialConnectorForm({ connector: c, onDone }: { connector: Json | null; onDone: () => void }) {
+  const w = useWorkspace();
+  const [name, setName] = useState(c?.name ?? "");
+  const [kind, setKind] = useState(c?.kind ?? "gitlab");
+  const [base, setBase] = useState(c?.base_url ?? "");
+  const [user, setUser] = useState(c?.username_variable ?? "");
+  const [token, setToken] = useState(c?.token_variable ?? "");
+  const [privateNetwork, setPrivateNetwork] = useState(c?.allow_private ?? false);
+  const [http, setHttp] = useState(c?.allow_http ?? false);
+  const [enabled, setEnabled] = useState(c?.enabled ?? true);
+  return <SubmitForm button="커넥터 저장" onSubmit={async () => {
+    await api("/v1/operator/credential-connectors", "POST", {
+      tenant_id: w.tenant, id: c?.id, expected_version: c?.version,
+      name, kind, base_url: base, username_variable: user, token_variable: token,
+      allow_private: privateNetwork, allow_http: http, enabled,
+    });
+    w.refresh(); onDone();
+  }}>
+    <Field label="이름"><input required value={name} maxLength={160} onChange={(e) => setName(e.target.value)} /></Field>
+    <Field label="서비스"><select value={kind} onChange={(e) => setKind(e.target.value)}>
+      <option value="gitlab">GitLab · 현재 사용자 조회</option>
+      <option value="jenkins">Jenkins · API 토큰으로 계정 조회</option>
+      <option value="databricks">Databricks · 현재 사용자 조회</option>
+    </select></Field>
+    <Field label="승인할 서비스 주소"><input required type="url" value={base} maxLength={1024} placeholder="https://service.example" onChange={(e) => setBase(e.target.value)} /></Field>
+    {kind === "jenkins" && <Field label="사용자명 변수 이름"><input required value={user} maxLength={128} placeholder="JENKINS_USER" onChange={(e) => setUser(e.target.value)} /></Field>}
+    <Field label="API 토큰 변수 이름" hint="첨부파일에 쓰인 변수 이름입니다. 비밀값을 입력하지 않습니다."><input required value={token} maxLength={128} placeholder="SERVICE_TOKEN" onChange={(e) => setToken(e.target.value)} /></Field>
+    <label className="check"><input type="checkbox" checked={privateNetwork} onChange={(e) => setPrivateNetwork(e.target.checked)} />이 커넥터의 내부망 대상 허용</label>
+    <label className="check"><input type="checkbox" checked={http} onChange={(e) => setHttp(e.target.checked)} />이 커넥터의 평문 HTTP 허용</label>
+    <label className="check"><input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} />사용 가능</label>
+    <p className="muted">Task마다 Handler가 승인된 커넥터를 선택합니다. 비밀번호 로그인·SSH·DB·메일 인증은 지원하지 않습니다.</p>
+  </SubmitForm>;
 }
 function SecretForm({
   secret: s,

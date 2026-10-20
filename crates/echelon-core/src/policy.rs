@@ -44,6 +44,12 @@ pub enum Capability {
     ArtifactRead,
     #[serde(rename = "artifact.write")]
     ArtifactWrite,
+    #[serde(rename = "credential.inspect")]
+    CredentialInspect,
+    #[serde(rename = "credential.import")]
+    CredentialImport,
+    #[serde(rename = "credential.check")]
+    CredentialCheck,
     #[serde(rename = "task.observe")]
     TaskObserve,
     #[serde(rename = "external.fetch")]
@@ -64,7 +70,7 @@ pub enum Capability {
     VaultRawRead,
 }
 
-pub const ALL: [Capability; 22] = [
+pub const ALL: [Capability; 25] = [
     Capability::KnowledgeRead,
     Capability::KnowledgeClassify,
     Capability::KnowledgePublish,
@@ -78,6 +84,9 @@ pub const ALL: [Capability; 22] = [
     Capability::WorkOrderComplete,
     Capability::ArtifactRead,
     Capability::ArtifactWrite,
+    Capability::CredentialInspect,
+    Capability::CredentialImport,
+    Capability::CredentialCheck,
     Capability::TaskObserve,
     Capability::ExternalFetch,
     Capability::ShellExec,
@@ -105,6 +114,7 @@ pub fn role_allows(role: Role, action: Capability) -> bool {
                 | AgentDelegate
                 | WorkOrderRead
                 | ArtifactRead
+                | CredentialInspect
         ),
         Role::Agent => matches!(
             action,
@@ -115,6 +125,9 @@ pub fn role_allows(role: Role, action: Capability) -> bool {
                 | WorkOrderComplete
                 | ArtifactRead
                 | ArtifactWrite
+                | CredentialInspect
+                | CredentialImport
+                | CredentialCheck
         ),
         Role::Master => matches!(
             action,
@@ -163,15 +176,19 @@ pub fn authorize(claims: &Claims, req: &ToolRequest) -> AppResult<()> {
             | Capability::TaskObserve
             | Capability::WorkOrderComplete
             | Capability::ArtifactWrite
+            | Capability::CredentialImport
+            | Capability::CredentialCheck
     ) {
         if claims.work_order_id.is_none() {
             return Err(AppError::forbidden("work_order_required"));
         }
-        if matches!(req.tool, Capability::ExternalFetch | Capability::ShellExec)
-            && !req
-                .target
-                .as_ref()
-                .is_some_and(|target| claims.targets.contains(target))
+        if matches!(
+            req.tool,
+            Capability::ExternalFetch | Capability::ShellExec | Capability::CredentialCheck
+        ) && !req
+            .target
+            .as_ref()
+            .is_some_and(|target| claims.targets.contains(target))
         {
             return Err(AppError::forbidden("target_denied"));
         }
@@ -231,6 +248,10 @@ mod tests {
         assert!(!role_allows(Role::Handler, Capability::KnowledgePublish));
         assert!(!role_allows(Role::Master, Capability::ShellExec));
         assert!(!role_allows(Role::Master, Capability::AgentDelegate));
+        for role in [Role::Analyst, Role::Handler, Role::Master] {
+            assert!(!role_allows(role, Capability::CredentialImport));
+            assert!(!role_allows(role, Capability::CredentialCheck));
+        }
         for role in [Role::Analyst, Role::Handler, Role::Agent, Role::Master] {
             assert_eq!(
                 role_allows(role, Capability::ContextRequest),

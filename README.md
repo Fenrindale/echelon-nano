@@ -18,6 +18,8 @@ Drag files into the attachment area or use the file selection button. New Tasks 
 
 Agent tools include exact-URL read-only HTTP requests through a Vault-backed Secret Broker, immutable file artifacts, and a dedicated Linux Worker. Shell children run under an unprivileged UID, with resource limits, no network syscalls, no credentials or host mounts, and a temporary job directory. Initial document workflows use UTF-8 Markdown, CSV and source files; arbitrary Office/PDF processing adapters are outside this beta.
 
+Credential attachments use a separate server-side path. Handler receives a variable-name inventory and delegates literal `.env` import to Agent; values stay out of model previews and the Worker. Agent stores a versioned Vault bundle, verifies the round trip, and can check identity through a workspace-approved GitLab, Jenkins or Databricks token connector. Missing connectors leave authentication unverified while storage and a `partial` report can complete. See [credential handling and its limits](docs/CREDENTIALS.md).
+
 See the [beta guide and API contracts](docs/BETA.md), [execution contracts](docs/EXECUTION.md), and [implementation evidence](docs/IMPLEMENTATION.md). Vector search, object storage, WCM, app-server, additional business write connectors and remote multi-user hosting remain the optional extensions identified in the design.
 
 The initial model connection uses the official Sign in with ChatGPT route. It does not reuse another application's Codex credentials, call private ChatGPT inference endpoints, or silently fall back to a billed API key.

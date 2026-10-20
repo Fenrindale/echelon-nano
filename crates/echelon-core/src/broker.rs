@@ -364,6 +364,9 @@ async fn shell(
     let mut files = vec![];
     for id in &p.input_artifacts {
         let file = workspace::artifact(&s.pool, a, *id).await?;
+        if crate::credentials::model_view(&file).is_some() {
+            return Err(AppError::forbidden("credential_material_not_for_shell"));
+        }
         files.push(InputFile {
             name: file["artifact"]["name"].as_str().ok_or_else(bad)?.into(),
             content: file["content"]

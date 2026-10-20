@@ -49,7 +49,8 @@ foreach ($role in @('analyst','handler','agent','master')) {
     if ($record.Count -ne 1) { throw "The $role runtime verification did not complete." }
     $checks += $record[0]
 }
-$network = & docker network inspect echelon-nano_roles --format '{{.Internal}}'
+$composeProject=(& docker compose config --format json | ConvertFrom-Json).name
+$network = & docker network inspect ($composeProject+'_roles') --format '{{.Internal}}'
 if ($LASTEXITCODE -ne 0 -or "$network".Trim() -ne 'true') { throw 'The role network is not internal.' }
 
 # These synthetic callback attempts never exchange a code with OpenAI.

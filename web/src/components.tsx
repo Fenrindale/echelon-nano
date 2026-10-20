@@ -14,7 +14,7 @@ export type Json = Record<string, any>;
 export function Badge({ value }: { value?: string }) {
   return (
     <span
-      className={`badge ${["failed", "refuted", "cancelled", "rejected"].includes(value ?? "") ? "danger" : ["blocked", "paused", "interrupted", "exhausted", "review_needed", "expired", "pending", "candidate"].includes(value ?? "") ? "warning" : ["completed", "active", "supported", "accepted", "applied", "success"].includes(value ?? "") ? "success" : ""}`}
+      className={`badge ${["failed", "refuted", "cancelled", "rejected"].includes(value ?? "") ? "danger" : ["partial", "blocked", "paused", "interrupted", "exhausted", "review_needed", "expired", "pending", "candidate"].includes(value ?? "") ? "warning" : ["completed", "active", "supported", "accepted", "applied", "success"].includes(value ?? "") ? "success" : ""}`}
     >
       {labels[value ?? ""] ?? value ?? "—"}
     </span>

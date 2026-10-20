@@ -21,6 +21,11 @@ class Handler(BaseHTTPRequestHandler):
             data = {"fixture": True, "echo": auth,
                     "encoded": base64.b64encode(auth.encode()).decode(),
                     "access_token": "owned-echo-only", "request_count": self.counts[self.path]}
+        elif self.path == "/whoAmI/api/json":
+            expected = "Basic " + base64.b64encode(b"owned-user:owned-identity-token").decode()
+            valid = auth == expected
+            data = {"authenticated": valid, "name": "owned-user" if valid else "anonymous",
+                    "request_count": self.counts[self.path]}
         elif self.path == "/redirect":
             self.send_response(302)
             self.send_header("Location", "http://vault:8200/v1/sys/health")

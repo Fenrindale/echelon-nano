@@ -52,6 +52,11 @@ pub fn routes() -> Router<Shared> {
         .route("/v1/operator/reviews", get(reviews))
         .route("/v1/operator/reviews/{id}/task", post(review_task))
         .route("/v1/operator/secrets", get(secrets).post(save_secret))
+        .route("/v1/operator/credentials", get(credential_catalog))
+        .route(
+            "/v1/operator/credential-connectors",
+            post(save_credential_connector),
+        )
         .route("/v1/operator/secrets/{id}/disable", post(disable_secret))
         .route("/v1/operator/settings", get(settings).put(save_settings))
         .route("/v1/operator/metrics", get(metrics))
@@ -307,6 +312,7 @@ async fn update_task(
                 | "paused"
                 | "waiting_input"
                 | "completed"
+                | "partial"
                 | "failed"
                 | "cancelled"
         ) {
@@ -354,7 +360,44 @@ pub async fn validate_contract(
             return Err(missing());
         }
     }
+    for id in &c.credential_bundles {
+        let valid: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM credential_bundles b JOIN tasks t ON t.tenant_id=b.tenant_id AND t.id=b.source_task_id WHERE b.tenant_id=$1 AND b.id=$2 AND COALESCE(t.contract->>'model_access','')<>'blocked')",
+        )
+        .bind(tenant)
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .map_err(db)?;
+        if !valid {
+            return Err(missing());
+        }
+    }
+    for grant in &c.credential_connectors {
+        let valid:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM credential_connectors WHERE tenant_id=$1 AND id=$2 AND version=$3 AND enabled)").bind(tenant).bind(grant.id).bind(grant.version).fetch_one(pool).await.map_err(db)?;
+        if !valid {
+            return Err(missing());
+        }
+    }
     Ok(())
+}
+async fn credential_catalog(
+    State(s): State<Shared>,
+    h: HeaderMap,
+    Query(q): Query<Scope>,
+) -> crate::error::AppResult<Json<Value>> {
+    operator(&s, &h).await?;
+    crate::credentials::catalog(&s.pool, q.tenant_id)
+        .await
+        .map(Json)
+}
+async fn save_credential_connector(
+    State(s): State<Shared>,
+    h: HeaderMap,
+    Json(r): Json<crate::credentials::ConnectorInput>,
+) -> crate::error::AppResult<Json<Value>> {
+    operator(&s, &h).await?;
+    crate::credentials::save_connector(&s, r).await.map(Json)
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -482,6 +525,7 @@ async fn domain(
         | Capability::AgentDelegate
         | Capability::WorkOrderRead
         | Capability::ArtifactRead => Role::Handler,
+        Capability::CredentialInspect => Role::Handler,
         _ => {
             return Err(crate::error::AppError::forbidden(
                 "operator_domain_tool_denied",

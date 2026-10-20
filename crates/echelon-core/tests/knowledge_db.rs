@@ -25,6 +25,100 @@ fn actor(tenant: Uuid, task: Uuid, role: Role) -> Claims {
 
 #[tokio::test]
 #[ignore = "requires the isolated compose.verify.yaml PostgreSQL database"]
+async fn credential_metadata_preserves_source_scope_and_append_only_checks() {
+    let pool = PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&std::env::var("DATABASE_URL").unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT current_database()")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        "echelon_verification"
+    );
+    sqlx::migrate!("../../migrations").run(&pool).await.unwrap();
+    let tenant = Uuid::new_v4();
+    let task = Uuid::new_v4();
+    let other = Uuid::new_v4();
+    let artifact = Uuid::new_v4();
+    sqlx::query("INSERT INTO tenants(id,name) VALUES($1,'Owned credential schema fixture')")
+        .bind(tenant)
+        .execute(&pool)
+        .await
+        .unwrap();
+    for id in [task, other] {
+        sqlx::query(
+            "INSERT INTO tasks(id,tenant_id,goal) VALUES($1,$2,'Owned credential metadata test')",
+        )
+        .bind(id)
+        .bind(tenant)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    sqlx::query("INSERT INTO artifacts(id,tenant_id,task_id,request_key,name,media_type,sha256,body) VALUES($1,$2,$3,$4,'owned.env','text/plain','owned-source-hash',$5)")
+        .bind(artifact).bind(tenant).bind(task).bind(Uuid::new_v4()).bind(b"OWNED_TOKEN=fixture-only".as_slice()).execute(&pool).await.unwrap();
+    let bundle = Uuid::new_v4();
+    let insert = "INSERT INTO credential_bundles(id,tenant_id,source_task_id,source_artifact_id,source_sha256,name,entry_names,empty_names,vault_version) VALUES($1,$2,$3,$4,'owned-source-hash','owned.env','[\"OWNED_TOKEN\"]','[]',1)";
+    assert!(
+        sqlx::query(insert)
+            .bind(bundle)
+            .bind(tenant)
+            .bind(other)
+            .bind(artifact)
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+    sqlx::query(insert)
+        .bind(bundle)
+        .bind(tenant)
+        .bind(task)
+        .bind(artifact)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(
+        sqlx::query("UPDATE credential_bundles SET vault_version=2 WHERE id=$1")
+            .bind(bundle)
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+    let connector = Uuid::new_v4();
+    let order = Uuid::new_v4();
+    let check = Uuid::new_v4();
+    sqlx::query("INSERT INTO credential_connectors(id,tenant_id,name,kind,base_url,token_variable) VALUES($1,$2,'Owned connector','gitlab','https://example.com','OWNED_TOKEN')").bind(connector).bind(tenant).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO work_orders(id,tenant_id,task_id,target) VALUES($1,$2,$3,'owned:credential-schema')").bind(order).bind(tenant).bind(task).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO credential_checks(id,tenant_id,task_id,work_order_id,bundle_id,connector_id,connector_version,result) VALUES($1,$2,$3,$4,$5,$6,1,'{\"status\":\"unverified\"}')").bind(check).bind(tenant).bind(task).bind(order).bind(bundle).bind(connector).execute(&pool).await.unwrap();
+    assert!(
+        sqlx::query("UPDATE credential_checks SET result='{}' WHERE id=$1")
+            .bind(check)
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+    assert!(
+        sqlx::query("DELETE FROM credential_checks WHERE id=$1")
+            .bind(check)
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+    let visible: String =
+        sqlx::query_scalar("SELECT to_jsonb(b)::text FROM credential_bundles b WHERE id=$1")
+            .bind(bundle)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(!visible.contains("fixture-only"));
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the isolated compose.verify.yaml PostgreSQL database"]
 async fn task_attachments_commit_together_and_keep_scoped_immutable_bytes() {
     let pool = PgPoolOptions::new()
         .max_connections(8)

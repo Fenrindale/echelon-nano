@@ -451,7 +451,7 @@ pub async fn invoke_as(s: &AppState, a: &Claims, req: &ToolRequest) -> AppResult
         return Err(error);
     }
     if a.role == Role::Agent {
-        let valid:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM work_orders w JOIN tasks t ON t.tenant_id=w.tenant_id AND t.id=w.task_id WHERE w.id=$1 AND w.tenant_id=$2 AND w.task_id=$3 AND w.status='ready' AND t.status NOT IN ('cancelled','paused','waiting_input','completed','failed','blocked'))")
+        let valid:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM work_orders w JOIN tasks t ON t.tenant_id=w.tenant_id AND t.id=w.task_id WHERE w.id=$1 AND w.tenant_id=$2 AND w.task_id=$3 AND w.status='ready' AND t.status NOT IN ('cancelled','paused','waiting_input','completed','partial','failed','blocked'))")
             .bind(a.work_order_id).bind(a.tenant_id).bind(a.task_id).fetch_one(&s.pool).await.map_err(|_|AppError::internal("database_unavailable"))?;
         if !valid {
             return Err(AppError::forbidden("work_order_inactive"));
@@ -509,6 +509,9 @@ async fn dispatch(s: &AppState, a: &Claims, req: &ToolRequest) -> AppResult<Valu
         Capability::WorkOrderComplete => work::complete(&s.pool, a, &req.input).await,
         Capability::ExternalFetch | Capability::ShellExec => broker::invoke(s, a, req).await,
         Capability::ArtifactRead => workspace::read_artifact(&s.pool, a, &req.input).await,
+        Capability::CredentialInspect => crate::credentials::inspect(s, a, &req.input).await,
+        Capability::CredentialImport => crate::credentials::import(s, a, &req.input).await,
+        Capability::CredentialCheck => crate::credentials::check(s, a, &req.input).await,
         Capability::ArtifactWrite => {
             let policy = broker::order_policy(&s.pool, a).await?;
             if !policy.allowed_tools.iter().any(|t| t == "artifact.write") {

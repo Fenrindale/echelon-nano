@@ -229,8 +229,10 @@ pub async fn complete(pool: &PgPool, a: &Claims, input: &Value) -> AppResult<Val
         .work_order_id
         .ok_or_else(|| AppError::forbidden("work_order_required"))?;
     let r: ResultInput = serde_json::from_value(input.clone()).map_err(|_| invalid())?;
-    if !matches!(r.outcome.as_str(), "completed" | "blocked" | "failed")
-        || !bounded(&r.summary, 8000)
+    if !matches!(
+        r.outcome.as_str(),
+        "completed" | "partial" | "blocked" | "failed"
+    ) || !bounded(&r.summary, 8000)
         || r.evidence.len() > 16
         || r.limitations.len() > 8
         || r.limitations.iter().any(|s| !bounded(s, 1000))
@@ -247,7 +249,7 @@ pub async fn complete(pool: &PgPool, a: &Claims, input: &Value) -> AppResult<Val
     if r.artifacts.len() > 16 {
         return Err(invalid());
     }
-    if r.outcome == "completed"
+    if matches!(r.outcome.as_str(), "completed" | "partial")
         && !contract["tool_policy"]["output_format"]
             .as_str()
             .unwrap_or_default()

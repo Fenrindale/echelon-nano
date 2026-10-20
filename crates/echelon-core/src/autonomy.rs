@@ -275,7 +275,18 @@ pub async fn catalog(s: &AppState, c: &StartRun, models: &Value) -> AppResult<Va
         .cloned()
         .collect();
     let artifacts = input_files(&s.pool, c.tenant_id, c.task_id).await?;
-    let value = json!({"models":models["models"],"protocols":protocols,"secrets":secrets,"input_artifacts":artifacts,"source_ids":source_ids});
+    let credentials = crate::credentials::model_catalog(&s.pool, c.tenant_id).await?;
+    for bundle in credentials["bundles"].as_array().into_iter().flatten() {
+        source_ids.push(bundle["source_task_id"].clone());
+    }
+    let work_orders: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM work_orders WHERE tenant_id=$1 AND task_id=$2")
+            .bind(c.tenant_id)
+            .bind(c.task_id)
+            .fetch_one(&s.pool)
+            .await
+            .map_err(db)?;
+    let value = json!({"models":models["models"],"protocols":protocols,"secrets":secrets,"credentials":credentials,"input_artifacts":artifacts,"historical_work_orders":work_orders,"source_ids":source_ids});
     if serde_json::to_vec(&value).map_err(|_| bad())?.len() > 65536 {
         return Err(AppError::bad("setup_catalog_budget_exceeded"));
     }

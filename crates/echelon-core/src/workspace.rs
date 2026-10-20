@@ -53,6 +53,8 @@ pub struct TaskContract {
     pub allowed_tools: Vec<String>,
     pub urls: Vec<UrlGrant>,
     pub secret_refs: Vec<Uuid>,
+    pub credential_bundles: Vec<Uuid>,
+    pub credential_connectors: Vec<CredentialConnectorGrant>,
     pub input_artifacts: Vec<Uuid>,
     pub verification: String,
     pub max_work_orders: u32,
@@ -65,6 +67,12 @@ pub struct UrlGrant {
     pub allow_private: bool,
     #[serde(default)]
     pub allow_http: bool,
+}
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialConnectorGrant {
+    pub id: Uuid,
+    pub version: i64,
 }
 impl TaskContract {
     pub fn validate(&self) -> AppResult<()> {
@@ -88,12 +96,19 @@ impl TaskContract {
                 .any(|s| !nonempty(s, 1000))
             || self.urls.len() > 16
             || self.secret_refs.len() > 8
+            || self.credential_bundles.len() > 16
+            || self.credential_connectors.len() > 8
+            || self.credential_connectors.iter().any(|g| g.version < 1)
             || self.input_artifacts.len() > 16
             || self.max_work_orders > 8
             || self.allowed_tools.iter().any(|s| {
                 !matches!(
                     s.as_str(),
-                    "external.fetch" | "shell.exec" | "artifact.write"
+                    "external.fetch"
+                        | "shell.exec"
+                        | "artifact.write"
+                        | "credential.import"
+                        | "credential.check"
                 )
             })
         {
@@ -264,6 +279,9 @@ pub async fn read_artifact(pool: &PgPool, a: &Claims, input: &Value) -> AppResul
         return Err(bad());
     }
     let value = artifact(pool, a, r.artifact_id).await?;
+    if let Some(masked) = crate::credentials::model_view(&value) {
+        return Ok(masked);
+    }
     if r.offset.is_none() && r.limit.is_none() {
         return Ok(value);
     }

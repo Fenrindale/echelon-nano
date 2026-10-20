@@ -1,4 +1,4 @@
-param([string]$ConnectionId,[string]$Model,[switch]$SkipBudgetCheck)
+param([string]$ConnectionId,[string]$Model,[switch]$SkipBudgetCheck,[switch]$SkipRefreshCheck)
 . (Join-Path $PSScriptRoot 'Common.ps1')
 Initialize-PrivateDirectory (Join-Path $script:RuntimeRoot 'evidence')
 $script:LoopAssertions=0
@@ -49,14 +49,14 @@ function Wait-Loop([string]$Id,[switch]$RefreshInFlight) {
         Start-Sleep -Seconds 4
     } while($true)
 }
-$run=Wait-Loop $runId -RefreshInFlight
+$run=Wait-Loop $runId -RefreshInFlight:(-not $SkipRefreshCheck)
 Assert-Loop ($run.status -eq 'completed') "Live loop stopped with status $($run.status), code $($run.error_code)."
 Assert-Loop ($run.result.outcome -eq 'completed') 'The synthetic business task did not complete.'
 foreach($role in @('analyst','handler','agent')) {
     Assert-Loop (@($run.events | Where-Object {$_.role -eq $role -and $_.kind -eq 'model.completed'}).Count -gt 0) "No actual completed model response for $role."
 }
 $generations=@($run.events | Where-Object kind -eq 'model.completed' | ForEach-Object {$_.details.credential_generation} | Sort-Object -Unique)
-Assert-Loop ($generations.Count -ge 2) 'The role loop did not continue inference with refreshed OAuth credentials.'
+if(-not $SkipRefreshCheck){Assert-Loop ($generations.Count -ge 2) 'The role loop did not continue inference with refreshed OAuth credentials.'}
 foreach($tool in @('context.request','context.curate','context.read','task.plan','agent.delegate','work_order.read','work_order.complete','run.finish')) {
     Assert-Loop (@($run.events | Where-Object {$_.kind -eq 'tool.completed' -and $_.details.tool -eq $tool}).Count -gt 0) "Missing actual tool effect: $tool."
 }
@@ -102,7 +102,7 @@ if(-not $SkipBudgetCheck) {
     Assert-Loop ($budget.status -eq 'exhausted' -and $budget.calls -eq 1 -and -not $budget.work_order_id) 'Model call budget did not stop before delegation.'
     Write-PrivateText (Join-Path $script:RuntimeRoot 'evidence/llm-loop-budget.json') ($budget | ConvertTo-Json -Depth 20)
 }
-$safe=@{passed=$true;assertions=$script:LoopAssertions;model=$Model;model_calls=$run.calls;total_tokens=$run.total_tokens;roles=@($run.events | Where-Object kind -eq 'model.completed' | Group-Object role | ForEach-Object {@{role=$_.Name;completed_calls=$_.Count}});historical_failure_preserved=$true;scoped_work_result_retrieved=$true;role_and_scope_rejections=$true;budget_stopped=($null -ne $budget);refresh_during_run_verified=$true;verified_at=[DateTimeOffset]::UtcNow.ToString('o')}
+$safe=@{passed=$true;assertions=$script:LoopAssertions;model=$Model;model_calls=$run.calls;total_tokens=$run.total_tokens;roles=@($run.events | Where-Object kind -eq 'model.completed' | Group-Object role | ForEach-Object {@{role=$_.Name;completed_calls=$_.Count}});historical_failure_preserved=$true;scoped_work_result_retrieved=$true;role_and_scope_rejections=$true;budget_stopped=($null -ne $budget);refresh_during_run_verified=(-not $SkipRefreshCheck);verified_at=[DateTimeOffset]::UtcNow.ToString('o')}
 Write-PrivateText (Join-Path $script:RuntimeRoot 'evidence/llm-loop.json') ($safe | ConvertTo-Json -Depth 8)
 Write-PrivateText (Join-Path $script:RuntimeRoot 'evidence/llm-loop-completed.json') ($run | ConvertTo-Json -Depth 20)
 $safe | ConvertTo-Json -Depth 8 -Compress
