@@ -1,4 +1,4 @@
-param([string]$ConnectionId,[string]$Model)
+param([string]$ConnectionId,[string]$Model,[switch]$PromptOnly)
 . (Join-Path $PSScriptRoot 'Common.ps1')
 Push-Location $script:ProjectRoot
 try {
@@ -14,9 +14,16 @@ $admin=(Invoke-Echelon "/v1/operator/tenants/$tenant/workspace" 'POST' @{}).admi
 $doc=@{category='info';title='Owned recovery fixture procedure';storage_mode='excerpt';truth_state='supported';applicability='Operator-authored synthetic test only; completion is independently checked against the actual Worker receipt and output';content='For tag 검증:재개 this operator-owned synthetic Task is fully specified. Execute its single permitted shell script in the isolated sandbox, wait for the receipt, and return resume.txt. This is a registered Info fixture, not a server protocol. No external evidence or business write is required. If interrupted, the operator can explicitly resume the same run and its existing Work Order.';tags=@('검증:재개');sources=@(@{uri='https://example.com/echelon-owned/recovery'})}
 $submission=Invoke-Echelon '/v1/operator/domain' 'POST' @{tenant_id=$tenant;task_id=$admin;tool='knowledge.submit';input=@{op='submit';request_id=[guid]::NewGuid().ToString();document=$doc;rationale='Owned recovery fixture'}}
 $null=Invoke-Echelon '/v1/operator/domain' 'POST' @{tenant_id=$tenant;task_id=$admin;tool='knowledge.publish';input=@{submission_id=$submission.submission.id;decision='accept';reason='Operator registered a bounded synthetic procedure'}}
-$task=(Invoke-Echelon '/v1/operator/tasks' 'POST' @{tenant_id=$tenant;tenant_name='Owned recovery fixture';goal='검증:재개. This is an authorized, fully specified recovery test. Use the registered Info recovery fixture as a pinned reference; a selected server protocol is not required. Agent must execute exactly one shell.exec with script: sleep 12; printf RESUME_OK > resume.txt . The 12-second wait is a required test condition and must not be removed. outputs:[resume.txt],timeout_seconds:25. Return the actual recovered resume.txt artifact and cite the pinned procedure. A replayed existing receipt is the expected successful outcome after explicit resume, not a reason to block. Completion requires the actual receipt and exact output bytes; do not add unrequested protocol-certification requirements. No external action is requested.';contract=@{kind='work';allowed_tools=@('shell.exec');output_format='resume.txt';max_work_orders=1;completion_conditions=@('Actual shell receipt and resume.txt containing RESUME_OK');verification='Compare recovered content to RESUME_OK'}}).task_id
-$request=@{request_id=[guid]::NewGuid().ToString();tenant_id=$tenant;task_id=$task;connection_id=$ConnectionId;model=$Model;target='owned:recovery';max_calls=48;max_total_tokens=180000}
-$run=(Invoke-Echelon '/v1/operator/runs' 'POST' $request).id
+$definition=@{tenant_id=$tenant;tenant_name='Owned recovery fixture';goal='검증:재개. This is an authorized, fully specified recovery test. Use the registered Info recovery fixture as a pinned reference; a selected server protocol is not required. Agent must execute exactly one shell.exec with script: sleep 12; printf RESUME_OK > resume.txt . The 12-second wait is a required test condition and must not be removed. outputs:[resume.txt],timeout_seconds:25. Return the actual recovered resume.txt artifact and cite the pinned procedure. A replayed existing receipt is the expected successful outcome after explicit resume, not a reason to block. Completion requires the actual receipt and exact output bytes; do not add unrequested protocol-certification requirements. No external action is requested.';contract=@{kind='work';allowed_tools=@('shell.exec');output_format='resume.txt';max_work_orders=1;completion_conditions=@('Actual shell receipt and resume.txt containing RESUME_OK');verification='Compare recovered content to RESUME_OK'}}
+if($PromptOnly){
+ $request=@{request_id=[guid]::NewGuid().ToString();tenant_id=$tenant;goal=$definition.goal}
+ $launch=Invoke-Echelon '/v1/operator/tasks/launch' 'POST' $request
+ $task=$launch.task_id;$run=$launch.run_id
+}else{
+ $task=(Invoke-Echelon '/v1/operator/tasks' 'POST' $definition).task_id
+ $request=@{request_id=[guid]::NewGuid().ToString();tenant_id=$tenant;task_id=$task;connection_id=$ConnectionId;model=$Model;target='owned:recovery';max_calls=48;max_total_tokens=180000}
+ $run=(Invoke-Echelon '/v1/operator/runs' 'POST' $request).id
+}
 Write-PrivateText (Join-Path $script:RuntimeRoot 'evidence/recovery-active.json') (@{tenant_id=$tenant;task_id=$task;run_id=$run;request=$request}|ConvertTo-Json -Depth 10)
 $null=Invoke-Echelon "/v1/operator/runs/$run/control" 'POST' @{action='pause'}
 $deadline=[DateTimeOffset]::UtcNow.AddMinutes(5)
@@ -30,6 +37,7 @@ $deadline=[DateTimeOffset]::UtcNow.AddMinutes(20)
 $shellPending=$null
 do{$state=Invoke-Echelon "/v1/operator/runs/$run";$shellPending=@($state.events|Where-Object {$_.kind -eq 'tool.pending' -and $_.details.tool -eq 'shell.exec'});if($shellPending.Count){break};if($state.status -notin @('queued','running')){throw "Recovery run stopped before shell: $($state.status), $($state.error_code)"};if([DateTimeOffset]::UtcNow -gt $deadline){throw 'Shell pending boundary timed out.'};Start-Sleep -Milliseconds 350}while($true)
 $beforeKillCalls=$state.calls
+$beforeSettings=$state.handler_settings|ConvertTo-Json -Depth 8 -Compress
 $runIdentity=[guid]::Parse($run)
 $otherCount=& docker compose exec -T postgres psql -U echelon -d echelon -Atc "SELECT count(*) FROM execution_runs WHERE id<>'$runIdentity' AND status IN ('queued','running')"
 if($LASTEXITCODE -ne 0 -or [long]("$otherCount".Trim()) -ne 0){throw 'A different Echelon execution became active; the core will not be interrupted.'}
@@ -43,6 +51,7 @@ if(-not $ready){throw 'Core did not recover readiness.'}
 $interrupted=Invoke-Echelon "/v1/operator/runs/$run"
 Assert-Recovery ($interrupted.status -eq 'interrupted') 'Restart did not preserve a stopped checkpoint.'
 Assert-Recovery ($interrupted.calls -eq $beforeKillCalls) 'Restart automatically replayed provider inference.'
+if($PromptOnly){Assert-Recovery ($interrupted.handler_settings -and (($interrupted.handler_settings|ConvertTo-Json -Depth 8 -Compress) -eq $beforeSettings) -and $interrupted.contract_finalized) 'Restart lost Handler settings or finalized contract.'}
 $null=Invoke-Echelon "/v1/operator/runs/$run/control" 'POST' @{action='resume'}
 $deadline=[DateTimeOffset]::UtcNow.AddMinutes(10)
 do{$state=Invoke-Echelon "/v1/operator/runs/$run";if($state.status -notin @('queued','running')){break};if([DateTimeOffset]::UtcNow -gt $deadline){throw 'Resumed run timed out.'};Start-Sleep -Seconds 1}while($true)
@@ -74,7 +83,7 @@ function Read-RecoveryEvents([long]$After,[int]$Count){
  $values.ToArray()
 }
 try{$first=@(Read-RecoveryEvents 0 3);Assert-Recovery ($first.Count -eq 3) 'Persisted SSE activity was not replayed.';$next=@(Read-RecoveryEvents $first[-1].seq 2);Assert-Recovery ($next.Count -eq 2 -and $next[0].seq -gt $first[-1].seq) 'Last-Event-ID did not advance monotonically.';Assert-Recovery (@(@($first)+@($next)|Where-Object task_id -ne $task).Count -eq 0) 'SSE replay leaked another Task.'}finally{$cts.Dispose();$http.Dispose()}
-$result=@{passed=$true;assertions=$assertions;tenant_id=$tenant;task_id=$task;run_id=$run;pause_verified=$true;explicit_restart_resume=$true;worker_executions=1;work_orders=1;output_artifacts=1;receipt_replayed=$true;sse_task_scope_and_cursor_verified=$true;calls=$state.calls;total_tokens=$state.total_tokens;verified_at=[DateTimeOffset]::UtcNow.ToString('o')}
+$result=@{passed=$true;prompt_only=[bool]$PromptOnly;assertions=$assertions;tenant_id=$tenant;task_id=$task;run_id=$run;pause_verified=$true;explicit_restart_resume=$true;worker_executions=1;work_orders=1;output_artifacts=1;receipt_replayed=$true;sse_task_scope_and_cursor_verified=$true;calls=$state.calls;total_tokens=$state.total_tokens;verified_at=[DateTimeOffset]::UtcNow.ToString('o')}
 Write-PrivateText (Join-Path $script:RuntimeRoot 'evidence/recovery.json') ($result|ConvertTo-Json -Depth 8)
 $result|ConvertTo-Json -Compress
 }finally{Pop-Location}

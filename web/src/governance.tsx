@@ -223,26 +223,10 @@ export function Protocols() {
           wide
           onClose={() => setUse(false)}
         >
-          {task ? (
-            <RunForm
-              task={task}
-              protocol={p}
-              onStarted={() => {
-                setUse(false);
-                w.openTask(task);
-              }}
-            />
-          ) : (
-            <TaskForm
-              initialGoal={p.document.description}
-              initialContract={{
-                completion_conditions: p.document.completion_conditions,
-                allowed_tools: ["artifact.write"],
-                constraints: p.document.stop_conditions,
-              }}
-              onCreated={setTask}
-            />
-          )}
+          <TaskForm
+            initialGoal={`프로토콜:${p.document.codename}을 사용해 다음 업무를 수행하세요. ${p.document.description}`}
+            onCreated={(id) => {setUse(false);w.openTask(id);}}
+          />
         </Modal>
       )}
     </>

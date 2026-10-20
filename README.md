@@ -12,6 +12,8 @@ Master reviews activity and repetition, proposes versioned merges/splits/revisio
 
 The Korean operations console includes Tasks with Brief/Path/Broadcast/Knowledge/Outputs, Central, Protocols, Dreaming, Vault, and Settings. The dark visual theme has one editable accent color with contrast correction. The local console opens directly without a password or pairing code. An automatic HttpOnly session supports CSRF protection; a user login system is deferred.
 
+To start a Task, enter only the business goal. Handler selects an available model, bounded budgets, completion and verification conditions, tools, protocol and retention settings. After Analyst delivers pinned evidence, Handler finalizes the contract before delegating. Brief shows the resulting settings for inspection. Account connection remains a one-time workspace setup; missing business inputs may be requested during execution.
+
 Agent tools include exact-URL read-only HTTP requests through a Vault-backed Secret Broker, immutable file artifacts, and a dedicated Linux Worker. Shell children run under an unprivileged UID, with resource limits, no network syscalls, no credentials or host mounts, and a temporary job directory. Initial document workflows use UTF-8 Markdown, CSV and source files; arbitrary Office/PDF processing adapters are outside this beta.
 
 See the [beta guide and API contracts](docs/BETA.md), [execution contracts](docs/EXECUTION.md), and [implementation evidence](docs/IMPLEMENTATION.md). Vector search, object storage, WCM, app-server, additional business write connectors and remote multi-user hosting remain the optional extensions identified in the design.
@@ -83,6 +85,8 @@ GitHub CI runs this database test separately; the database test is intentionally
 Run `./scripts/Verify-ContextPacks.ps1 -RestartCore` to verify the Context Pack request, curation, reference resolution, evidence pinning and scope boundaries through actual authenticated HTTP calls. The isolated PostgreSQL verification also covers Context Packs and concurrent delivery retries.
 
 Run `./scripts/Verify-LLMLoop.ps1` with an explicitly connected account to execute an owned synthetic task through all three actual model roles, verify evidence and failure history delivery, retrieve the Agent result, and exercise role/scope and call-budget limits. This makes real ChatGPT-plan inference requests; raw evidence remains private.
+
+`./scripts/Verify-GoalLaunch.ps1` checks the prompt-only entry with real OAuth inference: Handler settings and contract finalization, Analyst/Agent work, pinned report evidence, artifact hashes and duplicate-request replay. `-Resume` rechecks its saved owned run without starting another inference. `./scripts/Verify-Recovery.ps1 -PromptOnly` also checks that Handler settings and the finalized contract survive core interruption.
 
 Run `./scripts/Verify-Beta.ps1` for the actual broker, Vault rotation, Worker limits, artifact replay and console session boundaries. `./scripts/Verify-WorkScenarios.ps1` makes real OAuth calls for report generation, constrained source changes, request classification, Master protocol proposals and protocol reuse. It measures a controlled Handler/Agent baseline, Analyst selection and protocol reuse, with setup/audit costs shown separately. `./scripts/Verify-Recovery.ps1` deliberately interrupts only this project's core while a synthetic Worker job is running, then checks explicit resume, a single job execution, and SSE cursor replay. Run recovery when no unrelated Echelon Task is active.
 

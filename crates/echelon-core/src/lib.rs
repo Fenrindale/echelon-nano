@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod autonomy;
 pub mod bootstrap;
 pub mod broker;
 pub mod config;

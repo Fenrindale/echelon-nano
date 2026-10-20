@@ -4,6 +4,8 @@
 
 ## 실행 경로
 
+콘솔에서 새 Task를 시작할 때 업무 목표 외의 설정을 요구하지 않는다. Handler가 사용 가능한 모델·프로토콜·기밀 참조의 메타데이터를 보고 `run.configure`로 실행 설정과 초안 계약을 정한다. Analyst가 근거를 전달하면 Handler가 레퍼런스를 조회하고 `run.configure_contract`로 계약을 확정해야 계획·지시할 수 있다. 모델은 설치된 도구나 서버 상한을 늘릴 수 없으며, 내부망·HTTP URL은 목표에 명시되거나 등록된 출처여야 한다. 기밀 값은 전달하지 않는다.
+
 1. Handler가 목표에 맞는 `context.request` 조건을 작성한다. 서버가 멱등 요청 키를 지정한다.
 2. Analyst가 해당 요청의 후보를 페이지 단위로 보고 기존 ID·버전을 골라 `context.curate`로 전달한다. 보지 않은 후보는 선택할 수 없다. 거짓·실패 이력과 의존 근거의 포함은 기존 Context Pack 서버가 보장한다. Analyst는 업무 결론이나 새 원문을 작성하지 않는다.
 3. Handler가 Pack과 필요한 레퍼런스를 조회한다. 모든 caution 근거를 조회하고 계획을 저장해야 지시할 수 있다. Work Order에는 목표·예상 산출물·조회한 레퍼런스를 넣으며 모든 caution 참조를 포함해야 한다.
@@ -13,6 +15,20 @@
 Agent는 허용한 URL의 읽기, 격리 코드 실행과 실제 산출물 회수를 수행할 수 있다. `retain_knowledge`를 선택하면 Handler가 재사용 항목을 제출하고 Analyst가 지정한 제출만 채택·반려한다. `dream_after`는 이후 별도 Master 감사·정리 검토안 단계를 실행한다. 후처리 오류가 이미 확정된 업무 결과를 바꾸지 않는다. 한 Task의 Work Order는 순차 처리하며 여러 Task 실행은 서버의 동시성 한도 안에서 진행한다.
 
 ## 운영자 API
+
+콘솔의 기본 경로는 `POST /v1/operator/tasks/launch`다. 업무 입력은 `goal` 하나이며 `tenant_id`와 `request_id`는 클라이언트가 지정하는 범위·멱등 메타데이터다.
+
+```json
+{
+  "tenant_id": "22222222-2222-4222-8222-222222222222",
+  "request_id": "11111111-1111-4111-8111-111111111111",
+  "goal": "이번 달 진행 현황을 근거와 함께 한국어 Markdown 보고서로 작성해 주세요."
+}
+```
+
+응답은 `task_id`, `run_id`, `replayed`를 반환한다. 같은 요청 키와 목표의 재전송은 같은 Task와 실행을 반환한다. 다른 목표로 키를 재사용할 수 없다. 설정 단계가 실패해도 초안을 보존한다. `GET /v1/operator/runs/{id}`의 `handler_settings`와 `contract_finalized`로 Handler 결정을 확인한다. 설정 효과는 체크포인트와 감사 기록에 남고 명시적 재개 시 동일 효과를 복원한다. 자동 실행의 호출 예산은 16–48회, 토큰 예산은 10,000–300,000 안에서 Handler가 결정한다. 연결 계정 선택은 저장된 업무실 기본값 또는 기존 OAuth 연결을 사용하고 임의 API 키로 전환하지 않는다.
+
+기존 Task는 `POST /v1/operator/tasks/{id}/launch`로 설정 입력 없이 실행한다. 새 방식으로 생성한 Task는 Handler 설정 단계를 다시 수행한다. 기존 수동 계약으로 만든 Task는 기존 제한을 보존한다. 아래 명시적 설정 API는 자동화와 검증용으로 유지한다.
 
 `POST /v1/operator/runs`는 로컬 운영자 인증이 필요하다. 역할 토큰으로 시작하거나 조회할 수 없다.
 

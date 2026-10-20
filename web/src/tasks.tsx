@@ -25,11 +25,6 @@ import {
   type Json,
 } from "./components";
 
-const lines = (v: string) =>
-  v
-    .split("\n")
-    .map((s) => s.trim())
-    .filter(Boolean);
 export function Tasks({ onNew }: { onNew: () => void }) {
   const w = useWorkspace();
   const [search, setSearch] = useState("");
@@ -50,7 +45,7 @@ export function Tasks({ onNew }: { onNew: () => void }) {
           <p className="eyebrow">OPERATIONS / TASKS</p>
           <h1>업무를 시작하세요.</h1>
           <p className="muted">
-            목표와 완료 조건을 정하면, 필요한 지식에서 실행까지 이어집니다.
+            업무 목표만 알려 주세요. Handler가 설정부터 실행까지 맡습니다.
           </p>
         </div>
         <button className="primary" onClick={onNew}>
@@ -128,176 +123,6 @@ export function Tasks({ onNew }: { onNew: () => void }) {
     </>
   );
 }
-export function ContractFields({
-  value,
-  onChange,
-}: {
-  value: Json;
-  onChange: (v: Json) => void;
-}) {
-  const w = useWorkspace();
-  const secrets = useAsync(
-    () => api(`/v1/operator/secrets?${query({ tenant_id: w.tenant })}`),
-    [w.tenant, w.revision],
-  );
-  const set = (k: string, v: unknown) => onChange({ ...value, [k]: v });
-  const tools: string[] = value.allowed_tools ?? [];
-  return (
-    <>
-      <div className="form-grid">
-        <Field label="산출물 형식">
-          <input
-            value={value.output_format ?? ""}
-            onChange={(e) => set("output_format", e.target.value)}
-            placeholder="예: Markdown 보고서, 수정된 Python 파일"
-            maxLength={500}
-          />
-        </Field>
-        <Field label="Work Order 최대 개수">
-          <input
-            type="number"
-            min={1}
-            max={8}
-            value={value.max_work_orders || 2}
-            onChange={(e) => set("max_work_orders", Number(e.target.value))}
-          />
-        </Field>
-      </div>
-      <Field label="완료 조건 · 한 줄에 하나">
-        <textarea
-          defaultValue={(value.completion_conditions ?? []).join("\n")}
-          onChange={(e) => set("completion_conditions", lines(e.target.value))}
-          placeholder="수치에는 출처를 기재한다"
-        />
-      </Field>
-      <Field label="제약 조건 · 한 줄에 하나">
-        <textarea
-          defaultValue={(value.constraints ?? []).join("\n")}
-          onChange={(e) => set("constraints", lines(e.target.value))}
-          placeholder="외부 시스템 변경 금지"
-        />
-      </Field>
-      <Field label="허용 도구">
-        <div className="checks">
-          {[
-            ["artifact.write", "파일 작성"],
-            ["shell.exec", "격리 코드·파일 실행"],
-            ["external.fetch", "지정 URL·API 읽기"],
-          ].map(([id, label]) => (
-            <label className="check" key={id}>
-              <input
-                type="checkbox"
-                checked={tools.includes(id)}
-                onChange={(e) =>
-                  set(
-                    "allowed_tools",
-                    e.target.checked
-                      ? [...tools, id]
-                      : tools.filter((x) => x !== id),
-                  )
-                }
-              />
-              {label}
-            </label>
-          ))}
-        </div>
-      </Field>
-      {tools.includes("external.fetch") && (
-        <>
-          <Field
-            label="허용 URL · 정확히 일치하는 주소, 한 줄에 하나"
-            hint="다른 주소로의 이동은 허용되지 않습니다. 내부 서비스는 별도 범위 승인이 필요합니다."
-          >
-            <textarea
-              defaultValue={(value.urls ?? [])
-                .map((u: Json) => u.url)
-                .join("\n")}
-              onChange={(e) =>
-                set(
-                  "urls",
-                  lines(e.target.value).map((url) => {
-                    const old = value.urls?.find((u: Json) => u.url === url);
-                    return (
-                      old ?? { url, allow_private: false, allow_http: false }
-                    );
-                  }),
-                )
-              }
-              placeholder="https://example.com/api/status"
-            />
-          </Field>
-          {value.urls?.map((u: Json, i: number) => (
-            <div className="url-grant" key={i}>
-              <code>{u.url}</code>
-              {["allow_private", "allow_http"].map((flag) => (
-                <label className="check" key={flag}>
-                  <input
-                    type="checkbox"
-                    checked={u[flag] ?? false}
-                    onChange={(e) =>
-                      set(
-                        "urls",
-                        value.urls.map((v: Json, j: number) =>
-                          j === i ? { ...v, [flag]: e.target.checked } : v,
-                        ),
-                      )
-                    }
-                  />
-                  {flag === "allow_private" ? "내부망 범위 승인" : "HTTP 허용"}
-                </label>
-              ))}
-            </div>
-          ))}
-          <Field label="이 Task에서 사용 가능한 기밀 참조">
-            <div className="checks">
-              {secrets.data?.secrets
-                ?.filter((s: Json) => s.enabled)
-                .map((s: Json) => (
-                  <label className="check" key={s.id}>
-                    <input
-                      type="checkbox"
-                      checked={value.secret_refs?.includes(s.id) ?? false}
-                      onChange={(e) =>
-                        set(
-                          "secret_refs",
-                          e.target.checked
-                            ? [...(value.secret_refs ?? []), s.id]
-                            : (value.secret_refs ?? []).filter(
-                                (id: string) => id !== s.id,
-                              ),
-                        )
-                      }
-                    />
-                    {s.name} <ID id={s.id} />
-                  </label>
-                ))}
-            </div>
-          </Field>
-        </>
-      )}
-      <Field label="검증 방법">
-        <textarea
-          value={value.verification ?? ""}
-          onChange={(e) => set("verification", e.target.value)}
-          placeholder="예: 격리 환경에서 단위 검사를 실행하고 결과를 보고한다"
-        />
-      </Field>
-      <label className="check">
-        <input
-          type="checkbox"
-          checked={value.model_access === "blocked"}
-          onChange={(e) =>
-            set(
-              "model_access",
-              e.target.checked ? "blocked" : "external_allowed",
-            )
-          }
-        />
-        외부 모델 전송 금지 · 이 Task와 파생 지식을 모델에 보내지 않음
-      </label>
-    </>
-  );
-}
 export function TaskForm({
   onCreated,
   initialGoal = "",
@@ -309,186 +134,48 @@ export function TaskForm({
 }) {
   const w = useWorkspace();
   const [goal, setGoal] = useState(initialGoal);
-  const [contract, setContract] = useState<Json>({
-    kind: "work",
-    model_access: "external_allowed",
-    allowed_tools: ["artifact.write"],
-    max_work_orders: 2,
-    ...initialContract,
-  });
+  const [requestId, setRequestId] = useState(key);
   return (
-    <SubmitForm
-      button="Task 만들기"
-      onSubmit={async () => {
-        const r = await api("/v1/operator/tasks", "POST", {
-          tenant_id: w.tenant,
-          tenant_name: w.tenantName,
-          goal,
-          contract,
-        });
-        w.refresh();
-        onCreated(r.task_id);
-      }}
-    >
+    <SubmitForm button="Handler에게 맡기기" onSubmit={async () => {
+      if (initialContract.model_access === "blocked") {
+        throw new Error("외부 모델 전송이 금지된 원본 업무는 자동 실행으로 복제할 수 없습니다.");
+      }
+      const r = await api("/v1/operator/tasks/launch", "POST", {
+        tenant_id: w.tenant,
+        request_id: requestId,
+        goal: goal.trim(),
+      });
+      w.refresh();
+      onCreated(r.task_id);
+    }}>
       <Field label="업무 목표">
-        <textarea
-          autoFocus
-          required
-          value={goal}
-          onChange={(e) => setGoal(e.target.value)}
-          maxLength={4000}
-          placeholder="무엇을, 어떤 수준까지 완료해야 하나요?"
-        />
+        <textarea autoFocus required value={goal} maxLength={4000}
+          onChange={(e) => { setGoal(e.target.value); setRequestId(key()); }}
+          placeholder="완료하고 싶은 업무를 자유롭게 설명해 주세요." />
       </Field>
-      <ContractFields value={contract} onChange={setContract} />
+      <p className="muted">
+        Handler가 목표에 맞춰 완료 조건, 산출물, 모델, 예산, 도구와 프로토콜을 정하고 바로 실행합니다.
+      </p>
     </SubmitForm>
   );
 }
-export function RunForm({
-  task,
-  protocol,
-  onStarted,
-  mode = "work",
-}: {
+export function RunForm({ task, onStarted, mode = "work" }: {
   task: string;
-  protocol?: Json;
   onStarted: () => void;
   mode?: string;
 }) {
   const w = useWorkspace();
-  const [target, setTarget] = useState(`task:${task}`);
-  const [calls, setCalls] = useState(48);
-  const [tokens, setTokens] = useState(160000);
-  const [retain, setRetain] = useState(true);
-  const [dream, setDream] = useState(true);
-  const [params, setParams] = useState<Json>({});
+  const [requestId] = useState(key);
   return (
-    <SubmitForm
-      button={mode === "dream" ? "Master 감사 시작" : "실행 시작"}
+    <SubmitForm button={mode === "dream" ? "Master 감사 시작" : "Handler에게 맡기기"}
       onSubmit={async () => {
-        if (!w.connection || !w.model)
-          throw new Error("설정에서 계정과 모델을 선택해 주세요.");
-        await api("/v1/operator/runs", "POST", {
-          request_id: key(),
-          tenant_id: w.tenant,
-          task_id: task,
-          connection_id: w.connection,
-          model: w.model,
-          target,
-          max_calls: calls,
-          max_total_tokens: tokens,
-          mode,
-          protocol_id: protocol?.id ?? null,
-          protocol_version: protocol?.version ?? null,
-          parameters: params,
-          retain_knowledge: mode === "work" && retain,
-          dream_after: mode === "work" && dream,
+        await api(`/v1/operator/tasks/${task}/launch`, "POST", {
+          tenant_id: w.tenant, request_id: requestId, mode,
         });
         w.refresh();
         onStarted();
-      }}
-    >
-      <p className="muted">
-        {w.providers.find((p) => p.id === w.connection)?.name ?? w.connection} /{" "}
-        {w.model || "모델 미선택"}
-      </p>
-      <Field label="계정">
-        <select
-          value={w.connection}
-          onChange={(e) => w.setConnection(e.target.value)}
-        >
-          <option value="">선택</option>
-          {w.providers
-            .filter((p) => p.enabled !== false && p.status !== "revoked")
-            .map((p) => (
-              <option key={p.id} value={p.id}>
-                {p.name ?? p.label ?? p.provider ?? "ChatGPT"} ·{" "}
-                {p.id.slice(0, 8)}
-              </option>
-            ))}
-        </select>
-      </Field>
-      <Field label="모델">
-        <select value={w.model} onChange={(e) => w.setModel(e.target.value)}>
-          <option value="">선택</option>
-          {w.models.map((m) => (
-            <option key={m.slug} value={m.slug}>
-              {m.display_name ?? m.slug}
-            </option>
-          ))}
-        </select>
-      </Field>
-      <Field label="허용된 작업 대상">
-        <input
-          value={target}
-          onChange={(e) => setTarget(e.target.value)}
-          required
-          maxLength={500}
-        />
-      </Field>
-      <div className="form-grid">
-        <Field label="모델 호출 한도">
-          <input
-            type="number"
-            min={1}
-            max={48}
-            value={calls}
-            onChange={(e) => setCalls(+e.target.value)}
-          />
-        </Field>
-        <Field label="누적 토큰 한도">
-          <input
-            type="number"
-            min={1000}
-            max={300000}
-            step={1000}
-            value={tokens}
-            onChange={(e) => setTokens(+e.target.value)}
-          />
-        </Field>
-      </div>
-      {protocol && (
-        <>
-          <p>
-            프로토콜:{protocol.document.codename} · v{protocol.version}
-          </p>
-          {protocol.document.parameters?.map((p: Json) => (
-            <Field key={p.name} label={p.name} hint={p.description}>
-              <input
-                required={p.required}
-                value={params[p.name] ?? ""}
-                onChange={(e) =>
-                  setParams({ ...params, [p.name]: e.target.value })
-                }
-              />
-            </Field>
-          ))}
-        </>
-      )}
-      {mode === "work" && (
-        <div className="checks">
-          <label className="check">
-            <input
-              type="checkbox"
-              checked={retain}
-              onChange={(e) => setRetain(e.target.checked)}
-            />
-            완료 후 Handler 제출 → Analyst 채택
-          </label>
-          <label className="check">
-            <input
-              type="checkbox"
-              checked={dream}
-              onChange={(e) => setDream(e.target.checked)}
-            />
-            완료 후 Master 감사·정리 제안
-          </label>
-        </div>
-      )}
-      <small className="muted">
-        호출·토큰 예산과 권한은 서버에서 적용합니다. 실제 계정의 사용 한도
-        오류는 실행 결과에 표시됩니다.
-      </small>
+      }}>
+      <p className="muted">저장된 업무 목표와 현재 계약으로 실행합니다.</p>
     </SubmitForm>
   );
 }
@@ -503,11 +190,8 @@ export function TaskDetail({
 }) {
   const w = useWorkspace();
   const [tab, setTab] = useState("brief");
-  const [runOpen, setRunOpen] = useState(false);
-  const [edit, setEdit] = useState(false);
   const [note, setNote] = useState("");
   const [error, setError] = useState<unknown>();
-  const [contract, setContract] = useState<Json>({});
   const [clone, setClone] = useState(false);
   const data = useAsync(
     () => api(`/v1/operator/tasks/${id}?${query({ tenant_id: w.tenant })}`),
@@ -599,9 +283,9 @@ export function TaskDetail({
                 <button
                   className="primary"
                   disabled={t.contract.model_access === "blocked"}
-                  onClick={() => setRunOpen(true)}
+                  onClick={async () => {try{await api(`/v1/operator/tasks/${id}/launch`,"POST",{tenant_id:w.tenant,request_id:key()});w.refresh();}catch(e){setError(e);}}}
                 >
-                  실행
+                  Handler 실행
                 </button>
               )}
               <button onClick={() => setClone(true)}>복제</button>
@@ -664,18 +348,11 @@ export function TaskDetail({
             <>
               <section className="panel">
                 <div className="section-heading">
-                  <h2>업무 계약</h2>
-                  <button
-                    disabled={active}
-                    onClick={() => {
-                      setContract(t.contract);
-                      setEdit(true);
-                    }}
-                  >
-                    계약 수정
-                  </button>
+                  <h2>{run.data?.handler_settings ? "Handler가 정한 업무 계약" : "업무 계약"}</h2>
+
                 </div>
                 <p className="prose muted">{t.goal}</p>
+                {run.data?.handler_settings && <p className="muted">Handler 설정 · {run.data.handler_settings.model} · 최대 {run.data.handler_settings.max_calls}회 / {formatNumber(run.data.handler_settings.max_total_tokens)} 토큰 · {run.data.contract_finalized ? "계약 확정" : "근거 확인 중"}</p>}
                 <dl className="brief">
                   <dt>산출물</dt>
                   <dd>{t.contract.output_format || "결과 요약"}</dd>
@@ -960,28 +637,6 @@ export function TaskDetail({
           </p>
         </aside>
       </div>
-      {runOpen && (
-        <Modal title="Task 실행" onClose={() => setRunOpen(false)}>
-          <RunForm task={id} onStarted={() => setRunOpen(false)} />
-        </Modal>
-      )}
-      {edit && (
-        <Modal title="업무 계약 수정" wide onClose={() => setEdit(false)}>
-          <SubmitForm
-            onSubmit={async () => {
-              await api(`/v1/operator/tasks/${id}`, "PATCH", {
-                tenant_id: w.tenant,
-                contract,
-                reason: "운영자 계약 개정",
-              });
-              setEdit(false);
-              w.refresh();
-            }}
-          >
-            <ContractFields value={contract} onChange={setContract} />
-          </SubmitForm>
-        </Modal>
-      )}
       {clone && (
         <Modal title="새 Task로 복제" wide onClose={() => setClone(false)}>
           <TaskForm

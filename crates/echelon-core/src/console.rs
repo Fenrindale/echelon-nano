@@ -33,6 +33,8 @@ pub fn routes() -> Router<Shared> {
         .route("/v1/operator/tenants", get(tenants).post(create_tenant))
         .route("/v1/operator/tenants/{id}/workspace", post(workspace_open))
         .route("/v1/operator/tasks", get(tasks))
+        .route("/v1/operator/tasks/launch", post(launch_goal))
+        .route("/v1/operator/tasks/{id}/launch", post(launch_task))
         .route("/v1/operator/tasks/{id}", get(task).patch(update_task))
         .route("/v1/operator/tasks/{id}/inputs", post(task_input))
         .route("/v1/operator/artifacts", post(upload))
@@ -58,6 +60,70 @@ pub fn routes() -> Router<Shared> {
         )
         .route("/v1/operator/events", get(events))
         .route("/assets/{name}", get(asset))
+}
+async fn launch_goal(
+    State(s): State<Shared>,
+    h: HeaderMap,
+    Json(r): Json<crate::autonomy::Launch>,
+) -> crate::error::AppResult<Json<Value>> {
+    operator(&s, &h).await?;
+    let (value, spawn) = crate::autonomy::launch(&s, r).await?;
+    if spawn {
+        let id = serde_json::from_value(value["run_id"].clone()).map_err(|_| bad())?;
+        tokio::spawn(execution::drive(s, id));
+    }
+    Ok(Json(value))
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LaunchTask {
+    tenant_id: Uuid,
+    request_id: Uuid,
+    #[serde(default)]
+    mode: Option<String>,
+}
+async fn launch_task(
+    State(s): State<Shared>,
+    h: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(r): Json<LaunchTask>,
+) -> crate::error::AppResult<Json<Value>> {
+    operator(&s, &h).await?;
+    let managed: bool =
+        sqlx::query_scalar("SELECT launch_key IS NOT NULL FROM tasks WHERE tenant_id=$1 AND id=$2")
+            .bind(r.tenant_id)
+            .bind(id)
+            .fetch_optional(&s.pool)
+            .await
+            .map_err(db)?
+            .ok_or_else(missing)?;
+    let mode = r.mode.unwrap_or_else(|| "work".into());
+    let (connection_id, model) = crate::autonomy::defaults(&s, r.tenant_id).await?;
+    let c = execution::StartRun {
+        request_id: r.request_id,
+        tenant_id: r.tenant_id,
+        task_id: id,
+        connection_id,
+        model,
+        target: format!("task:{id}"),
+        max_calls: 48,
+        max_total_tokens: 300000,
+        mode: mode.clone(),
+        protocol_id: None,
+        protocol_version: None,
+        parameters: Value::Null,
+        retain_knowledge: !managed && mode == "work",
+        dream_after: !managed && mode == "work",
+        prepared_pack_id: None,
+        eager_context: false,
+        auto_configure: managed,
+    };
+    let (value, spawn) = execution::start(&s, c).await?;
+    if spawn {
+        let run = serde_json::from_value(value["id"].clone()).map_err(|_| bad())?;
+        tokio::spawn(execution::drive(s, run));
+    }
+    Ok(Json(value))
 }
 async fn open_session(State(s): State<Shared>, h: HeaderMap) -> crate::error::AppResult<Response> {
     ui_auth::open_session(&s, &h).await
