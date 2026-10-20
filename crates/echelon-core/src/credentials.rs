@@ -4,7 +4,7 @@ use crate::{
     error::{AppError, AppResult},
     policy::Claims,
     server::AppState,
-    workspace::{self, UrlGrant, bad, db, missing},
+    workspace::{self, CredentialBinding, TaskContract, UrlGrant, bad, db, missing},
 };
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -86,7 +86,112 @@ fn parse(text: &str) -> AppResult<BTreeMap<String, String>> {
 fn manifest(entries: &BTreeMap<String, String>) -> Value {
     json!({"format":"literal_env","entry_names":entries.keys().collect::<Vec<_>>(),"entry_count":entries.len(),
         "empty_names":entries.iter().filter(|(_,v)|v.is_empty()).map(|(k,_)|k).collect::<Vec<_>>(),
-        "sensitive_field_count":entries.keys().filter(|k|secret_name(k)).count(),"values_withheld":true})
+        "sensitive_field_count":entries.keys().filter(|k|secret_name(k)).count(),"targets":targets(entries),"values_withheld":true})
+}
+fn target_url(value: &str) -> Option<String> {
+    let url = url::Url::parse(value).ok()?;
+    (matches!(url.scheme(), "http" | "https")
+        && url.host_str().is_some()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none())
+    .then(|| value.trim_end_matches('/').to_string())
+}
+fn targets(entries: &BTreeMap<String, String>) -> Vec<Value> {
+    entries
+        .iter()
+        .filter_map(|(key, value)| {
+            let upper = key.to_ascii_uppercase();
+            if secret_name(key)
+                || !(upper.ends_with("URL") || upper.ends_with("HOST") || upper.ends_with("URI"))
+            {
+                return None;
+            }
+            let url = target_url(value)?;
+            if entries.iter().any(|(name, secret)| {
+                secret_name(name) && secret.len() >= 4 && url.contains(secret)
+            }) {
+                return None;
+            }
+            let kind = if upper.contains("JENKINS") {
+                Some("jenkins")
+            } else if upper.contains("GITLAB") {
+                Some("gitlab")
+            } else if upper.contains("DATABRICKS") {
+                Some("databricks")
+            } else {
+                None
+            };
+            Some(json!({"target_variable":key,"base_url":url,"kind":kind}))
+        })
+        .take(16)
+        .collect()
+}
+pub fn validate_binding(r: &CredentialBinding) -> AppResult<()> {
+    if !matches!(r.kind.as_str(), "gitlab" | "jenkins" | "databricks")
+        || !identifier(&r.token_variable)
+        || r.kind == "jenkins" && !identifier(&r.username_variable)
+        || r.base_url.len() > 1024
+        || target_url(&r.base_url).is_none()
+        || r.base_url.starts_with("http:") && !r.allow_http
+        || r.source_artifact_id.is_some() != r.target_variable.is_some()
+        || r.target_variable
+            .as_ref()
+            .is_some_and(|v| !identifier(v) || secret_name(v))
+    {
+        return Err(AppError::bad("credential_binding_invalid"));
+    }
+    Ok(())
+}
+pub async fn validate_task_bindings(
+    pool: &PgPool,
+    tenant: Uuid,
+    task: Uuid,
+    policy: &TaskContract,
+) -> AppResult<()> {
+    if policy.credential_bindings.is_empty() {
+        return Ok(());
+    }
+    let goal: String = sqlx::query_scalar("SELECT goal FROM tasks WHERE tenant_id=$1 AND id=$2")
+        .bind(tenant)
+        .bind(task)
+        .fetch_one(pool)
+        .await
+        .map_err(db)?;
+    for binding in &policy.credential_bindings {
+        validate_binding(binding)?;
+        if goal.split_whitespace().any(|part| {
+            target_url(part.trim_matches(|c: char| "`\"'()<>,.;[]{}".contains(c)))
+                .is_some_and(|url| url == binding.base_url.trim_end_matches('/'))
+        }) {
+            continue;
+        }
+        let source = binding
+            .source_artifact_id
+            .ok_or_else(|| AppError::forbidden("credential_target_not_in_task"))?;
+        let input = policy.input_artifacts.contains(&source);
+        let reusable:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM credential_bundles WHERE tenant_id=$1 AND id=ANY($2) AND source_artifact_id=$3)").bind(tenant).bind(&policy.credential_bundles).bind(source).fetch_one(pool).await.map_err(db)?;
+        let row = sqlx::query("SELECT body,task_id FROM artifacts WHERE tenant_id=$1 AND id=$2")
+            .bind(tenant)
+            .bind(source)
+            .fetch_optional(pool)
+            .await
+            .map_err(db)?
+            .ok_or_else(missing)?;
+        if !(input && row.get::<Uuid, _>("task_id") == task || reusable) {
+            return Err(missing());
+        }
+        let bytes: Vec<u8> = row.get("body");
+        let entries = parse(std::str::from_utf8(&bytes).map_err(|_| bad())?)?;
+        if !targets(&entries).iter().any(|target| {
+            target["target_variable"].as_str() == binding.target_variable.as_deref()
+                && target["base_url"].as_str() == Some(binding.base_url.trim_end_matches('/'))
+        }) {
+            return Err(AppError::forbidden("credential_target_not_in_task"));
+        }
+    }
+    Ok(())
 }
 pub fn model_view(value: &Value) -> Option<Value> {
     let name = value["artifact"]["name"].as_str().unwrap_or("");
@@ -128,6 +233,29 @@ fn bundle_header(row: &sqlx::postgres::PgRow) -> Value {
         "source_artifact_id":row.get::<Uuid,_>("source_artifact_id"),"source_sha256":row.get::<String,_>("source_sha256"),
         "entry_names":row.get::<Value,_>("entry_names"),"empty_names":row.get::<Value,_>("empty_names"),
         "vault_version":row.get::<i64,_>("vault_version"),"storage_verified":true,"authentication":"unverified"})
+}
+async fn storage_receipt(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    a: &Claims,
+    id: Uuid,
+    artifact: Uuid,
+    version: u64,
+    replayed: bool,
+    request_id: Option<Uuid>,
+) -> AppResult<Value> {
+    let details = json!({"bundle_id":id,"artifact_id":artifact,"work_order_id":a.work_order_id,"vault_version":version,"vault_roundtrip_verified":true,"replayed":replayed,"request_id":request_id});
+    let seq:i64=sqlx::query_scalar("INSERT INTO audit_records(tenant_id,task_id,actor_role,action,outcome,details) VALUES($1,$2,'agent',$3,'success',$4) RETURNING seq")
+        .bind(a.tenant_id).bind(a.task_id).bind(if replayed{"credential.storage_verified"}else{"credential.imported"}).bind(&details).fetch_one(&mut **tx).await.map_err(db)?;
+    Ok(json!({"audit_seq":seq,"details":details}))
+}
+pub async fn work_evidence(pool: &PgPool, a: &Claims, order: Uuid) -> AppResult<Value> {
+    let imports=sqlx::query("SELECT seq,details,created_at::text AS observed_at FROM audit_records WHERE tenant_id=$1 AND task_id=$2 AND actor_role='agent' AND action IN ('credential.imported','credential.storage_verified') AND details->>'work_order_id'=$3 ORDER BY seq DESC LIMIT 32")
+        .bind(a.tenant_id).bind(a.task_id).bind(order.to_string()).fetch_all(pool).await.map_err(db)?;
+    let checks:Vec<Value>=sqlx::query_scalar("SELECT result FROM credential_checks WHERE tenant_id=$1 AND task_id=$2 AND work_order_id=$3 UNION ALL SELECT result FROM task_credential_checks WHERE tenant_id=$1 AND task_id=$2 AND work_order_id=$3 LIMIT 32")
+        .bind(a.tenant_id).bind(a.task_id).bind(order).fetch_all(pool).await.map_err(db)?;
+    Ok(
+        json!({"credential_imports":imports.iter().map(|row|json!({"audit_seq":row.get::<i64,_>("seq"),"details":row.get::<Value,_>("details"),"observed_at":row.get::<String,_>("observed_at")})).collect::<Vec<_>>(),"credential_checks":checks,"source":"server_records"}),
+    )
 }
 pub async fn import(s: &AppState, a: &Claims, input: &Value) -> AppResult<Value> {
     let policy = broker::order_policy(&s.pool, a).await?;
@@ -183,18 +311,22 @@ pub async fn import(s: &AppState, a: &Claims, input: &Value) -> AppResult<Value>
         if row.get::<i64, _>("vault_version") != version as i64 {
             return Err(AppError::bad("credential_version_unconfirmed"));
         }
+        let receipt =
+            storage_receipt(&mut tx, a, id, r.artifact_id, version, true, r.request_id).await?;
         tx.commit().await.map_err(db)?;
         return Ok(
-            json!({"bundle":bundle_header(&row),"replayed":true,"vault_roundtrip_verified":true}),
+            json!({"bundle":bundle_header(&row),"replayed":true,"vault_roundtrip_verified":true,"storage_receipt":receipt}),
         );
     }
     let row=sqlx::query("INSERT INTO credential_bundles(id,tenant_id,source_task_id,source_artifact_id,source_sha256,name,entry_names,empty_names,vault_version) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *")
         .bind(id).bind(a.tenant_id).bind(a.task_id).bind(r.artifact_id).bind(&expected.source_sha256).bind(value["artifact"]["name"].as_str().ok_or_else(bad)?)
         .bind(&info["entry_names"]).bind(&info["empty_names"]).bind(version as i64).fetch_one(&mut *tx).await.map_err(db)?;
-    sqlx::query("INSERT INTO audit_records(tenant_id,task_id,actor_role,action,outcome,details) VALUES($1,$2,'agent','credential.imported','success',$3)")
-        .bind(a.tenant_id).bind(a.task_id).bind(json!({"bundle_id":id,"artifact_id":r.artifact_id,"work_order_id":a.work_order_id,"vault_version":version,"entry_count":info["entry_count"],"request_id":r.request_id})).execute(&mut *tx).await.map_err(db)?;
+    let receipt =
+        storage_receipt(&mut tx, a, id, r.artifact_id, version, false, r.request_id).await?;
     tx.commit().await.map_err(db)?;
-    Ok(json!({"bundle":bundle_header(&row),"replayed":false,"vault_roundtrip_verified":true}))
+    Ok(
+        json!({"bundle":bundle_header(&row),"replayed":false,"vault_roundtrip_verified":true,"storage_receipt":receipt}),
+    )
 }
 pub async fn catalog(pool: &PgPool, tenant: Uuid) -> AppResult<Value> {
     let bundles = sqlx::query(
@@ -205,15 +337,19 @@ pub async fn catalog(pool: &PgPool, tenant: Uuid) -> AppResult<Value> {
     .await
     .map_err(db)?;
     let connectors=sqlx::query("SELECT to_jsonb(c) AS value FROM credential_connectors c WHERE tenant_id=$1 ORDER BY name LIMIT 32").bind(tenant).fetch_all(pool).await.map_err(db)?;
-    let checks=sqlx::query("SELECT DISTINCT ON(bundle_id,connector_id) result,created_at::text AS checked_at FROM credential_checks WHERE tenant_id=$1 ORDER BY bundle_id,connector_id,created_at DESC LIMIT 100").bind(tenant).fetch_all(pool).await.map_err(db)?;
+    let checks=sqlx::query("SELECT result,created_at::text AS checked_at FROM (SELECT result,created_at FROM credential_checks WHERE tenant_id=$1 UNION ALL SELECT result,created_at FROM task_credential_checks WHERE tenant_id=$1) checks ORDER BY created_at DESC LIMIT 100").bind(tenant).fetch_all(pool).await.map_err(db)?;
     Ok(
         json!({"bundles":bundles.iter().map(bundle_header).collect::<Vec<_>>(),"connectors":connectors.iter().map(|r|r.get::<Value,_>("value")).collect::<Vec<_>>(),"checks":checks.iter().map(|r|json!({"result":r.get::<Value,_>("result"),"checked_at":r.get::<String,_>("checked_at")})).collect::<Vec<_>>(),
-        "supported_identity_connectors":["gitlab","jenkins","databricks"],"scope":"Checks require an operator-registered connector and a pinned Work Order grant. Vault storage is separate from service authentication."}),
+        "supported_identity_connectors":["gitlab","jenkins","databricks"],"scope":"Handler selects Task-local identity bindings from the user goal or selected configuration inputs. Workspace connection profiles are optional. Work Orders freeze the selected scope; Vault storage is separate from service authentication."}),
     )
 }
 pub async fn model_catalog(pool: &PgPool, tenant: Uuid) -> AppResult<Value> {
     let mut value = catalog(pool, tenant).await?;
-    value.as_object_mut().ok_or_else(bad)?.remove("checks");
+    let checks = value
+        .as_object_mut()
+        .ok_or_else(bad)?
+        .remove("checks")
+        .unwrap_or(json!([]));
     let restricted: Vec<Uuid> = sqlx::query_scalar(
         "SELECT id FROM tasks WHERE tenant_id=$1 AND contract->>'model_access'='blocked'",
     )
@@ -242,6 +378,16 @@ pub async fn model_catalog(pool: &PgPool, tenant: Uuid) -> AppResult<Value> {
         connectors.retain(|c| c["enabled"] == true);
         connectors.truncate(16);
     }
+    let ids: Vec<Value> = value["bundles"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|b| b["id"].clone())
+        .collect();
+    value["recent_bindings"]=json!(checks.as_array().into_iter().flatten().filter_map(|check| {
+        let result=&check["result"];
+        (ids.contains(&result["bundle_id"]) && result["binding_snapshot"].is_object()).then(||json!({"bundle_id":result["bundle_id"],"binding":result["binding_snapshot"]}))
+    }).take(8).collect::<Vec<_>>());
     Ok(value)
 }
 
@@ -316,7 +462,8 @@ pub async fn save_connector(s: &AppState, r: ConnectorInput) -> AppResult<Value>
 #[serde(deny_unknown_fields)]
 struct Check {
     bundle_id: Uuid,
-    connector_id: Uuid,
+    connector_id: Option<Uuid>,
+    binding_index: Option<usize>,
     request_id: Option<Uuid>,
 }
 pub async fn check(s: &AppState, a: &Claims, input: &Value) -> AppResult<Value> {
@@ -325,10 +472,17 @@ pub async fn check(s: &AppState, a: &Claims, input: &Value) -> AppResult<Value> 
         return Err(AppError::forbidden("work_tool_denied"));
     }
     let r: Check = serde_json::from_value(input.clone()).map_err(|_| bad())?;
+    if let Some(index) = r.binding_index {
+        if r.connector_id.is_some() {
+            return Err(bad());
+        }
+        return check_binding(s, a, &p, &r, index).await;
+    }
+    let connector_id = r.connector_id.ok_or_else(bad)?;
     let grant = p
         .credential_connectors
         .iter()
-        .find(|g| g.id == r.connector_id)
+        .find(|g| g.id == connector_id)
         .ok_or_else(|| AppError::forbidden("credential_connector_not_granted"))?;
     let bundle = sqlx::query("SELECT * FROM credential_bundles WHERE tenant_id=$1 AND id=$2")
         .bind(a.tenant_id)
@@ -348,7 +502,7 @@ pub async fn check(s: &AppState, a: &Claims, input: &Value) -> AppResult<Value> 
         "SELECT * FROM credential_connectors WHERE tenant_id=$1 AND id=$2 AND enabled FOR SHARE",
     )
     .bind(a.tenant_id)
-    .bind(r.connector_id)
+    .bind(connector_id)
     .fetch_optional(&mut *tx)
     .await
     .map_err(db)?
@@ -358,14 +512,14 @@ pub async fn check(s: &AppState, a: &Claims, input: &Value) -> AppResult<Value> 
     }
     let lock = format!(
         "credential-check:{:?}:{}:{}:{}",
-        a.work_order_id, r.bundle_id, r.connector_id, grant.version
+        a.work_order_id, r.bundle_id, connector_id, grant.version
     );
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))")
         .bind(lock)
         .execute(&mut *tx)
         .await
         .map_err(db)?;
-    if let Some(result)=sqlx::query_scalar::<_,Value>("SELECT result FROM credential_checks WHERE tenant_id=$1 AND work_order_id=$2 AND bundle_id=$3 AND connector_id=$4 AND connector_version=$5").bind(a.tenant_id).bind(a.work_order_id).bind(r.bundle_id).bind(r.connector_id).bind(grant.version).fetch_optional(&mut *tx).await.map_err(db)? {return Ok(result);}
+    if let Some(result)=sqlx::query_scalar::<_,Value>("SELECT result FROM credential_checks WHERE tenant_id=$1 AND work_order_id=$2 AND bundle_id=$3 AND connector_id=$4 AND connector_version=$5").bind(a.tenant_id).bind(a.work_order_id).bind(r.bundle_id).bind(connector_id).bind(grant.version).fetch_optional(&mut *tx).await.map_err(db)? {return Ok(result);}
     let stored = s
         .vault
         .get::<Bundle>(&format!("usersecrets/{}", r.bundle_id))
@@ -411,9 +565,92 @@ pub async fn check(s: &AppState, a: &Claims, input: &Value) -> AppResult<Value> 
         .await
     };
     let id = Uuid::new_v4();
-    let result = json!({"check_id":id,"bundle_id":r.bundle_id,"connector_id":r.connector_id,"connector_version":grant.version,"connector_snapshot":{"kind":kind,"base_url":base,"username_variable":connector.get::<String,_>("username_variable"),"token_variable":connector.get::<String,_>("token_variable"),"allow_private":url_grant.allow_private,"allow_http":url_grant.allow_http},"observation":observation});
-    sqlx::query("INSERT INTO credential_checks(id,tenant_id,task_id,work_order_id,bundle_id,connector_id,connector_version,result) VALUES($1,$2,$3,$4,$5,$6,$7,$8)").bind(id).bind(a.tenant_id).bind(a.task_id).bind(a.work_order_id).bind(r.bundle_id).bind(r.connector_id).bind(grant.version).bind(&result).execute(&mut *tx).await.map_err(db)?;
-    sqlx::query("INSERT INTO audit_records(tenant_id,task_id,actor_role,action,outcome,details) VALUES($1,$2,'agent','credential.checked',$3,$4)").bind(a.tenant_id).bind(a.task_id).bind(observation["status"].as_str().unwrap_or("unverified")).bind(json!({"check_id":id,"bundle_id":r.bundle_id,"connector_id":r.connector_id,"request_id":r.request_id})).execute(&mut *tx).await.map_err(db)?;
+    let result = json!({"check_id":id,"bundle_id":r.bundle_id,"connector_id":connector_id,"connector_version":grant.version,"connector_snapshot":{"kind":kind,"base_url":base,"username_variable":connector.get::<String,_>("username_variable"),"token_variable":connector.get::<String,_>("token_variable"),"allow_private":url_grant.allow_private,"allow_http":url_grant.allow_http},"observation":observation});
+    sqlx::query("INSERT INTO credential_checks(id,tenant_id,task_id,work_order_id,bundle_id,connector_id,connector_version,result) VALUES($1,$2,$3,$4,$5,$6,$7,$8)").bind(id).bind(a.tenant_id).bind(a.task_id).bind(a.work_order_id).bind(r.bundle_id).bind(connector_id).bind(grant.version).bind(&result).execute(&mut *tx).await.map_err(db)?;
+    sqlx::query("INSERT INTO audit_records(tenant_id,task_id,actor_role,action,outcome,details) VALUES($1,$2,'agent','credential.checked',$3,$4)").bind(a.tenant_id).bind(a.task_id).bind(observation["status"].as_str().unwrap_or("unverified")).bind(json!({"check_id":id,"bundle_id":r.bundle_id,"connector_id":connector_id,"request_id":r.request_id})).execute(&mut *tx).await.map_err(db)?;
+    tx.commit().await.map_err(db)?;
+    Ok(result)
+}
+async fn check_binding(
+    s: &AppState,
+    a: &Claims,
+    p: &TaskContract,
+    r: &Check,
+    index: usize,
+) -> AppResult<Value> {
+    let binding = p
+        .credential_bindings
+        .get(index)
+        .ok_or_else(|| AppError::forbidden("credential_binding_not_in_work_order"))?;
+    let current = workspace::task_contract(&s.pool, a).await?;
+    if current
+        .credential_bindings
+        .get(index)
+        .is_none_or(|v| json!(v) != json!(binding))
+    {
+        return Err(AppError::forbidden("credential_binding_changed"));
+    }
+    validate_task_bindings(&s.pool, a.tenant_id, a.task_id, &current).await?;
+    let row=sqlx::query("SELECT b.* FROM credential_bundles b JOIN tasks t ON t.tenant_id=b.tenant_id AND t.id=b.source_task_id WHERE b.tenant_id=$1 AND b.id=$2 AND COALESCE(t.contract->>'model_access','')<>'blocked'").bind(a.tenant_id).bind(r.bundle_id).fetch_optional(&s.pool).await.map_err(db)?.ok_or_else(missing)?;
+    if !(row.get::<Uuid, _>("source_task_id") == a.task_id
+        && p.input_artifacts.contains(&row.get("source_artifact_id"))
+        || p.credential_bundles.contains(&r.bundle_id))
+    {
+        return Err(missing());
+    }
+    let fingerprint = workspace::digest(&serde_json::to_vec(binding).map_err(|_| bad())?);
+    let mut tx = s.pool.begin().await.map_err(db)?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))")
+        .bind(format!(
+            "task-identity:{:?}:{}:{index}:{fingerprint}",
+            a.work_order_id, r.bundle_id
+        ))
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
+    if let Some(result)=sqlx::query_scalar::<_,Value>("SELECT result FROM task_credential_checks WHERE tenant_id=$1 AND work_order_id=$2 AND bundle_id=$3 AND binding_index=$4 AND binding_sha256=$5").bind(a.tenant_id).bind(a.work_order_id).bind(r.bundle_id).bind(index as i32).bind(&fingerprint).fetch_optional(&mut *tx).await.map_err(db)?{return Ok(result);}
+    let stored = s
+        .vault
+        .get::<Bundle>(&format!("usersecrets/{}", r.bundle_id))
+        .await?
+        .ok_or_else(missing)?;
+    if stored.value.tenant_id != a.tenant_id
+        || stored.version != row.get::<i64, _>("vault_version") as u64
+    {
+        return Err(AppError::bad("credential_version_unconfirmed"));
+    }
+    let token = stored
+        .value
+        .variables
+        .get(&binding.token_variable)
+        .filter(|v| !v.is_empty());
+    let user = stored.value.variables.get(&binding.username_variable);
+    let suffix = match binding.kind.as_str() {
+        "gitlab" => "api/v4/user",
+        "jenkins" => "whoAmI/api/json",
+        "databricks" => "api/2.0/preview/scim/v2/Me",
+        _ => return Err(bad()),
+    };
+    let observation =
+        if token.is_none() || binding.kind == "jenkins" && user.is_none_or(|v| v.is_empty()) {
+            json!({"status":"missing_fields","authenticated":false,"attempted":false})
+        } else {
+            identity_request(
+                &UrlGrant {
+                    url: format!("{}/{suffix}", binding.base_url.trim_end_matches('/')),
+                    allow_private: binding.allow_private,
+                    allow_http: binding.allow_http,
+                },
+                &binding.kind,
+                token.ok_or_else(bad)?,
+                user.map(String::as_str),
+            )
+            .await
+        };
+    let id = Uuid::new_v4();
+    let result = json!({"check_id":id,"bundle_id":r.bundle_id,"binding_index":index,"binding_sha256":fingerprint,"binding_snapshot":binding,"observation":observation});
+    sqlx::query("INSERT INTO task_credential_checks(id,tenant_id,task_id,work_order_id,bundle_id,binding_index,binding_sha256,result) VALUES($1,$2,$3,$4,$5,$6,$7,$8)").bind(id).bind(a.tenant_id).bind(a.task_id).bind(a.work_order_id).bind(r.bundle_id).bind(index as i32).bind(&fingerprint).bind(&result).execute(&mut *tx).await.map_err(db)?;
+    sqlx::query("INSERT INTO audit_records(tenant_id,task_id,actor_role,action,outcome,details) VALUES($1,$2,'agent','credential.checked',$3,$4)").bind(a.tenant_id).bind(a.task_id).bind(observation["status"].as_str().unwrap_or("unverified")).bind(json!({"check_id":id,"bundle_id":r.bundle_id,"binding_index":index,"binding_sha256":fingerprint,"request_id":r.request_id})).execute(&mut *tx).await.map_err(db)?;
     tx.commit().await.map_err(db)?;
     Ok(result)
 }
@@ -472,6 +709,24 @@ fn identity_matches(kind: &str, value: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn task_bindings_use_configuration_targets_without_exposing_credentials() {
+        let entries=parse("JENKINS_URL=https://ci.example/jenkins/\nJENKINS_USER=owned\nPAT=opaque\nOTHER_URL=https://host.example?token=private\nBAD_HOST=https://user:password@host.example\nAPI_TOKEN=hidden-token-value\nLEAK_URL=https://host.example/hidden-token-value\n").unwrap();
+        let target_list = targets(&entries);
+        assert_eq!(target_list.len(), 1);
+        assert_eq!(target_list[0]["base_url"], "https://ci.example/jenkins");
+        assert_eq!(target_list[0]["kind"], "jenkins");
+        let mut binding:CredentialBinding=serde_json::from_value(json!({"kind":"jenkins","base_url":"https://ci.example/jenkins","username_variable":"JENKINS_USER","token_variable":"PAT"})).unwrap();
+        assert!(validate_binding(&binding).is_ok());
+        binding.kind = "ssh".into();
+        assert!(validate_binding(&binding).is_err());
+        binding.kind = "jenkins".into();
+        binding.base_url = "https://user:password@ci.example".into();
+        assert!(validate_binding(&binding).is_err());
+        binding.base_url = "https://ci.example".into();
+        binding.source_artifact_id = Some(Uuid::new_v4());
+        assert!(validate_binding(&binding).is_err());
+    }
     #[test]
     fn literal_env_is_bounded_and_never_executes_or_expands() {
         let values = parse(

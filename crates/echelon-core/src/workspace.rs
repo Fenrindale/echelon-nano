@@ -55,6 +55,7 @@ pub struct TaskContract {
     pub secret_refs: Vec<Uuid>,
     pub credential_bundles: Vec<Uuid>,
     pub credential_connectors: Vec<CredentialConnectorGrant>,
+    pub credential_bindings: Vec<CredentialBinding>,
     pub input_artifacts: Vec<Uuid>,
     pub verification: String,
     pub max_work_orders: u32,
@@ -73,6 +74,24 @@ pub struct UrlGrant {
 pub struct CredentialConnectorGrant {
     pub id: Uuid,
     pub version: i64,
+}
+/// Task-local connection parameters selected by Handler, frozen into a Work Order.
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialBinding {
+    pub kind: String,
+    pub base_url: String,
+    #[serde(default)]
+    pub username_variable: String,
+    pub token_variable: String,
+    #[serde(default)]
+    pub allow_private: bool,
+    #[serde(default)]
+    pub allow_http: bool,
+    #[serde(default)]
+    pub source_artifact_id: Option<Uuid>,
+    #[serde(default)]
+    pub target_variable: Option<String>,
 }
 impl TaskContract {
     pub fn validate(&self) -> AppResult<()> {
@@ -98,6 +117,7 @@ impl TaskContract {
             || self.secret_refs.len() > 8
             || self.credential_bundles.len() > 16
             || self.credential_connectors.len() > 8
+            || self.credential_bindings.len() > 8
             || self.credential_connectors.iter().any(|g| g.version < 1)
             || self.input_artifacts.len() > 16
             || self.max_work_orders > 8
@@ -113,6 +133,9 @@ impl TaskContract {
             })
         {
             return Err(bad());
+        }
+        for binding in &self.credential_bindings {
+            crate::credentials::validate_binding(binding)?;
         }
         for grant in &self.urls {
             let url = url::Url::parse(&grant.url).map_err(|_| bad())?;

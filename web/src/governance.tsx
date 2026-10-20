@@ -927,7 +927,7 @@ export function Vault() {
             Task에는 사용 범위를, 모델에는 불투명한 참조만 전달합니다.
           </p>
         </div>
-        <button onClick={() => setConnector(null)}>＋ 인증 커넥터</button>
+        <button onClick={() => setConnector(null)}>＋ 연결 프리셋 저장</button>
         <button className="primary" onClick={() => setEdit(null)}>
           ＋ 기밀 참조 등록
         </button>
@@ -935,7 +935,7 @@ export function Vault() {
       <ErrorBox error={r.error || credentials.error || error} />
       <section className="panel">
         <h2>Task에서 가져온 기밀 묶음</h2>
-        <p className="muted">Agent가 승인된 첨부파일을 서버 경유로 Vault에 보관합니다. 저장 확인과 외부 서비스 인증 결과는 별개입니다.</p>
+        <p className="muted">Handler가 업무 목표와 첨부 설정으로 연결을 정하고 Agent가 실행합니다. 별도 커넥터 등록·승인은 필요하지 않습니다. 저장 확인과 서비스 인증 결과는 따로 기록합니다.</p>
         {(credentials.data?.bundles ?? []).map((b: Json) => <div className="secret-row" key={b.id}>
           <span className="file-icon">⌁</span>
           <div className="grow">
@@ -943,7 +943,7 @@ export function Vault() {
             <p>Vault v{b.vault_version} 저장 확인 · 변수 {b.entry_names.length}개 · 빈 값 {b.empty_names.length}개</p>
             <details><summary>변수명 보기 · 값 비공개</summary><Tags tags={b.entry_names} /></details>
             {(credentials.data?.checks ?? []).filter((check: Json) => check.result.bundle_id === b.id).map((check: Json) => <p key={check.result.check_id}>
-              인증 기록 · 커넥터 <ID id={check.result.connector_id} /> v{check.result.connector_version} · <Badge value={check.result.observation.status} />
+              인증 기록 · {check.result.binding_snapshot ? <>Task 연결 {check.result.binding_index + 1} · {check.result.binding_snapshot.kind}</> : <>프리셋 <ID id={check.result.connector_id} /> v{check.result.connector_version}</>} · <Badge value={check.result.observation.status} />
               <small> {check.checked_at}</small>
             </p>)}
           </div>
@@ -952,13 +952,13 @@ export function Vault() {
         {!credentials.data?.bundles?.length && <Empty title="Task에서 가져온 기밀 묶음이 없습니다" />}
       </section>
       <section className="panel">
-        <div className="row"><h2>승인된 인증 커넥터</h2></div>
-        <p className="muted">업무실에서 승인한 대상에만 고정된 계정 조회 요청을 보냅니다. 첨부파일의 주소가 접속 권한을 부여하지 않습니다.</p>
+        <div className="row"><h2>선택 사항 · 저장된 연결 프리셋</h2></div>
+        <p className="muted">자주 쓰는 연결을 보관할 수 있습니다. 프리셋이 없어도 Handler가 Task에 필요한 연결을 설정합니다.</p>
         {(credentials.data?.connectors ?? []).map((c: Json) => <div className="secret-row" key={c.id}>
           <div className="grow"><h3>{c.name}</h3><p>{c.kind} · v{c.version} · {c.enabled ? "사용 가능" : "사용 중지"}</p><small>{c.base_url}</small><ID id={c.id} /></div>
           <button onClick={() => setConnector(c)}>범위 수정</button>
         </div>)}
-        {!credentials.data?.connectors?.length && <Empty title="승인된 인증 커넥터가 없습니다" />}
+        {!credentials.data?.connectors?.length && <Empty title="저장된 연결 프리셋이 없습니다">Task 실행에는 필요하지 않습니다.</Empty>}
       </section>
       <div className="panel">
         {r.data?.secrets?.map((s: Json) => (
@@ -1011,7 +1011,7 @@ export function Vault() {
           <SecretForm secret={edit} onDone={() => setEdit(undefined)} />
         </Modal>
       )}
-      {connector !== undefined && <Modal title={connector ? "인증 커넥터 수정" : "인증 커넥터 등록"} onClose={() => setConnector(undefined)}>
+      {connector !== undefined && <Modal title={connector ? "연결 프리셋 수정" : "연결 프리셋 저장"} onClose={() => setConnector(undefined)}>
         <CredentialConnectorForm connector={connector} onDone={() => setConnector(undefined)} />
       </Modal>}
     </>
@@ -1027,7 +1027,7 @@ function CredentialConnectorForm({ connector: c, onDone }: { connector: Json | n
   const [privateNetwork, setPrivateNetwork] = useState(c?.allow_private ?? false);
   const [http, setHttp] = useState(c?.allow_http ?? false);
   const [enabled, setEnabled] = useState(c?.enabled ?? true);
-  return <SubmitForm button="커넥터 저장" onSubmit={async () => {
+  return <SubmitForm button="프리셋 저장" onSubmit={async () => {
     await api("/v1/operator/credential-connectors", "POST", {
       tenant_id: w.tenant, id: c?.id, expected_version: c?.version,
       name, kind, base_url: base, username_variable: user, token_variable: token,
@@ -1047,7 +1047,7 @@ function CredentialConnectorForm({ connector: c, onDone }: { connector: Json | n
     <label className="check"><input type="checkbox" checked={privateNetwork} onChange={(e) => setPrivateNetwork(e.target.checked)} />이 커넥터의 내부망 대상 허용</label>
     <label className="check"><input type="checkbox" checked={http} onChange={(e) => setHttp(e.target.checked)} />이 커넥터의 평문 HTTP 허용</label>
     <label className="check"><input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} />사용 가능</label>
-    <p className="muted">Task마다 Handler가 승인된 커넥터를 선택합니다. 비밀번호 로그인·SSH·DB·메일 인증은 지원하지 않습니다.</p>
+    <p className="muted">Handler가 Task 연결을 직접 정하며 프리셋 저장은 선택 사항입니다. 비밀번호 로그인·SSH·DB·메일 인증 어댑터는 아직 구현하지 않았습니다.</p>
   </SubmitForm>;
 }
 function SecretForm({

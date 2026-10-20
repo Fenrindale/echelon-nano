@@ -114,6 +114,61 @@ async fn credential_metadata_preserves_source_scope_and_append_only_checks() {
             .await
             .unwrap();
     assert!(!visible.contains("fixture-only"));
+    let local_check = Uuid::new_v4();
+    let native_insert = "INSERT INTO task_credential_checks(id,tenant_id,task_id,work_order_id,bundle_id,binding_index,binding_sha256,result) VALUES($1,$2,$3,$4,$5,0,'owned-binding-fingerprint',$6)";
+    let native_result = json!({"check_id":local_check,"bundle_id":bundle,"binding_index":0,"observation":{"status":"verified","authenticated":true}});
+    assert!(
+        sqlx::query(native_insert)
+            .bind(local_check)
+            .bind(tenant)
+            .bind(other)
+            .bind(order)
+            .bind(bundle)
+            .bind(&native_result)
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+    sqlx::query(native_insert)
+        .bind(local_check)
+        .bind(tenant)
+        .bind(task)
+        .bind(order)
+        .bind(bundle)
+        .bind(&native_result)
+        .execute(&pool)
+        .await
+        .unwrap();
+    for statement in [
+        "UPDATE task_credential_checks SET result='{}' WHERE id=$1",
+        "DELETE FROM task_credential_checks WHERE id=$1",
+    ] {
+        assert!(
+            sqlx::query(statement)
+                .bind(local_check)
+                .execute(&pool)
+                .await
+                .is_err()
+        );
+    }
+    assert!(
+        sqlx::query("TRUNCATE task_credential_checks")
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+    let handler = workspace::actor(tenant, task, Role::Handler);
+    let recorded = work::read(&pool, &handler, &json!({"work_order_id":order}))
+        .await
+        .unwrap();
+    assert_eq!(
+        recorded["tool_evidence"]["credential_checks"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(!recorded.to_string().contains("fixture-only"));
     pool.close().await;
 }
 

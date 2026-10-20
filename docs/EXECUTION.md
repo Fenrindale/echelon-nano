@@ -51,7 +51,7 @@ Agent는 허용한 URL의 읽기, 격리 코드 실행과 실제 산출물 회�
 
 ## 모델 연결과 제한
 
-기밀 첨부는 일반 미리보기 대신 값 없는 목록을 반환한다. Handler는 `credential.inspect` 후 `credential.import`와 필요한 `credential.check`를 계약에 포함해 Agent에게 위임한다. 승인된 커넥터가 없더라도 적재 가능한 입력을 버리지 않고 미검증 범위와 함께 부분 완료로 보고한다. 세부 형식·권한·고정 신원 API와 재사용 계약은 [기밀 처리](CREDENTIALS.md)를 따른다.
+기밀 첨부는 기밀값 없는 목록과 서비스 주소를 반환한다. Handler는 `credential.inspect` 후 Task의 `credential_bindings`를 정하고 `credential.import`·`credential.check`를 Agent에게 위임한다. 별도 커넥터 등록·사용자 승인은 요구하지 않는다. 연결은 목표 또는 선택한 설정 원본과 일치해야 하며 Work Order가 설정을 고정한다. Handler는 `work_order.read.tool_evidence`의 저장 영수증·실제 신원 관찰로 결과를 평가한다. 세부 형식·실행 범위·재사용 계약은 [기밀 처리](CREDENTIALS.md)를 따른다.
 
 선택 첨부는 `attachments:[{request_id,name,media_type,data_base64}]`로 전달한다. 각 파일에 안정된 요청 UUID를 사용하며 최대 16개·파일당 1 MiB·합계 4 MiB다. 실행 등록 경로의 JSON 본문 상한은 base64를 고려해 6 MiB이며 다른 API의 2 MiB 상한은 유지한다. 서버가 파일 검증·저장과 Task 생성을 한 트랜잭션에서 처리하고, 파일 요청 ID·이름·형식·SHA256 목록을 불변으로 고정한다. Handler는 `artifact.read {artifact_id,offset:0,limit:4000}`으로 UTF-8 미리보기를 읽고 계약의 `input_artifacts`를 선택한다. 미리보기는 문자 경계에서 잘라 반환하고 전체 base64를 제외한다. 바이너리는 본문을 해석한 것으로 표시하지 않는다. Agent는 자기 Work Order의 입력 허용 목록을 계속 따른다.
 

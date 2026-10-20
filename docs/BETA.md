@@ -77,7 +77,7 @@ OAuth와 명시적 OpenAI API 키 연결은 Vault에서 관리한다. API 키 �
 
 ## 관찰과 UI
 
-첨부 기밀은 [전용 적재·인증 경로](CREDENTIALS.md)를 사용한다. Handler는 값 없는 목록으로 계약을 정하고 Agent만 승인 입력을 Vault에 적재한다. GitLab·Jenkins·Databricks 토큰 신원 확인은 운영자가 등록한 버전 고정 커넥터로 제한한다. 없는 연결이나 미지원 인증은 적재 결과와 구분해 미검증·부분 완료로 보고한다.
+첨부 기밀은 [전용 적재·인증 경로](CREDENTIALS.md)를 사용한다. Handler가 목록·서비스 주소로 Task 연결을 직접 정하고 Agent가 적재·신원 확인을 수행한다. GitLab·Jenkins·Databricks 토큰 신원 확인에 별도 커넥터 등록·승인은 필요하지 않다. Handler는 Work Order의 서버 영수증으로 결과를 확인한다. 미구현 어댑터나 실제 업무 대상 누락은 그 원인을 명확히 구분한다.
 
 Path는 현재 Task의 Work Order·고정 정보 ID/버전·결과를 연결한다. Broadcast는 역할, 도구, 성공·거부·오류와 토큰 수를 보여 준다. 비공개 reasoning 원문을 이벤트에 쓰지 않는다. SSE는 DB 순번과 `Last-Event-ID`로 재연결하며 매번 세션과 업무실·Task 범위를 검사한다.
 

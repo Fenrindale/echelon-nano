@@ -379,6 +379,7 @@ pub async fn validate_contract(
             return Err(missing());
         }
     }
+    crate::credentials::validate_task_bindings(pool, tenant, task, c).await?;
     Ok(())
 }
 async fn credential_catalog(

@@ -231,6 +231,16 @@ pub async fn order_policy(pool: &PgPool, a: &Claims) -> AppResult<TaskContract> 
     pinned
         .input_artifacts
         .retain(|id| current.input_artifacts.contains(id));
+    pinned
+        .credential_bundles
+        .retain(|id| current.credential_bundles.contains(id));
+    pinned.credential_connectors.retain(|g| {
+        current
+            .credential_connectors
+            .iter()
+            .any(|v| v.id == g.id && v.version == g.version)
+    });
+    // Keep binding positions stable; credential.check compares the exact pinned entry.
     Ok(pinned)
 }
 pub async fn invoke(s: &AppState, a: &Claims, req: &ToolRequest) -> AppResult<Value> {

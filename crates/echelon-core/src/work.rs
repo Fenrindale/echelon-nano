@@ -204,8 +204,9 @@ pub async fn read(pool: &PgPool, a: &Claims, input: &Value) -> AppResult<Value> 
         .bind(r.work_order_id).bind(a.tenant_id).bind(a.task_id).fetch_optional(pool).await.map_err(db)?.ok_or_else(missing)?;
     let artifacts=sqlx::query("SELECT id,name,media_type,sha256,work_order_id,octet_length(body) AS bytes FROM artifacts WHERE tenant_id=$1 AND task_id=$2 AND work_order_id=$3 ORDER BY created_at LIMIT 64").bind(a.tenant_id).bind(a.task_id).bind(r.work_order_id).fetch_all(pool).await.map_err(db)?;
     let observations=sqlx::query("SELECT id,content FROM observations WHERE tenant_id=$1 AND task_id=$2 AND work_order_id=$3 ORDER BY created_at LIMIT 32").bind(a.tenant_id).bind(a.task_id).bind(r.work_order_id).fetch_all(pool).await.map_err(db)?;
+    let tool_evidence = crate::credentials::work_evidence(pool, a, r.work_order_id).await?;
     Ok(
-        json!({"work_order_id":r.work_order_id,"target":row.get::<String,_>("target"),"status":row.get::<String,_>("status"),"contract":row.get::<Value,_>("contract"),"result":row.get::<Option<Value>,_>("result"),"artifacts":artifacts.iter().map(crate::workspace::artifact_header).collect::<Vec<_>>(),"observations":observations.iter().map(|o|json!({"id":o.get::<Uuid,_>("id"),"content":o.get::<Value,_>("content")})).collect::<Vec<_>>()}),
+        json!({"work_order_id":r.work_order_id,"target":row.get::<String,_>("target"),"status":row.get::<String,_>("status"),"contract":row.get::<Value,_>("contract"),"result":row.get::<Option<Value>,_>("result"),"artifacts":artifacts.iter().map(crate::workspace::artifact_header).collect::<Vec<_>>(),"observations":observations.iter().map(|o|json!({"id":o.get::<Uuid,_>("id"),"content":o.get::<Value,_>("content")})).collect::<Vec<_>>(),"tool_evidence":tool_evidence}),
     )
 }
 
