@@ -48,6 +48,8 @@ The live verifier uses the connected account's model catalog, completes a fixed 
 
 The console is available at http://127.0.0.1:18431. Anyone using this local console has operator access; there is no user authentication gate. Browser sessions are issued automatically and cookie mutations require a CSRF token. Direct automation uses the local operator credential, while model roles still require signed scope tokens. This installation targets one local operator with loopback-only port binding.
 
+For an explicitly trusted LAN, add the exact host-IP port mappings in a local `compose.override.yaml` and set `ECHELON_UI_ORIGINS` on core to the corresponding comma-separated browser origins (for example `http://192.0.2.10:18431`). Restrict the host firewall to the intended local addresses and client subnets. The default remains loopback-only. The override is excluded from Git and the Docker build context. Browser Origin and Host must match an approved origin; CSRF and role scopes remain enforced. Anyone admitted to this login-free console has operator access. OAuth account connection still uses the host's loopback callback.
+
 ## Credentials and storage
 
 OAuth access, refresh and ID tokens are stored only in Vault. Public metadata and audit records contain no credential values. The role containers receive only their own short-lived session token and cannot connect directly to Vault, PostgreSQL or the internet.

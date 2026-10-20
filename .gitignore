@@ -3,6 +3,7 @@
 /target/
 /web/node_modules/
 /web/dist/
+/compose.override.yaml
 .env
 .env.*
 !.env.example

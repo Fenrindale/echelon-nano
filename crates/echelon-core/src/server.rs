@@ -32,6 +32,7 @@ pub struct AppState {
     pub vault: VaultStore,
     pub oauth: OAuthService,
     pub slots: Arc<tokio::sync::Semaphore>,
+    pub ui_origins: Vec<String>,
     keys: RuntimeKeys,
     signing_key: Vec<u8>,
 }
@@ -66,6 +67,7 @@ fn actor(state: &AppState, headers: &HeaderMap) -> AppResult<Claims> {
 
 pub async fn run(config: Config) -> anyhow::Result<()> {
     config.validate()?;
+    let ui_origins = ui_auth::origins(&config.ui_origins)?;
     let token = tokio::fs::read_to_string(&config.vault_token_file).await?;
     let vault = VaultStore::new(config.vault_url.clone(), token.trim().into())?;
     let keys = vault
@@ -97,6 +99,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         vault: vault.clone(),
         oauth,
         slots: Arc::new(tokio::sync::Semaphore::new(2)),
+        ui_origins,
         keys,
         signing_key,
     });

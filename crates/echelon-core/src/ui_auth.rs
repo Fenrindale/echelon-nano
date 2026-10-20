@@ -16,6 +16,46 @@ use sqlx::Row;
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
 
+pub fn origins(extra: &str) -> anyhow::Result<Vec<String>> {
+    let mut origins = vec![
+        "http://127.0.0.1:18431".into(),
+        "http://localhost:18431".into(),
+    ];
+    for value in extra.split(',').map(str::trim).filter(|v| !v.is_empty()) {
+        let uri = url::Url::parse(value)?;
+        anyhow::ensure!(
+            matches!(uri.scheme(), "http" | "https")
+                && uri.host_str().is_some_and(|host| !host.contains('*'))
+                && uri.path() == "/"
+                && uri.query().is_none()
+                && uri.fragment().is_none()
+                && uri.username().is_empty()
+                && uri.password().is_none(),
+            "invalid UI origin"
+        );
+        let origin = uri.origin().ascii_serialization();
+        if !origins.contains(&origin) {
+            origins.push(origin);
+        }
+    }
+    Ok(origins)
+}
+fn allowed_host(origins: &[String], headers: &HeaderMap) -> bool {
+    let host = headers.get(header::HOST).and_then(|v| v.to_str().ok());
+    origins
+        .iter()
+        .any(|origin| origin.split_once("://").map(|(_, authority)| authority) == host)
+}
+fn allowed_origin(origins: &[String], headers: &HeaderMap) -> bool {
+    let Some(origin) = headers.get(header::ORIGIN) else {
+        return true;
+    };
+    origin.to_str().ok().is_some_and(|value| {
+        origins.iter().any(|known| known == value)
+            && value.split_once("://").map(|(_, authority)| authority)
+                == headers.get(header::HOST).and_then(|v| v.to_str().ok())
+    })
+}
 pub fn cookie(h: &HeaderMap) -> Option<&str> {
     h.get(header::COOKIE)?
         .to_str()
@@ -34,10 +74,9 @@ pub async fn session(s: &AppState, h: &HeaderMap) -> AppResult<Value> {
 pub async fn open_session(s: &AppState, h: &HeaderMap) -> AppResult<Response> {
     // The local beta deliberately has no operator login. The browser receives
     // a session automatically; role tokens and CSRF remain separate controls.
-    if !matches!(
-        h.get(header::HOST).and_then(|v| v.to_str().ok()),
-        Some("127.0.0.1:18431" | "localhost:18431")
-    ) || h.get("sec-fetch-site").and_then(|v| v.to_str().ok()) == Some("cross-site")
+    if !allowed_host(&s.ui_origins, h)
+        || !allowed_origin(&s.ui_origins, h)
+        || h.get("sec-fetch-site").and_then(|v| v.to_str().ok()) == Some("cross-site")
     {
         return Err(AppError::forbidden("origin_denied"));
     }
@@ -79,12 +118,7 @@ pub async fn csrf(State(s): State<Arc<AppState>>, request: Request, next: Next) 
     let path = request.uri().path().to_owned();
     let check = async {
         let h = &headers;
-        if let Some(origin) = h.get(header::ORIGIN)
-            && !matches!(
-                origin.to_str().ok(),
-                Some("http://127.0.0.1:18431" | "http://localhost:18431")
-            )
-        {
+        if !allowed_origin(&s.ui_origins, h) {
             return Err(AppError::forbidden("origin_denied"));
         }
         if cookie(h).is_some()
@@ -114,5 +148,34 @@ pub async fn csrf(State(s): State<Arc<AppState>>, request: Request, next: Next) 
     match check {
         Ok(()) => next.run(request).await,
         Err(e) => e.into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn configured_origins_are_exact_and_remain_same_origin() {
+        let allowed = origins("http://192.0.2.10:18431/, http://192.0.2.10:18431").unwrap();
+        assert_eq!(allowed.len(), 3);
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "192.0.2.10:18431".parse().unwrap());
+        headers.insert(header::ORIGIN, "http://192.0.2.10:18431".parse().unwrap());
+        assert!(allowed_host(&allowed, &headers));
+        assert!(allowed_origin(&allowed, &headers));
+        headers.insert(header::ORIGIN, "http://127.0.0.1:18431".parse().unwrap());
+        assert!(!allowed_origin(&allowed, &headers));
+        headers.insert(header::HOST, "foreign.example:18431".parse().unwrap());
+        assert!(!allowed_host(&allowed, &headers));
+        for invalid in [
+            "https://*.example",
+            "http://user:password@example.com",
+            "http://example.com/path",
+            "http://example.com?query=1",
+            "ftp://example.com",
+        ] {
+            assert!(origins(invalid).is_err());
+        }
     }
 }

@@ -7,6 +7,7 @@ pub struct Config {
     pub vault_url: String,
     pub vault_token_file: PathBuf,
     pub callback_uri: String,
+    pub ui_origins: String,
     pub postgres_host: String,
     pub postgres_password_file: PathBuf,
 }
@@ -21,6 +22,7 @@ impl Config {
                 .into(),
             callback_uri: env::var("ECHELON_CALLBACK_URI")
                 .unwrap_or_else(|_| "http://127.0.0.1:18431/auth/callback".into()),
+            ui_origins: env::var("ECHELON_UI_ORIGINS").unwrap_or_default(),
             postgres_host: env::var("POSTGRES_HOST").unwrap_or_else(|_| "postgres".into()),
             postgres_password_file: env::var("POSTGRES_PASSWORD_FILE")
                 .unwrap_or_else(|_| "/run/secrets/postgres-password".into())
@@ -39,6 +41,7 @@ impl Config {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
+        crate::ui_auth::origins(&self.ui_origins)?;
         let uri = url::Url::parse(&self.callback_uri)?;
         anyhow::ensure!(
             uri.scheme() == "http"

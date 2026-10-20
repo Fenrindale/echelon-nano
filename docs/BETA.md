@@ -83,6 +83,8 @@ Path는 현재 Task의 Work Order·고정 정보 ID/버전·결과를 연결한�
 
 운영자 경로는 Bearer 또는 자동 발급한 로컬 브라우저 세션을 사용한다. `POST /v1/ui/session`은 로컬 Host와 동일 출처에서 암호·코드 없이 세션을 연다. 이는 사용자 인증 체계가 아니므로 현재 배포는 localhost의 개인 운영을 전제로 한다. 역할의 직접 도구 API는 계속 서명된 역할·Task·Work Order 토큰을 요구한다. `/v1/operator/domain`도 호출자가 역할을 정하지 않고 서버가 도구에 맞는 고정 역할을 선택한다.
 
+명시적으로 신뢰한 내부망에서 사용할 때는 비공개 `compose.override.yaml`에 필요한 호스트 IP의 포트 바인딩과 `ECHELON_UI_ORIGINS`를 추가한다. 원점은 쉼표로 구분한 정확한 `http(s)://주소:포트`이며 와일드카드·경로·인증정보는 허용하지 않는다. 요청의 Origin과 Host도 일치해야 한다. 방화벽은 해당 호스트 주소와 승인한 클라이언트 대역으로 제한한다. 이 설정은 로그인 기능을 추가하지 않으며 접속자는 운영자다. OAuth 연결의 loopback callback은 유지한다.
+
 | 경로 | 용도 |
 | --- | --- |
 | `GET/POST /v1/operator/tenants` | 업무실 목록·생성 |
