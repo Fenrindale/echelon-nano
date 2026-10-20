@@ -1201,24 +1201,24 @@ pre {
   font-size: 25px;
   color: var(--accent);
 }
-.attachment-picker {
+.file-drop-zone {
   padding: 18px;
-  border: 1px solid var(--line);
+  border: 1px dashed #34494e;
   border-radius: 8px;
   margin-bottom: 18px;
+  transition: border-color 120ms ease, background-color 120ms ease;
 }
-.attachment-picker > .row { justify-content: space-between; margin-bottom: 12px; }
-.upload {
-  border: 1px dashed #34494e;
-  padding: 16px;
-  display: flex;
-  align-items: center;
-  gap: 16px;
-  flex-wrap: wrap;
-  border-radius: 5px;
+.file-drop-zone.dragging {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
 }
-.upload small {
-  color: #8c9da3;
+.file-drop-zone.disabled { opacity: 0.6; }
+.drop-zone-header { justify-content: space-between; flex-wrap: wrap; gap: 12px; }
+.drop-zone-prompt { color: #a5b7bd; font-size: 13px; margin: 16px 0; }
+.file-drop-zone.dragging .drop-zone-prompt { color: var(--accent); }
+.file-drop-zone > small { display: block; }
+@media (prefers-reduced-motion: reduce) {
+  .file-drop-zone { transition: none; }
 }
 .protocol-grid {
   display: grid;

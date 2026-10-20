@@ -11,6 +11,7 @@ import {
 } from "./api";
 import { useWorkspace } from "./context";
 import { encodeAttachment, selectAttachments, type Attachment } from "./attachments";
+import { FileDropZone } from "./file-drop-zone";
 import {
   Badge,
   Empty,
@@ -164,31 +165,22 @@ export function TaskForm({
           onChange={(e) => { setGoal(e.target.value); setRequestId(key()); }}
           placeholder="완료하고 싶은 업무를 자유롭게 설명해 주세요." />
       </Field>
-      <div className="attachment-picker">
-        <div className="row">
-          <strong>첨부파일 <span className="muted">선택</span></strong>
-          <label className={`button ${sending ? "disabled" : ""}`}>
-            ＋ 파일 선택
-            <input type="file" multiple hidden aria-label="첨부파일 선택" disabled={sending}
-              onChange={(e) => {
-                try {
-                  setFiles(selectAttachments(files, Array.from(e.target.files ?? [])));
-                  setRequestId(key());
-                  setFileError(undefined);
-                } catch (err) { setFileError(err); }
-                e.target.value = "";
-              }} />
-          </label>
-        </div>
+      <FileDropZone multiple disabled={sending}
+        title={<>첨부파일 <span className="muted">선택</span></>}
+        hint="파일당 1 MiB · 최대 16개 · 합계 4 MiB. 텍스트 분석은 UTF-8 파일을 지원합니다."
+        onError={setFileError}
+        onFiles={(added) => {
+          setFiles(selectAttachments(files, added));
+          setRequestId(key());
+        }}>
         {files.map((a) => <div className="file-row" key={a.id}>
           <span className="file-icon">▤</span>
           <div><strong>{a.file.name}</strong><small>{formatNumber(a.file.size)} bytes</small></div>
           <button type="button" className="quiet" disabled={sending} aria-label={`${a.file.name} 첨부 취소`}
             onClick={() => { setFiles(files.filter((f) => f.id !== a.id)); setRequestId(key()); setFileError(undefined); }}>×</button>
         </div>)}
-        <small className="muted">파일당 1 MiB · 최대 16개 · 합계 4 MiB. 텍스트 분석은 UTF-8 파일을 지원합니다.</small>
         <ErrorBox error={fileError} />
-      </div>
+      </FileDropZone>
       <p className="muted">
         Handler가 목표에 맞춰 완료 조건, 산출물, 모델, 예산, 도구와 프로토콜을 정하고 바로 실행합니다.
       </p>
@@ -716,58 +708,37 @@ function FileUpload({
   const [error, setError] = useState<unknown>();
   const [busy, setBusy] = useState(false);
   return (
-    <div className="upload">
-      <label className={`button ${disabled || busy ? "disabled" : ""}`}>
-        {busy ? "등록 중…" : "＋ 파일 첨부"}
-        <input
-          type="file"
-          hidden
-          disabled={disabled || busy}
-          onChange={async (e) => {
-            const file = e.target.files?.[0];
-            if (!file) return;
-            setBusy(true);
-            setError(undefined);
-            try {
-              if (file.size > 1048576)
-                throw new Error("파일은 1 MiB 이하여야 합니다.");
-              const bytes = new Uint8Array(await file.arrayBuffer());
-              let binary = "";
-              for (const b of bytes) binary += String.fromCharCode(b);
-              const r = await api("/v1/operator/artifacts", "POST", {
-                tenant_id: w.tenant,
-                task_id: task,
-                artifact: {
-                  request_id: key(),
-                  name: file.name,
-                  media_type: file.type || "application/octet-stream",
-                  data_base64: btoa(binary),
-                },
-              });
-              if (!automatic) await api(`/v1/operator/tasks/${task}`, "PATCH", {
-                tenant_id: w.tenant,
-                contract: {
-                  ...contract,
-                  input_artifacts: [
-                    ...(contract.input_artifacts ?? []),
-                    r.artifact.id,
-                  ],
-                },
-                reason: "업무 입력 파일 추가",
-              });
-              w.refresh();
-              w.notify("입력 파일을 등록했습니다.");
-            } catch (err) {
-              setError(err);
-            } finally {
-              setBusy(false);
-              e.target.value = "";
-            }
-          }}
-        />
-      </label>
-      <small>1 MiB 이하 · 코드 실행 입력은 UTF-8 텍스트</small>
+    <FileDropZone disabled={disabled || busy}
+      button={busy ? "등록 중…" : "＋ 파일 첨부"}
+      hint="한 번에 1개 · 파일당 1 MiB 이하 · 코드 실행 입력은 UTF-8 텍스트"
+      onError={setError}
+      onFiles={async ([file]) => {
+        setBusy(true);
+        try {
+          const artifact = await encodeAttachment({ id: key(), file });
+          const r = await api("/v1/operator/artifacts", "POST", {
+            tenant_id: w.tenant,
+            task_id: task,
+            artifact,
+          });
+          if (!automatic) await api(`/v1/operator/tasks/${task}`, "PATCH", {
+            tenant_id: w.tenant,
+            contract: {
+              ...contract,
+              input_artifacts: [
+                ...(contract.input_artifacts ?? []),
+                r.artifact.id,
+              ],
+            },
+            reason: "업무 입력 파일 추가",
+          });
+          w.refresh();
+          w.notify("입력 파일을 등록했습니다.");
+        } finally {
+          setBusy(false);
+        }
+      }}>
       <ErrorBox error={error} />
-    </div>
+    </FileDropZone>
   );
 }
