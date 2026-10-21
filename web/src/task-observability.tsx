@@ -40,12 +40,13 @@ export function graphLayout(nodes: Json[]): Json[] {
 }
 function NodeTags({ node }: { node: Json }) {
   const d = node.detail ?? {};
+  const outcome = typeof d.outcome === "string" ? d.outcome : undefined;
   return <div className="row"><span className="node-kind">{nodeKinds[node.kind] ?? node.kind}</span>
     <Role role={node.role} /><Badge value={node.status} />
     {d.category && <span>{String(d.category).toUpperCase()}</span>}
     {d.version && <code>v{d.version}</code>}
     {d.retention_scope && <Badge value={d.retention_scope} />}
-    {d.outcome && d.outcome !== "not_applicable" && <Badge value={d.outcome} />}
+    {outcome && outcome !== "not_applicable" && <Badge value={outcome} />}
   </div>;
 }
 function NodeDetail({ node, nodes, onFocus, onSession }: {

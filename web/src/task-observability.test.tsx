@@ -30,6 +30,15 @@ it("paginates business records rather than hiding everything beyond the newest w
   await click("다음");
   expect(vi.mocked(api).mock.calls.at(-1)?.[0]).toContain("offset=40");
 });
+it("keeps structured tool receipts out of business status badges when rendering real execution milestones", async () => {
+  const milestone = { ...node, id: "milestone:1", kind: "milestone", title: "후속 업무 재계획", status: "tool.completed", detail: { outcome: { ok: true, result: { phase: "plan" } } } };
+  vi.mocked(api).mockResolvedValue({ items: [milestone], nodes: [milestone], edges: [], total: 1, has_more: false });
+  await act(() => root.render(<TaskObservability task="task" tab="path" onTab={vi.fn()} />));
+  expect(host.querySelectorAll(".graph-node")).toHaveLength(1);
+  await click(milestone.title);
+  expect(host.textContent).toContain('"ok": true');
+  expect(host.textContent).not.toContain("[object Object]");
+});
 it("shows the ongoing ingestion lane alongside a completed ordinary run and pages immutable events", async () => {
   const lanes = [{ source: "ingestion", source_id: "body-job", role: "agent", status: "running", calls: 500, tokens: 1234, last_activity: "2026-10-21" }, { source: "execution", source_id: "old-run", role: "handler", status: "completed", calls: 4, tokens: 100, last_activity: "2026-10-20" }];
   vi.mocked(api).mockImplementation(async (path) => path.includes("/sessions?") ? { sessions: lanes, total: 2 } : { status: "running", events: [{ seq: 999, kind: "model.started", created_at: "2026-10-21", details: { phase: "ingestion.extract" }, ordinal: 4 }], next_before: 999, has_more: true, unit: null });
