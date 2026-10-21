@@ -107,6 +107,17 @@ Assert-Beta ($session.csrf -eq $csrf) 'Browser session did not survive a subsequ
 $null=Invoke-WebRequest -Uri ($script:ApiBase+'/v1/ui/logout') -Method POST -WebSession $betaBrowser -Headers @{'X-Echelon-Csrf'=$csrf} -ContentType 'application/json' -Body '{}'
 $loggedOut=Invoke-WebRequest -Uri ($script:ApiBase+'/v1/operator/tenants') -WebSession $betaBrowser -SkipHttpErrorCheck
 Assert-Beta ([int]$loggedOut.StatusCode -eq 401) 'A logged-out session remained valid.'
+foreach ($view in @('path','broadcast','sessions')) {
+ $viewPath="/v1/operator/tasks/$($task.task_id)/${view}?tenant_id=$tenant"
+ $observed=Invoke-Echelon $viewPath
+ Assert-Beta ($observed.read_only) "The $view projection is not explicitly read-only."
+ $foreignView=Invoke-WebRequest -Uri ($script:ApiBase+"/v1/operator/tasks/$($task.task_id)/${view}?tenant_id=$otherTenant") -Headers @{Authorization='Bearer '+(Get-OperatorToken)} -SkipHttpErrorCheck
+ Assert-Beta ([int]$foreignView.StatusCode -eq 404) "The $view projection leaked across tenants."
+ $roleView=Invoke-WebRequest -Uri ($script:ApiBase+$viewPath) -Headers @{Authorization='Bearer '+$agent} -SkipHttpErrorCheck
+ Assert-Beta ([int]$roleView.StatusCode -eq 401) "An Agent token reached operator $view records."
+}
+$sessionDenied=Invoke-WebRequest -Uri ($script:ApiBase+"/v1/operator/tasks/$($task.task_id)/session?tenant_id=$tenant&source=execution&source_id=$($order.work_order_id)&role=agent") -Headers @{Authorization='Bearer '+$agent} -SkipHttpErrorCheck
+Assert-Beta ([int]$sessionDenied.StatusCode -eq 401) 'An Agent token reached operator execution receipts.'
 $secretValue=$null;$csrf=$null;$agent=$null
 $result=@{passed=$true;assertions=$script:BetaAssertions;tenant_id=$tenant;task_id=$task.task_id;work_order_id=$order.work_order_id;worker_uid=10002;external_network_blocked=$true;secret_echo_redacted=$true;tool_replay_verified=$true;ui_cookie_csrf_verified=$true;verified_at=[DateTimeOffset]::UtcNow.ToString('o')}
 Write-PrivateText (Join-Path $script:RuntimeRoot 'evidence/beta-boundaries.json') ($result|ConvertTo-Json -Depth 8)

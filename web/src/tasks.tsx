@@ -1,3 +1,4 @@
+import { TaskObservability } from "./task-observability";
 import { useState } from "react";
 import {
   api,
@@ -210,11 +211,9 @@ export function RunForm({ task, onStarted, mode = "work" }: {
 }
 export function TaskDetail({
   id,
-  events,
   onBack,
 }: {
   id: string;
-  events: Json[];
   onBack: () => void;
 }) {
   const w = useWorkspace();
@@ -283,7 +282,7 @@ export function TaskDetail({
   const active = latest && ["queued", "running"].includes(latest.status);
   const canResume =
     latest && ["paused", "interrupted", "failed"].includes(latest.status);
-  const ev = events.filter((e) => e.task_id === id);
+  const bodyCurrent = ingestion && !active && ["queued", "running", "paused", "interrupted", "failed"].includes(ingestion.status);
   const result = run.data?.result;
   return (
     <>
@@ -298,7 +297,7 @@ export function TaskDetail({
           <h1>{taskTitle(t.goal)}</h1>
           <div className="row">
             <Badge value={t.status} />
-            {latest && (
+            {bodyCurrent ? <><span>본문 분석</span><Badge value={ingestion.status} /><span>{formatNumber(ingestion.total_tokens)} tokens · {ingestion.model_calls} calls</span></> : latest && (
               <>
                 <span>실행</span>
                 <Badge value={latest.status} />
@@ -391,6 +390,7 @@ export function TaskDetail({
           ["brief", "Brief"],
           ["path", "Path"],
           ["broadcast", "Broadcast"],
+          ["sessions", "Sessions"],
           ["knowledge", "Knowledge"],
           ["outputs", "Outputs"],
         ].map(([name, label]) => (
@@ -512,110 +512,7 @@ export function TaskDetail({
               </section>
             </>
           )}
-          {tab === "path" && (
-            <section className="panel">
-              <h2>업무 경로</h2>
-              <p className="muted">
-                이 Task의 지시·고정 근거·결과만 표시합니다.
-              </p>
-              <div className="path-start">
-                <Role role="Handler" />
-                <span>목표 → 정보 요청 → Context Pack</span>
-              </div>
-              {t.work_orders.map((o: Json) => (
-                <div className="path-order" key={o.id}>
-                  <div className="row">
-                    <Role role="Agent" />
-                    <ID id={o.id} />
-                    <Badge value={o.status} />
-                  </div>
-                  <h3>{o.contract.objective}</h3>
-                  <p>{o.target}</p>
-                  <div className="path-refs">
-                    {o.contract.evidence?.map((r: Json, i: number) => {
-                      const ref = r.resolved.reference;
-                      return (
-                        <button
-                          key={i}
-                          onClick={() => {
-                            if (ref.item_id)
-                              w.openKnowledge(ref.item_id, ref.version);
-                          }}
-                        >
-                          {r.resolved.document?.title ??
-                            ref.title ??
-                            `고정 참조 ${i + 1}`}{" "}
-                          · v{ref.version ?? ref.item_version ?? "—"}
-                        </button>
-                      );
-                    })}
-                  </div>
-                  {o.result && (
-                    <div className="path-result">
-                      <Badge value={o.result.outcome} />
-                      <p>{o.result.summary}</p>
-                    </div>
-                  )}
-                  <details>
-                    <summary>Work Order 계약·근거</summary>
-                    <JsonView value={o.contract} />
-                  </details>
-                </div>
-              ))}
-              {!t.work_orders.length && (
-                <Empty title="아직 발행된 Work Order가 없습니다" />
-              )}
-              <div className="path-start">
-                <Role role="Analyst" />
-                <span>재사용 지식 검토</span>
-                <Role role="Master" />
-                <span>감사·정리 제안</span>
-              </div>
-            </section>
-          )}
-          {tab === "broadcast" && (
-            <section className="panel">
-              <h2>Broadcast</h2>
-              <p className="muted">
-                결정·행동·관찰의 기록입니다. 비공개 추론은 포함하지 않습니다.
-              </p>
-              {run.data?.events?.length ? (
-                <div className="timeline">
-                  {run.data.events.map((e: Json) => (
-                    <div className="event" key={e.seq}>
-                      <span className="event-dot" />
-                      <div>
-                        <div className="row">
-                          <Role role={e.role} />
-                          <strong>{actions[e.kind] ?? e.kind}</strong>
-                          <ID id={e.details?.tool} />
-                        </div>
-                        {e.details?.usage && (
-                          <small>
-                            {formatNumber(e.details.usage.input_tokens)} in /{" "}
-                            {formatNumber(e.details.usage.output_tokens)} out
-                          </small>
-                        )}
-                        {e.details?.tool && (
-                          <p>{actions[e.details.tool] ?? e.details.tool}</p>
-                        )}
-                        <details>
-                          <summary>세부 근거</summary>
-                          <JsonView value={e.details} />
-                        </details>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              ) : (
-                <Empty title="아직 실행 기록이 없습니다" />
-              )}
-              <details>
-                <summary>작업 활동 기록 {ev.length}개</summary>
-                <JsonView value={ev.slice(-30)} />
-              </details>
-            </section>
-          )}
+          {["path", "broadcast", "sessions"].includes(tab) && <TaskObservability task={id} tab={tab} onTab={setTab} />}
           {tab === "knowledge" && (
             <section className="panel">
               <h2>지식 제출·채택</h2>
@@ -697,11 +594,11 @@ export function TaskDetail({
             <dt>지식 제출</dt>
             <dd>{knowledge.data?.submissions?.length ?? 0}</dd>
             <dt>실행 단계</dt>
-            <dd>{run.data?.phase ?? "대기"}</dd>
+            <dd>{bodyCurrent ? ingestion.inflight?.phase ?? "본문 분석" : run.data?.phase ?? "대기"}</dd>
           </dl>
           <hr />
           <h3>최근 활동</h3>
-          {(run.data?.events ?? [])
+          {(bodyCurrent ? (ingestion.events ?? []).slice(0, 6).reverse() : (run.data?.events ?? []))
             .slice(-6)
             .reverse()
             .map((e: Json) => (

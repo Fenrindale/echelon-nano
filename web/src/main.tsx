@@ -369,7 +369,7 @@ function Shell({
           <div className="sidebar-bottom">
             <div>
               <span className={`live-dot ${connected ? "live" : ""}`} />
-              {connected ? "Broadcast 연결됨" : "연결 대기"}
+              {connected ? "실시간 활동 연결됨" : "연결 대기"}
             </div>
             <small>
               LOCAL / PRIVATE WORKSPACE
@@ -421,7 +421,6 @@ function Shell({
                     <TaskDetail
                       key={task}
                       id={task}
-                      events={events}
                       onBack={() => setTask("")}
                     />
                   ) : (

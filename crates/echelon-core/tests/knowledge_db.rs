@@ -25,6 +25,227 @@ fn actor(tenant: Uuid, task: Uuid, role: Role) -> Claims {
 
 #[tokio::test]
 #[ignore = "requires the isolated compose.verify.yaml PostgreSQL database"]
+async fn task_observability_spans_jobs_pins_versions_and_pages_without_role_or_tenant_leaks() {
+    use echelon_core::observability::{self, Page, SessionQuery};
+    let pool = PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&std::env::var("DATABASE_URL").unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT current_database()")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        "echelon_verification"
+    );
+    sqlx::migrate!("../../migrations").run(&pool).await.unwrap();
+    let tenant = Uuid::new_v4();
+    let foreign = Uuid::new_v4();
+    let task = Uuid::new_v4();
+    let other = Uuid::new_v4();
+    for t in [tenant, foreign] {
+        sqlx::query("INSERT INTO tenants(id,name) VALUES($1,'Owned observation fixture')")
+            .bind(t)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    for (t, id, goal) in [
+        (tenant, task, "Owned observable work"),
+        (foreign, other, "foreign-goal-marker"),
+    ] {
+        sqlx::query("INSERT INTO tasks(id,tenant_id,goal) VALUES($1,$2,$3)")
+            .bind(id)
+            .bind(t)
+            .bind(goal)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    let run = Uuid::new_v4();
+    let job = Uuid::new_v4();
+    let review = Uuid::new_v4();
+    let order = Uuid::new_v4();
+    sqlx::query("INSERT INTO execution_runs(id,tenant_id,task_id,request_key,config,state,status) VALUES($1,$2,$3,$4,'{}','{\"phase\":\"done\",\"history\":[\"private-history-marker\"]}','completed')").bind(run).bind(tenant).bind(task).bind(Uuid::new_v4()).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO execution_actions(run_id,call_id,request,outcome) VALUES($1,'owned-call',$2,$3)").bind(run).bind(json!({"tool":"artifact.write","input":{"name":"owned.md","access_token":"owned-secret-check"}})).bind(json!({"ok":false,"error":{"code":"owned_failure"}})).execute(&pool).await.unwrap();
+    // More than the previous 250-event window, with identical timestamps and a separate role.
+    sqlx::query("INSERT INTO execution_events(run_id,role,kind,details) SELECT $1,'agent','tool.failed','{\"call_id\":\"owned-call\",\"tool\":\"artifact.write\"}' FROM generate_series(1,262)").bind(run).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO execution_events(run_id,role,kind,details) VALUES($1,'handler','model.started','{}')").bind(run).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO knowledge_ingestion_jobs(id,tenant_id,task_id,request_key,goal,source_manifest,status,total_units) VALUES($1,$2,$3,$4,'Owned body job','{}','running',1)").bind(job).bind(tenant).bind(task).bind(Uuid::new_v4()).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO knowledge_ingestion_units(job_id,ordinal,source_id,locator,metadata,payload,input_sha256,sanitized_sha256,state) VALUES($1,0,'owned-source','message 1','{}','[]','fixed-input','fixed-safe',$2)").bind(job).bind(json!({"extraction":{"candidates":[{"claim":"owned-body-output"}]},"proposals":[{"document":{"title":"owned-handler-output"}}],"published":{"0":{"reason":"owned-analyst-output"}},"responses":{"private":"private-envelope-marker"}})).execute(&pool).await.unwrap();
+    for role in ["agent", "handler", "analyst"] {
+        sqlx::query("INSERT INTO knowledge_ingestion_events(job_id,ordinal,actor_role,kind,details) VALUES($1,0,$2,'model.completed','{\"usage\":{\"total_tokens\":123}}')").bind(job).bind(role).execute(&pool).await.unwrap();
+    }
+    sqlx::query("INSERT INTO knowledge_retention_jobs(id,tenant_id,task_id,request_key,connection_id,model,status) VALUES($1,$2,$3,$4,'owned-synthetic','owned-model','completed')").bind(review).bind(tenant).bind(task).bind(Uuid::new_v4()).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO knowledge_retention_units(job_id,ordinal,snapshot,response,result) VALUES($1,0,'{}','{\"reason\":\"owned-review-output\"}','{\"scope\":\"task\"}')").bind(review).execute(&pool).await.unwrap();
+    let item = Uuid::new_v4();
+    let request = Uuid::new_v4();
+    let pack = Uuid::new_v4();
+    sqlx::query("INSERT INTO knowledge_items(id,tenant_id,category,title,version,retention_scope) VALUES($1,$2,'info','Owned negative rule',2,'task')").bind(item).bind(tenant).execute(&pool).await.unwrap();
+    for v in [1, 2] {
+        sqlx::query("INSERT INTO knowledge_revisions(tenant_id,item_id,version,document,actor_role,reason) VALUES($1,$2,$3,$4,'analyst','Owned fixed historical rule')").bind(tenant).bind(item).bind(v).bind(json!({"title":format!("Owned rule version {v}"),"category":"info","truth_state":"refuted","outcome":"failed"})).execute(&pool).await.unwrap();
+    }
+    sqlx::query("INSERT INTO context_requests(id,tenant_id,task_id,request_key,requested_by,goal_snapshot,criteria) VALUES($1,$2,$3,$4,$5,'Owned goal','{}')").bind(request).bind(tenant).bind(task).bind(Uuid::new_v4()).bind(Uuid::new_v4()).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO context_packs(id,tenant_id,task_id,context_request_id,created_by,manifest) VALUES($1,$2,$3,$4,$5,'{}')").bind(pack).bind(tenant).bind(task).bind(request).bind(Uuid::new_v4()).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO context_pack_refs(id,tenant_id,task_id,pack_id,item_id,version,document_sha256) VALUES($1,$2,$3,$4,$5,1,'owned-fixed-hash')").bind(Uuid::new_v4()).bind(tenant).bind(task).bind(pack).bind(item).execute(&pool).await.unwrap();
+    let protocol = Uuid::new_v4();
+    sqlx::query("INSERT INTO protocols(id,tenant_id,version,codename,description,status) VALUES($1,$2,2,'owned-observation','Owned protocol fixture','active')").bind(protocol).bind(tenant).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO protocol_revisions(tenant_id,protocol_id,version,document,actor_task_id,reason) VALUES($1,$2,1,'{\"codename\":\"owned-observation\",\"status\":\"active\"}',$3,'Owned pinned procedure')").bind(tenant).bind(protocol).bind(task).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO protocol_members(tenant_id,protocol_id,protocol_version,item_id,item_version,required) VALUES($1,$2,1,$3,1,true)").bind(tenant).bind(protocol).bind(item).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO work_orders(id,tenant_id,task_id,target,contract) VALUES($1,$2,$3,'owned:observation',$4)").bind(order).bind(tenant).bind(task).bind(json!({"objective":"Owned observation work","references":[{"pack_id":pack}],"protocol":{"id":protocol,"version":1}})).execute(&pool).await.unwrap();
+    let page = Page {
+        tenant_id: tenant,
+        limit: Some(100),
+        ..Page::default()
+    };
+    let graph = observability::path_data(&pool, task, &page).await.unwrap();
+    assert!(
+        graph["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["id"] == format!("knowledge:{item}:1")
+                && n["detail"]["version"] == 1
+                && n["status"] == "refuted")
+    );
+    assert!(!graph.to_string().contains(&format!("knowledge:{item}:2")));
+    assert!(
+        graph["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["source"] == format!("knowledge:{item}:1")
+                && e["target"] == format!("pack:{pack}")
+                && e["relation"] == "pins")
+    );
+    assert!(!graph.to_string().contains("private-history-marker"));
+    assert!(
+        graph["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["id"] == format!("protocol:{protocol}:1"))
+    );
+    let lanes = observability::sessions_data(&pool, task, &page)
+        .await
+        .unwrap();
+    assert_eq!(
+        lanes["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|l| l["source"] == "ingestion")
+            .count(),
+        3
+    );
+    assert!(
+        lanes["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l["source"] == "retention")
+    );
+    let mut q = SessionQuery {
+        tenant_id: tenant,
+        source: "execution".into(),
+        source_id: run,
+        role: "agent".into(),
+        before: None,
+        limit: Some(100),
+        ordinal: None,
+    };
+    let mut seen = std::collections::BTreeSet::new();
+    loop {
+        let p = observability::session_data(&pool, task, &q).await.unwrap();
+        assert!(!p.to_string().contains("owned-secret-check"));
+        for e in p["events"].as_array().unwrap() {
+            assert_eq!(e["kind"], "tool.failed");
+            assert_eq!(e["outcome"]["error"]["code"], "owned_failure");
+            assert!(seen.insert(e["seq"].as_i64().unwrap()));
+        }
+        if p["has_more"] != true {
+            break;
+        }
+        q.before = p["next_before"].as_i64();
+    }
+    assert_eq!(seen.len(), 262);
+    q.source = "ingestion".into();
+    q.source_id = job;
+    q.before = None;
+    q.ordinal = Some(0);
+    let body = observability::session_data(&pool, task, &q).await.unwrap();
+    assert!(body.to_string().contains("owned-body-output"));
+    assert!(!body.to_string().contains("owned-handler-output"));
+    assert!(!body.to_string().contains("private-envelope-marker"));
+    q.source = "retention".into();
+    q.source_id = review;
+    q.role = "analyst".into();
+    sqlx::query("INSERT INTO audit_records(tenant_id,task_id,actor_role,action,outcome,details) VALUES($1,$2,'analyst','knowledge.review_model','completed',$3)")
+        .bind(foreign).bind(other).bind(json!({"job_id":review,"marker":"foreign-audit-marker"})).execute(&pool).await.unwrap();
+    assert!(
+        observability::session_data(&pool, task, &q)
+            .await
+            .unwrap()
+            .to_string()
+            .contains("owned-review-output")
+    );
+    assert!(
+        !observability::session_data(&pool, task, &q)
+            .await
+            .unwrap()
+            .to_string()
+            .contains("foreign-audit-marker")
+    );
+    q.tenant_id = foreign;
+    assert!(observability::session_data(&pool, task, &q).await.is_err());
+    q.tenant_id = tenant;
+    q.source_id = job;
+    assert!(observability::session_data(&pool, other, &q).await.is_err());
+    assert!(
+        observability::path_data(
+            &pool,
+            task,
+            &Page {
+                tenant_id: foreign,
+                ..Page::default()
+            }
+        )
+        .await
+        .is_err()
+    );
+    let focused = observability::path_data(
+        &pool,
+        task,
+        &Page {
+            tenant_id: tenant,
+            focus: Some(format!("pack:{pack}")),
+            ..Page::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(focused["items"].as_array().unwrap().len(), 1);
+    assert!(
+        focused["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["source"] == format!("pack:{pack}")
+                && e["target"] == format!("order:{order}"))
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT status FROM knowledge_ingestion_jobs WHERE id=$1")
+            .bind(job)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        "running"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires the isolated compose.verify.yaml PostgreSQL database"]
 async fn body_ingestion_preserves_sources_checkpoints_and_role_owned_adoption() {
     let pool = PgPoolOptions::new()
         .max_connections(4)
