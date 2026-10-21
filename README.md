@@ -116,3 +116,5 @@ See [the design](docs/PLAN.ko.md), [Phase 0 validation](docs/PHASE0.md), [the kn
 - [Preview limitations](https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations)
 
 MIT License.
+
+See [central versus Task-local retention](docs/RETENTION.md) for decision-utility requirements, legacy review, local preservation and verification. Central adoption counts are historical receipts, distinct from current placement.

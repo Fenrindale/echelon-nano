@@ -90,7 +90,7 @@ async fn body_ingestion_preserves_sources_checkpoints_and_role_owned_adoption() 
     let submitted = knowledge::submit(&pool, &actor(tenant, task, Role::Handler), &input)
         .await
         .unwrap();
-    let decision = json!({"submission_id":submitted["submission"]["id"],"decision":"accept","reason":"Grounded owned fixture"});
+    let decision = json!({"submission_id":submitted["submission"]["id"],"decision":"accept","reuse":fixture_reuse(&submitted["submission"]["document"]),"reason":"Grounded owned fixture"});
     assert!(
         knowledge::publish(&pool, &actor(tenant, task, Role::Agent), &decision)
             .await
@@ -980,8 +980,15 @@ async fn work_orders_scope_results_and_interrupted_runs() {
 async fn submit(pool: &PgPool, h: &Claims, document: Value, target: Option<(Uuid, i32)>) -> Value {
     knowledge::submit(pool,h,&json!({"op":"submit","request_id":Uuid::new_v4(),"document":document,"target_id":target.map(|t|t.0),"base_version":target.map(|t|t.1),"rationale":"Owned synthetic verification"})).await.unwrap()
 }
+fn fixture_reuse(document: &Value) -> Value {
+    let anchor = document["content"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| document["sources"][0]["uri"].as_str().unwrap());
+    json!({"applicable_when":"An independent owned verification Task needs this fixture specification", "decision_or_action":"Use this pinned synthetic specification to choose and verify the fixture action", "evidence":anchor})
+}
 fn acceptance(submission: &Value) -> Value {
-    json!({"submission_id":submission["submission"]["id"],"decision":"accept","reason":"Submitted evidence selected for reuse"})
+    json!({"submission_id":submission["submission"]["id"],"decision":"accept","reuse":fixture_reuse(&submission["submission"]["document"]),"reason":"Submitted evidence selected for reuse"})
 }
 async fn accept(pool: &PgPool, a: &Claims, submission: &Value) -> Value {
     knowledge::publish(pool, a, &acceptance(submission))
@@ -992,6 +999,123 @@ async fn get(pool: &PgPool, a: &Claims, item: Uuid) -> Value {
     knowledge::read(pool, a, &json!({"op":"get","item_id":item}))
         .await
         .unwrap()
+}
+
+#[tokio::test]
+#[ignore = "requires the isolated compose.verify.yaml PostgreSQL database"]
+async fn task_local_retention_excludes_new_contexts_and_preserves_delivered_references() {
+    let pool = PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&std::env::var("DATABASE_URL").unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT current_database()")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        "echelon_verification"
+    );
+    sqlx::migrate!("../../migrations").run(&pool).await.unwrap();
+    let tenant = Uuid::new_v4();
+    let task = Uuid::new_v4();
+    sqlx::query("INSERT INTO tenants(id,name) VALUES($1,'Retention fixture')")
+        .bind(tenant)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO tasks(id,tenant_id,goal) VALUES($1,$2,'Retention fixture')")
+        .bind(task)
+        .bind(tenant)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let h = actor(tenant, task, Role::Handler);
+    let a = actor(tenant, task, Role::Analyst);
+    let doc = json!({"category":"info","title":"Owned fixture rule","storage_mode":"excerpt","content":"When the fixture reports SMTP 535 before DATA, do not claim delivery or repeat unchanged AUTH.","sources":[{"uri":"https://example.com/fixture"}]});
+    let sub = submit(&pool, &h, doc, None).await;
+    let mut decision = acceptance(&sub);
+    decision.as_object_mut().unwrap().remove("reuse");
+    assert_eq!(
+        knowledge::publish(&pool, &a, &decision)
+            .await
+            .unwrap_err()
+            .code,
+        "central_reuse_required"
+    );
+    let adopted = accept(&pool, &a, &sub).await;
+    let item: Uuid = serde_json::from_value(adopted["submission"]["item_id"].clone()).unwrap();
+    let req = context::request(
+        &pool,
+        &h,
+        &json!({"request_id":Uuid::new_v4(),"criteria":{"need":"Owned fixture rule","query":"fixture"}}),
+    )
+    .await
+    .unwrap();
+    let pack = context::curate(&pool,&a,&json!({"op":"deliver","request_id":req["request"]["id"],"selections":[{"item_id":item,"version":1,"reason":"Owned rule"}],"gaps":[]})).await.unwrap();
+    let pinned = pack["pack"]["knowledge"][0]["ref_id"].clone();
+    let pack_id = pack["pack"]["id"].clone();
+    let demote = json!({"request_id":Uuid::new_v4(),"item_id":item,"expected_version":1,"retention_scope":"task","reason":"Owned local placement test"});
+    let receipt = knowledge::classify(&pool, &a, &demote).await.unwrap();
+    assert_eq!(receipt["version"], 2);
+    assert_eq!(
+        knowledge::classify(&pool, &a, &demote).await.unwrap(),
+        receipt
+    );
+    assert!(
+        knowledge::read(&pool, &a, &json!({"op":"list"}))
+            .await
+            .unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        knowledge::read(
+            &pool,
+            &a,
+            &json!({"op":"list","retention_scope":"task","source_task_id":task})
+        )
+        .await
+        .unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let req2 = context::request(
+        &pool,
+        &h,
+        &json!({"request_id":Uuid::new_v4(),"criteria":{"need":"Owned fixture rule","query":"fixture"}}),
+    )
+    .await
+    .unwrap();
+    assert!(context::curate(&pool,&a,&json!({"op":"deliver","request_id":req2["request"]["id"],"selections":[{"item_id":item,"version":1,"reason":"Must not reintroduce local through old revision"}],"gaps":[]})).await.is_err());
+    let resolved = context::read(
+        &pool,
+        &h,
+        &json!({"op":"resolve","pack_id":pack_id,"ref_id":pinned}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(resolved["reference"]["version"], 1);
+    assert_eq!(
+        resolved["document"]["content"],
+        sub["submission"]["document"]["content"]
+    );
+    let incident = submit(&pool,&h,json!({"category":"data","title":"Fixture Task status","storage_mode":"excerpt","content":"Task A briefly failed on Tuesday. This is only an incident log.","sources":[{"uri":"https://example.com/fixture-incident"}]}),None).await;
+    let local = knowledge::publish(&pool,&a,&json!({"submission_id":incident["submission"]["id"],"decision":"local","reason":"Situation is useful only inside the source Task"})).await.unwrap();
+    assert_eq!(local["submission"]["status"], "local");
+    assert!(!local["submission"]["item_id"].is_null());
+    assert!(
+        knowledge::read(
+            &pool,
+            &h,
+            &json!({"op":"list","retention_scope":"task","source_task_id":task})
+        )
+        .await
+        .is_err()
+    );
 }
 
 #[tokio::test]

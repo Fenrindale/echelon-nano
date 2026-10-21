@@ -94,6 +94,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     // An unknown provider/tool outcome must be inspected, never silently replayed after restart.
     execution::interrupt(&pool).await?;
     crate::ingestion::interrupt(&pool).await?;
+    crate::retention::interrupt(&pool).await?;
     let oauth = OAuthService::new(vault.clone(), pool.clone(), host_id, config.callback_uri)?;
     let state = Arc::new(AppState {
         pool,
@@ -154,6 +155,7 @@ pub fn router(state: Shared) -> Router {
     Router::new()
         .merge(console::routes())
         .merge(crate::ingestion::routes())
+        .merge(crate::retention::routes())
         .route("/", get(home))
         .route("/healthz", get(health))
         .route("/readyz", get(ready))

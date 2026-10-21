@@ -83,3 +83,5 @@ fixtures must never be registered in the live corpus Task.
 ## 일시적인 모델 오류 복구
 
 본문 분석의 연결 실패·시간 초과·완료 없는 스트림 단절·일시적 HTTP 거부는 같은 미완료 단계의 모델 생성만 자동 재시도한다. 각 요청을 `model.started`로 집계하고 `model.retry_scheduled`에 오류 코드·대기 시각·미확인 사용량·미실행 효과를 남긴다. 완료 모델 응답 캐시와 완료 구간, 제출·채택 ID, Work Order는 재사용한다. 대기는 최대 60초 간격이며 중지·취소·모델 정책 변경을 확인한다. 인증·정책·DB·형식/근거 검증 실패나 불명확한 업무 도구 효과는 이 자동 재시도 대상이 아니다. 서버 재시작은 기존 명시적 재개 절차를 유지한다.
+
+See [central versus Task-local retention](RETENTION.md) for decision-utility requirements, legacy review, local preservation and verification. Central adoption counts are historical receipts, distinct from current placement.

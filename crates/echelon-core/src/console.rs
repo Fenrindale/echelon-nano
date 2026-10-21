@@ -790,6 +790,15 @@ async fn metrics(
                 COALESCE((e.details->'usage'->>'total_tokens')::bigint,0)
             FROM knowledge_ingestion_events e JOIN knowledge_ingestion_jobs j ON j.id=e.job_id
             WHERE j.tenant_id=$1 AND ($2::uuid IS NULL OR j.task_id=$2) AND e.kind='model.completed'
+            UNION ALL
+            SELECT actor_role,details->>'phase',details->>'model',details->>'phase',
+                COALESCE((details->'usage'->>'input_tokens')::bigint,0),
+                COALESCE((details->'usage'->>'output_tokens')::bigint,0),
+                COALESCE((details->'usage'->'input_tokens_details'->>'cached_tokens')::bigint,0),
+                COALESCE((details->'usage'->>'total_tokens')::bigint,0)
+            FROM audit_records WHERE tenant_id=$1 AND ($2::uuid IS NULL OR task_id=$2)
+                AND action='knowledge.review_model' AND outcome='completed'
+
         ), dimensions AS (
             SELECT d.dimension,d.name,o.input_tokens,o.output_tokens,o.cached_tokens,o.total_tokens
             FROM observations o CROSS JOIN LATERAL (VALUES
@@ -828,7 +837,7 @@ async fn metrics(
             .ok_or_else(bad)?
             .push(entry);
     }
-    let counts = sqlx::query("SELECT count(*) FILTER (WHERE kind='model.started') AS started,count(*) FILTER (WHERE kind='model.completed') AS completed FROM (SELECT e.kind FROM execution_events e JOIN execution_runs r ON r.id=e.run_id WHERE r.tenant_id=$1 AND ($2::uuid IS NULL OR r.task_id=$2) UNION ALL SELECT e.kind FROM knowledge_ingestion_events e JOIN knowledge_ingestion_jobs j ON j.id=e.job_id WHERE j.tenant_id=$1 AND ($2::uuid IS NULL OR j.task_id=$2)) events")
+    let counts = sqlx::query("SELECT count(*) FILTER (WHERE kind='model.started') AS started,count(*) FILTER (WHERE kind='model.completed') AS completed FROM (SELECT e.kind FROM execution_events e JOIN execution_runs r ON r.id=e.run_id WHERE r.tenant_id=$1 AND ($2::uuid IS NULL OR r.task_id=$2) UNION ALL SELECT e.kind FROM knowledge_ingestion_events e JOIN knowledge_ingestion_jobs j ON j.id=e.job_id WHERE j.tenant_id=$1 AND ($2::uuid IS NULL OR j.task_id=$2) UNION ALL SELECT CASE WHEN outcome='started' THEN 'model.started' ELSE 'model.completed' END AS kind FROM audit_records WHERE tenant_id=$1 AND ($2::uuid IS NULL OR task_id=$2) AND action='knowledge.review_model' AND outcome IN ('started','completed')) events")
         .bind(q.tenant_id).bind(q.task_id).fetch_one(&s.pool).await.map_err(db)?;
     result["calls_without_completed_usage"] =
         json!((counts.get::<i64, _>("started") - counts.get::<i64, _>("completed")).max(0));

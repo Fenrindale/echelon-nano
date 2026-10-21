@@ -1,5 +1,6 @@
 param([string]$TenantId,[string]$ConnectionId,[string]$Model,[switch]$Resume)
 . (Join-Path $PSScriptRoot 'Common.ps1')
+. (Join-Path $PSScriptRoot 'KnowledgeFixture.ps1')
 $script:ScenarioAssertions=0
 $progressPath=Join-Path $script:RuntimeRoot 'evidence/work-scenarios-progress.json'
 $progress=@{tasks=@{};runs=@{};configs=@{};started=@{};elapsed=@{};vars=@{};protocol='';pack='';tenant=''}
@@ -18,7 +19,7 @@ function Scenario-Domain([string]$Task,[string]$Tool,$InputData){Invoke-Echelon 
 function Scenario-Task([string]$Goal,$Contract){(Invoke-Echelon '/v1/operator/tasks' 'POST' @{tenant_id=$tenant;tenant_name='Owned beta scenarios';goal=$Goal;contract=$Contract}).task_id}
 function Save-ScenarioProgress {Write-PrivateText ($progressPath+'.tmp') ($progress|ConvertTo-Json -Depth 40);[IO.File]::Move(($progressPath+'.tmp'),$progressPath,$true)}
 function Scenario-StageTask([string]$Name,[string]$Goal,$Contract){if($progress.tasks.ContainsKey($Name)){return $progress.tasks[$Name]};$id=Scenario-Task $Goal $Contract;$progress.tasks[$Name]=$id;Save-ScenarioProgress;$id}
-function Scenario-Knowledge($Document){$s=Scenario-Domain $admin 'knowledge.submit' @{op='submit';request_id=[guid]::NewGuid().ToString();document=$Document;rationale='Owned synthetic work scenario evidence'};Scenario-Domain $admin 'knowledge.publish' @{submission_id=$s.submission.id;decision='accept';reason='Operator registered the owned fixture source'} }
+function Scenario-Knowledge($Document){$s=Scenario-Domain $admin 'knowledge.submit' @{op='submit';request_id=[guid]::NewGuid().ToString();document=$Document;rationale='Owned synthetic work scenario evidence'};Scenario-Domain $admin 'knowledge.publish' @{submission_id=$s.submission.id;decision='accept';reuse=(New-FixtureReuse $s.submission.document);reason='Operator registered the owned fixture source'} }
 function Scenario-Upload([string]$Task,[string]$Name,[string]$Content){$hash=[Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($Task+':'+$Name));$requestKey=[guid]::new([byte[]]$hash[0..15]);(Invoke-Echelon '/v1/operator/artifacts' 'POST' @{tenant_id=$tenant;task_id=$Task;artifact=@{request_id=$requestKey.ToString();name=$Name;content=$Content}}).artifact.id}
 function Scenario-Run([string]$Task,$Extra=@{}){
  $alreadyCompleted=$false

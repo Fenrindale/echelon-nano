@@ -15,6 +15,7 @@ pub mod persistence;
 pub mod policy;
 pub mod protocol;
 pub mod provider;
+pub mod retention;
 pub mod server;
 pub mod store;
 pub mod ui_auth;

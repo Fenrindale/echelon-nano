@@ -1,5 +1,6 @@
 param([switch]$RestartCore)
 . (Join-Path $PSScriptRoot 'Common.ps1')
+. (Join-Path $PSScriptRoot 'KnowledgeFixture.ps1')
 $script:ContextAssertions=0
 function Assert-Context {
     param([bool]$Condition,[string]$Description)
@@ -42,7 +43,7 @@ function Register-ContextKnowledge {
     $inputData=@{op='submit';request_id=[guid]::NewGuid().ToString();document=$Document;rationale='Owned context fixture'}
     if ($TargetId) {$inputData.target_id=$TargetId;$inputData.base_version=$BaseVersion}
     $submission=Invoke-ContextTool 'knowledge.submit' $inputData $writer $writerTask
-    Invoke-ContextTool 'knowledge.publish' @{submission_id=$submission.submission.id;decision='accept';reason='Registered evidence for context verification'}
+    Invoke-ContextTool 'knowledge.publish' @{submission_id=$submission.submission.id;decision='accept';reuse=(New-FixtureReuse $submission.submission.document);reason='Registered evidence for context verification'}
 }
 function Request-Context {
     param($Extra=@{},[string]$Key=([guid]::NewGuid().ToString()))

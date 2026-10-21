@@ -10,6 +10,12 @@ if("$corpusTable".Trim() -eq 't'){
  $corpusActive=& docker compose exec -T postgres psql -U echelon -d echelon -Atc "SELECT count(*) FROM knowledge_ingestion_jobs WHERE status IN ('queued','running')"
  if($LASTEXITCODE -ne 0 -or [long]("$corpusActive".Trim()) -ne 0){throw 'Pause and reconcile active body ingestion before taking a consistent backup.'}
 }
+$reviewTable=& docker compose exec -T postgres psql -U echelon -d echelon -Atc "SELECT to_regclass('knowledge_retention_jobs') IS NOT NULL"
+if($LASTEXITCODE -ne 0){throw 'Could not inspect knowledge reviews before backup.'}
+if("$reviewTable".Trim() -eq 't'){
+ $reviewActive=& docker compose exec -T postgres psql -U echelon -d echelon -Atc "SELECT count(*) FROM knowledge_retention_jobs WHERE status IN ('queued','running')"
+ if($LASTEXITCODE -ne 0 -or [long]("$reviewActive".Trim()) -ne 0){throw 'Pause knowledge review before a consistent backup.'}
+}
 if($VerifyRestore){
  $verificationRunning=@(& docker compose -f compose.verify.yaml ps --status running -q)
  if($LASTEXITCODE -ne 0 -or $verificationRunning.Count){throw 'The isolated verification project must be stopped before restore verification.'}

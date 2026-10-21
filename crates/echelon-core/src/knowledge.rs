@@ -90,9 +90,27 @@ pub struct Assessment {
     pub avoid: String,
     pub retry_when: String,
 }
+/// Curation metadata: an explicit future use and the submitted evidence supporting it.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Reuse {
+    pub applicable_when: String,
+    pub decision_or_action: String,
+    pub evidence: String,
+}
+fn task_scope() -> String {
+    "task".into()
+}
+fn is_task_scope(v: &String) -> bool {
+    v == "task"
+}
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Document {
+    #[serde(default = "task_scope", skip_serializing_if = "is_task_scope")]
+    pub retention_scope: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reuse: Option<Reuse>,
     #[serde(default = "allow_external", skip_serializing_if = "is_allowed")]
     pub external_model_allowed: bool,
     pub category: Category,
@@ -160,6 +178,26 @@ fn require(a: &Claims, roles: &[Role]) -> AppResult<()> {
 }
 
 impl Document {
+    pub fn validate_reuse(&self) -> AppResult<()> {
+        let proof = self
+            .reuse
+            .as_ref()
+            .ok_or_else(|| AppError::bad("central_reuse_required"))?;
+        if [
+            &proof.applicable_when,
+            &proof.decision_or_action,
+            &proof.evidence,
+        ]
+        .iter()
+        .any(|v| !bounded(v, 1600) || v.chars().count() < 8)
+            || !(self.content.contains(&proof.evidence)
+                || self.sources.iter().any(|s| s.uri == proof.evidence))
+        {
+            return Err(AppError::bad("central_reuse_not_grounded"));
+        }
+        Ok(())
+    }
+
     pub fn normalize_tags(&mut self) -> AppResult<()> {
         if self.tags.len() > 34 {
             return Err(invalid());
@@ -187,6 +225,12 @@ impl Document {
         Ok(())
     }
     pub fn validate(&mut self) -> AppResult<()> {
+        if !matches!(self.retention_scope.as_str(), "central" | "task") {
+            return Err(invalid());
+        }
+        if self.retention_scope == "central" {
+            self.validate_reuse()?;
+        }
         self.title = self.title.trim().to_string();
         if !bounded(&self.title, 240)
             || self.content.len() > 16000
@@ -321,11 +365,14 @@ enum SubmitInput {
 #[serde(rename_all = "snake_case")]
 enum Decision {
     Accept,
+    Local,
     Reject,
 }
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct PublishInput {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reuse: Option<Reuse>,
     submission_id: Uuid,
     decision: Decision,
     reason: String,
@@ -335,6 +382,9 @@ struct PublishInput {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ClassifyInput {
+    request_id: Option<Uuid>,
+    retention_scope: Option<String>,
+    reuse: Option<Reuse>,
     item_id: Uuid,
     expected_version: i32,
     category: Option<Category>,
@@ -345,6 +395,8 @@ struct ClassifyInput {
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 enum ReadInput {
     List {
+        retention_scope: Option<String>,
+        source_task_id: Option<Uuid>,
         category: Option<Category>,
         #[serde(default)]
         tags: Vec<String>,
@@ -544,7 +596,8 @@ pub async fn publish(pool: &PgPool, a: &Claims, input: &Value) -> AppResult<Valu
     require(a, &[Role::Analyst])?;
     let req: PublishInput = parse(input)?;
     if !bounded(&req.reason, 2000)
-        || (req.decision == Decision::Reject && (req.category.is_some() || req.tags.is_some()))
+        || (req.decision == Decision::Reject
+            && (req.category.is_some() || req.tags.is_some() || req.reuse.is_some()))
     {
         return Err(invalid());
     }
@@ -568,7 +621,7 @@ pub async fn publish(pool: &PgPool, a: &Claims, input: &Value) -> AppResult<Valu
     let mut result_version = None;
     let status = match req.decision {
         Decision::Reject => "rejected",
-        Decision::Accept => {
+        Decision::Accept | Decision::Local => {
             lock_tenant(&mut tx, a.tenant_id).await?;
             let target: Option<Uuid> = row.get("target_id");
             let id = target.unwrap_or_else(Uuid::new_v4);
@@ -599,6 +652,18 @@ pub async fn publish(pool: &PgPool, a: &Claims, input: &Value) -> AppResult<Valu
             if let Some(tags) = req.tags.as_ref() {
                 document.tags = tags.clone();
             }
+            document.retention_scope = if req.decision == Decision::Accept {
+                "central"
+            } else {
+                "task"
+            }
+            .into();
+            if let Some(reuse) = &req.reuse {
+                document.reuse = Some(reuse.clone());
+            }
+            if document.retention_scope == "task" {
+                document.reuse = None;
+            }
             document.validate()?;
             check_relations(&mut tx, a.tenant_id, Some(id), &document).await?;
             if target.is_none() {
@@ -619,7 +684,11 @@ pub async fn publish(pool: &PgPool, a: &Claims, input: &Value) -> AppResult<Valu
             .await?;
             result_item = Some(id);
             result_version = Some(version);
-            "accepted"
+            if req.decision == Decision::Accept {
+                "accepted"
+            } else {
+                "local"
+            }
         }
     };
     let updated=sqlx::query("UPDATE knowledge_submissions SET status=$3,decision=$4,result_item_id=$5,result_version=$6,decided_by=$7,decided_at=now() WHERE tenant_id=$1 AND id=$2 RETURNING *")
@@ -635,12 +704,20 @@ pub async fn classify(pool: &PgPool, a: &Claims, input: &Value) -> AppResult<Val
     let req: ClassifyInput = parse(input)?;
     if req.expected_version < 1
         || !bounded(&req.reason, 2000)
-        || (req.category.is_none() && req.tags.is_none())
+        || (req.category.is_none()
+            && req.tags.is_none()
+            && req.retention_scope.is_none()
+            && req.reuse.is_none())
     {
         return Err(invalid());
     }
     let mut tx = pool.begin().await.map_err(database)?;
     lock_tenant(&mut tx, a.tenant_id).await?;
+    if let Some(key) = req.request_id
+        && let Some(row) = sqlx::query("SELECT payload,result FROM knowledge_curation_effects WHERE tenant_id=$1 AND request_key=$2").bind(a.tenant_id).bind(key).fetch_optional(&mut *tx).await.map_err(database)? {
+            if row.get::<Value,_>("payload") != *input { return Err(conflict("curation_request_conflict")); }
+            return Ok(row.get("result"));
+    }
     let row=sqlx::query("SELECT k.version,r.document,r.source_task_id,r.submission_id FROM knowledge_items k JOIN knowledge_revisions r ON r.tenant_id=k.tenant_id AND r.item_id=k.id AND r.version=k.version WHERE k.tenant_id=$1 AND k.id=$2 FOR UPDATE OF k")
         .bind(a.tenant_id).bind(req.item_id).fetch_optional(&mut *tx).await.map_err(database)?.ok_or_else(missing)?;
     let current: i32 = row.get("version");
@@ -653,6 +730,20 @@ pub async fn classify(pool: &PgPool, a: &Claims, input: &Value) -> AppResult<Val
     }
     if let Some(tags) = req.tags {
         document.tags = tags;
+    }
+    if let Some(scope) = req.retention_scope {
+        document.retention_scope = scope;
+    }
+    if let Some(reuse) = req.reuse {
+        document.reuse = Some(reuse);
+    }
+    if !matches!(document.retention_scope.as_str(), "central" | "task") {
+        return Err(invalid());
+    }
+    if document.retention_scope == "central" {
+        document.validate_reuse()?;
+    } else {
+        document.reuse = None;
     }
     // Metadata-only management cannot alter content, source, verdict or outcome.
     document.normalize_tags()?;
@@ -675,6 +766,10 @@ pub async fn classify(pool: &PgPool, a: &Claims, input: &Value) -> AppResult<Val
         json!({"item_id":req.item_id,"version":version}),
     )
     .await?;
+    let result = json!({"item_id":req.item_id,"version":version});
+    if let Some(key) = req.request_id {
+        sqlx::query("INSERT INTO knowledge_curation_effects(tenant_id,request_key,payload,result) VALUES($1,$2,$3,$4)").bind(a.tenant_id).bind(key).bind(input).bind(&result).execute(&mut *tx).await.map_err(database)?;
+    }
     tx.commit().await.map_err(database)?;
     Ok(json!({"item_id":req.item_id,"version":version}))
 }
@@ -709,8 +804,8 @@ pub(crate) async fn append_revision(
         sqlx::query("INSERT INTO knowledge_edges(tenant_id,source_id,source_version,kind,target_id,target_version) VALUES($1,$2,$3,$4,$5,$6)")
             .bind(a.tenant_id).bind(id).bind(version).bind(label(&edge.kind)?).bind(edge.target_id).bind(edge.target_version).execute(&mut **tx).await.map_err(database)?;
     }
-    sqlx::query("UPDATE knowledge_items SET version=$3,category=$4,title=$5,truth_state=$6,outcome=$7,updated_at=now() WHERE tenant_id=$1 AND id=$2")
-        .bind(a.tenant_id).bind(id).bind(version).bind(label(&doc.category)?).bind(&doc.title).bind(label(&doc.truth_state)?).bind(label(&doc.outcome)?)
+    sqlx::query("UPDATE knowledge_items SET version=$3,category=$4,title=$5,truth_state=$6,outcome=$7,retention_scope=$8,updated_at=now() WHERE tenant_id=$1 AND id=$2")
+        .bind(a.tenant_id).bind(id).bind(version).bind(label(&doc.category)?).bind(&doc.title).bind(label(&doc.truth_state)?).bind(label(&doc.outcome)?).bind(&doc.retention_scope)
         .execute(&mut **tx).await.map_err(database)?;
     let related: Vec<Uuid> = doc.relations.iter().map(|r| r.target_id).collect();
     let restricted:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM knowledge_items WHERE tenant_id=$1 AND id=ANY($2) AND NOT external_model_allowed)").bind(a.tenant_id).bind(related).fetch_one(&mut **tx).await.map_err(database)?;
@@ -744,6 +839,8 @@ pub async fn read(pool: &PgPool, a: &Claims, input: &Value) -> AppResult<Value> 
     }
     match parse::<ReadInput>(&input)? {
         ReadInput::List {
+            retention_scope,
+            source_task_id,
             category,
             tags,
             query,
@@ -758,6 +855,12 @@ pub async fn read(pool: &PgPool, a: &Claims, input: &Value) -> AppResult<Value> 
             {
                 return Err(invalid());
             }
+            let scope = retention_scope.unwrap_or_else(|| "central".into());
+            if !matches!(scope.as_str(), "central" | "task" | "review_needed")
+                || (scope == "task" && source_task_id.is_none())
+            {
+                return Err(invalid());
+            }
             let query = query.map(|q| {
                 format!(
                     "%{}%",
@@ -766,18 +869,18 @@ pub async fn read(pool: &PgPool, a: &Claims, input: &Value) -> AppResult<Value> 
                         .replace('_', "\\_")
                 )
             });
-            let rows=sqlx::query("SELECT k.id,k.version,k.external_model_allowed,r.document,EXISTS(SELECT 1 FROM knowledge_revisions h WHERE h.tenant_id=k.tenant_id AND h.item_id=k.id AND (h.document->>'truth_state'='refuted' OR h.document->>'outcome'='failed')) AS has_negative_history FROM knowledge_items k JOIN knowledge_revisions r ON r.tenant_id=k.tenant_id AND r.item_id=k.id AND r.version=k.version WHERE k.tenant_id=$1 AND ($2::text IS NULL OR k.category=$2) AND NOT EXISTS(SELECT 1 FROM unnest($3::text[]) wanted(tag) WHERE NOT EXISTS(SELECT 1 FROM knowledge_tags t WHERE t.tenant_id=k.tenant_id AND t.item_id=k.id AND t.version=k.version AND t.tag=wanted.tag)) AND ($4::text IS NULL OR k.title ILIKE $4 OR r.document->>'content' ILIKE $4) AND (NOT $5 OR EXISTS(SELECT 1 FROM knowledge_revisions h WHERE h.tenant_id=k.tenant_id AND h.item_id=k.id AND (h.document->>'truth_state'='refuted' OR h.document->>'outcome'='failed'))) AND ($6::uuid IS NULL OR k.id>$6) ORDER BY k.id LIMIT $7")
-                .bind(a.tenant_id).bind(category.map(|c|label(&c)).transpose()?).bind(tags).bind(query).bind(negative_history).bind(after_id).bind(limit)
+            let rows=sqlx::query("SELECT k.id,k.version,k.retention_scope,r.source_task_id,k.external_model_allowed,r.document,EXISTS(SELECT 1 FROM knowledge_revisions h WHERE h.tenant_id=k.tenant_id AND h.item_id=k.id AND (h.document->>'truth_state'='refuted' OR h.document->>'outcome'='failed')) AS has_negative_history FROM knowledge_items k JOIN knowledge_revisions r ON r.tenant_id=k.tenant_id AND r.item_id=k.id AND r.version=k.version WHERE k.tenant_id=$1 AND ($2::text IS NULL OR k.category=$2) AND NOT EXISTS(SELECT 1 FROM unnest($3::text[]) wanted(tag) WHERE NOT EXISTS(SELECT 1 FROM knowledge_tags t WHERE t.tenant_id=k.tenant_id AND t.item_id=k.id AND t.version=k.version AND t.tag=wanted.tag)) AND ($4::text IS NULL OR k.title ILIKE $4 OR r.document->>'content' ILIKE $4) AND (NOT $5 OR EXISTS(SELECT 1 FROM knowledge_revisions h WHERE h.tenant_id=k.tenant_id AND h.item_id=k.id AND (h.document->>'truth_state'='refuted' OR h.document->>'outcome'='failed'))) AND ($6::uuid IS NULL OR k.id>$6) AND k.retention_scope=$8 AND ($9::uuid IS NULL OR r.source_task_id=$9) ORDER BY k.id LIMIT $7")
+                .bind(a.tenant_id).bind(category.map(|c|label(&c)).transpose()?).bind(tags).bind(query).bind(negative_history).bind(after_id).bind(limit).bind(scope).bind(source_task_id)
                 .fetch_all(pool).await.map_err(database)?;
             let items:Vec<Value>=rows.iter().map(|r| { let d:Value=r.get("document");json!({"id":r.get::<Uuid,_>("id"),"version":r.get::<i32,_>("version"),
-                "category":d["category"],"title":d["title"],"tags":d["tags"],"truth_state":d["truth_state"],"outcome":d["outcome"],"freshness":effective_freshness(&d),"external_model_allowed":r.get::<bool,_>("external_model_allowed"),"has_negative_history":r.get::<bool,_>("has_negative_history")}) }).collect();
+                "retention_scope":r.get::<String,_>("retention_scope"),"source_task_id":r.get::<Option<Uuid>,_>("source_task_id"),"category":d["category"],"title":d["title"],"tags":d["tags"],"truth_state":d["truth_state"],"outcome":d["outcome"],"freshness":effective_freshness(&d),"external_model_allowed":r.get::<bool,_>("external_model_allowed"),"has_negative_history":r.get::<bool,_>("has_negative_history")}) }).collect();
             Ok(json!({"next_after_id":items.last().map(|v|v["id"].clone()),"items":items}))
         }
         ReadInput::Get { item_id, version } => {
             if version.is_some_and(|v| v < 1) {
                 return Err(invalid());
             }
-            let row=sqlx::query("SELECT r.*,k.external_model_allowed AS effective_model_access,r.created_at::text AS recorded_at FROM knowledge_items k JOIN knowledge_revisions r ON r.tenant_id=k.tenant_id AND r.item_id=k.id AND r.version=COALESCE($3,k.version) WHERE k.tenant_id=$1 AND k.id=$2")
+            let row=sqlx::query("SELECT r.*,k.retention_scope AS effective_scope,k.external_model_allowed AS effective_model_access,r.created_at::text AS recorded_at FROM knowledge_items k JOIN knowledge_revisions r ON r.tenant_id=k.tenant_id AND r.item_id=k.id AND r.version=COALESCE($3,k.version) WHERE k.tenant_id=$1 AND k.id=$2")
                 .bind(a.tenant_id).bind(item_id).bind(version).fetch_optional(pool).await.map_err(database)?.ok_or_else(missing)?;
             let version: i32 = row.get("version");
             let mut warnings = dependency_warnings(pool, a.tenant_id, item_id, version).await?;
@@ -786,7 +889,7 @@ pub async fn read(pool: &PgPool, a: &Claims, input: &Value) -> AppResult<Value> 
             let negative=sqlx::query("SELECT version,document->>'truth_state' AS truth_state,document->>'outcome' AS outcome FROM knowledge_revisions WHERE tenant_id=$1 AND item_id=$2 AND (document->>'truth_state'='refuted' OR document->>'outcome'='failed') ORDER BY version DESC LIMIT 101")
                 .bind(a.tenant_id).bind(item_id).fetch_all(pool).await.map_err(database)?;
             Ok(
-                json!({"item":revision_json(&row),"external_model_allowed":row.get::<bool,_>("effective_model_access"),"effective_freshness":effective_freshness(&row.get::<Value,_>("document")),"dependency_warnings":warnings,"dependency_warnings_truncated":warnings_truncated,
+                json!({"item":revision_json(&row),"retention_scope":row.get::<String,_>("effective_scope"),"external_model_allowed":row.get::<bool,_>("effective_model_access"),"effective_freshness":effective_freshness(&row.get::<Value,_>("document")),"dependency_warnings":warnings,"dependency_warnings_truncated":warnings_truncated,
                     "negative_history_truncated":negative.len()>100,"negative_history":negative.iter().take(100).map(|r|json!({"version":r.get::<i32,_>("version"),"truth_state":r.get::<String,_>("truth_state"),"outcome":r.get::<String,_>("outcome")})).collect::<Vec<_>>()}),
             )
         }
@@ -815,20 +918,19 @@ pub async fn read(pool: &PgPool, a: &Claims, input: &Value) -> AppResult<Value> 
             limit,
         } => {
             valid_limit(limit)?;
-            if status
-                .as_ref()
-                .is_some_and(|v| !matches!(v.as_str(), "pending" | "accepted" | "rejected"))
-            {
+            if status.as_ref().is_some_and(|v| {
+                !matches!(v.as_str(), "pending" | "accepted" | "local" | "rejected")
+            }) {
                 return Err(invalid());
             }
-            let rows=sqlx::query("SELECT id,source_task_id,target_id,base_version,status,result_item_id,result_version,rationale,document->>'title' AS title,document->>'category' AS category,document->'tags' AS tags,created_at::text AS submitted_at,decided_at::text AS decided_at FROM knowledge_submissions WHERE tenant_id=$1 AND ($2::text IS NULL OR status=$2) AND ($3::uuid IS NULL OR source_task_id=$3) AND ($4::uuid IS NULL OR id>$4) ORDER BY id LIMIT $5")
+            let rows=sqlx::query("SELECT id,source_task_id,target_id,base_version,status,result_item_id,result_version,rationale,document->>'title' AS title,document->>'category' AS category,document->'tags' AS tags,(SELECT retention_scope FROM knowledge_items k WHERE k.tenant_id=knowledge_submissions.tenant_id AND k.id=result_item_id) AS retention_scope,created_at::text AS submitted_at,decided_at::text AS decided_at FROM knowledge_submissions WHERE tenant_id=$1 AND ($2::text IS NULL OR status=$2) AND ($3::uuid IS NULL OR source_task_id=$3) AND ($4::uuid IS NULL OR id>$4) ORDER BY id LIMIT $5")
                 .bind(a.tenant_id).bind(status).bind(source_task_id).bind(after_id).bind(limit).fetch_all(pool).await.map_err(database)?;
             Ok(json!({"submissions":rows.iter().map(|r|json!({
                     "id":r.get::<Uuid,_>("id"),"source_task_id":r.get::<Uuid,_>("source_task_id"),
                     "target_id":r.get::<Option<Uuid>,_>("target_id"),"base_version":r.get::<Option<i32>,_>("base_version"),
                     "status":r.get::<String,_>("status"),"item_id":r.get::<Option<Uuid>,_>("result_item_id"),"version":r.get::<Option<i32>,_>("result_version"),
                     "title":r.get::<String,_>("title"),"category":r.get::<String,_>("category"),"tags":r.get::<Value,_>("tags"),
-                    "rationale":r.get::<String,_>("rationale"),"submitted_at":r.get::<String,_>("submitted_at"),"decided_at":r.get::<Option<String>,_>("decided_at")
+                    "retention_scope":r.get::<Option<String>,_>("retention_scope"),"rationale":r.get::<String,_>("rationale"),"submitted_at":r.get::<String,_>("submitted_at"),"decided_at":r.get::<Option<String>,_>("decided_at")
                 })).collect::<Vec<_>>(),"next_after_id":rows.last().map(|r|r.get::<Uuid,_>("id"))}))
         }
         ReadInput::Submission { submission_id } => {
@@ -874,6 +976,24 @@ mod tests {
         assert!(d.content.is_empty());
         d.content = "copied body".into();
         assert_eq!(d.validate().unwrap_err().code, "knowledge_storage_invalid");
+    }
+    #[test]
+    fn central_placement_requires_a_grounded_future_use_but_local_records_do_not() {
+        let mut d = reference();
+        d.retention_scope = "central".into();
+        assert_eq!(d.validate().unwrap_err().code, "central_reuse_required");
+        d.reuse = Some(Reuse {
+            applicable_when: "Configuring the documented service in another Task".into(),
+            decision_or_action:
+                "Consult this exact documentation section before choosing parameters".into(),
+            evidence: "https://example.com/docs".into(),
+        });
+        d.validate().unwrap();
+        d.reuse.as_mut().unwrap().evidence = "An invented general lesson".into();
+        assert_eq!(d.validate().unwrap_err().code, "central_reuse_not_grounded");
+        d.retention_scope = "task".into();
+        d.reuse = None;
+        d.validate().unwrap();
     }
     #[test]
     fn negative_records_require_context_and_keep_truth_separate_from_outcome() {

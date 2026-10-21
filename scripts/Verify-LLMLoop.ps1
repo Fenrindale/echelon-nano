@@ -1,5 +1,6 @@
 param([string]$ConnectionId,[string]$Model,[switch]$SkipBudgetCheck,[switch]$SkipRefreshCheck)
 . (Join-Path $PSScriptRoot 'Common.ps1')
+. (Join-Path $PSScriptRoot 'KnowledgeFixture.ps1')
 Initialize-PrivateDirectory (Join-Path $script:RuntimeRoot 'evidence')
 $script:LoopAssertions=0
 function Assert-Loop([bool]$Condition,[string]$Message) {if(-not $Condition){throw $Message};$script:LoopAssertions++}
@@ -19,7 +20,7 @@ function Register-LoopKnowledge($Document,[string]$Target,[int]$Version) {
     $body=@{op='submit';request_id=[guid]::NewGuid().ToString();document=$Document;rationale='Owned synthetic live loop evidence'}
     if($Target){$body.target_id=$Target;$body.base_version=$Version}
     $submission=Invoke-LoopTool 'knowledge.submit' $body
-    Invoke-LoopTool 'knowledge.publish' @{submission_id=$submission.submission.id;decision='accept';reason='Registered synthetic evidence'} $analyst
+    Invoke-LoopTool 'knowledge.publish' @{submission_id=$submission.submission.id;decision='accept';reuse=(New-FixtureReuse $submission.submission.document);reason='Registered synthetic evidence'} $analyst
 }
 $source=Register-LoopKnowledge @{category='data';title='Synthetic operating note source';storage_mode='excerpt';sources=@(@{uri='https://example.com/synthetic-loop';locator='Owned fixture; do not fetch'});content='This fixture has no external work. The currently supported operating value is 41.';tags=@('검증:LLM루프')} '' 0
 $failed=@{category='info';title='Retired operating rule';storage_mode='excerpt';content='NANO_RETIRED_RULE_13: use value 13. This historical rule was refuted and its synthetic execution failed.';tags=@('검증:LLM루프');truth_state='refuted';outcome='failed';assessment=@{conditions='Old synthetic rule';attempted_action='Use 13';observed='Rule rejected';reason='Replaced with supported value 41';avoid='Reusing value 13';retry_when='New independently verified evidence'};relations=@(@{kind='derived_from';target_id=$source.submission.item_id;target_version=1})}

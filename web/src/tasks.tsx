@@ -11,6 +11,7 @@ import {
 } from "./api";
 import { useWorkspace } from "./context";
 import { encodeAttachment, selectAttachments, type Attachment } from "./attachments";
+import { SubmissionReview } from "./central";
 import { FileDropZone } from "./file-drop-zone";
 import {
   Badge,
@@ -248,14 +249,17 @@ export function TaskDetail({
       latest ? api(`/v1/operator/runs/${latest.id}`) : Promise.resolve(null),
     [latest?.id, w.revision],
   );
+  const [knowledgeAfter, setKnowledgeAfter] = useState<string>();
+  const [submissionView, setSubmissionView] = useState<string>();
   const knowledge = useAsync(
     () =>
       domain(w.tenant, w.admin, "knowledge.read", {
         op: "submissions",
         source_task_id: id,
+        after_id: knowledgeAfter ?? null,
         limit: 100,
       }),
-    [id, w.revision],
+    [id, w.revision, knowledgeAfter],
   );
   async function act(action: string) {
     setError(undefined);
@@ -361,7 +365,8 @@ export function TaskDetail({
           <div className="section-heading"><h2>대화 본문 지식화</h2><Badge value={ingestion.status} /></div>
           <p className="prose">{ingestion.goal}</p>
           {ingestion.source_manifest.coverage && <p className="muted">본문 있는 대화 {ingestion.source_manifest.coverage.available_body_conversations}개 · 본문 없는 대화 {ingestion.source_manifest.coverage.metadata_only_conversations}개 · 원문 메시지 {formatNumber(ingestion.source_manifest.coverage.original_messages)}개</p>}
-          <p>본문 구간 {ingestion.completed_units} / {ingestion.total_units} · 후보 {ingestion.proposed}개 · 채택 {(ingestion.accepted || []).map((x: Json) => `${x.category.toUpperCase()} ${x.count}`).join(" / ") || "심사 대기"}</p>
+          <p>현재 보관 {(ingestion.current_placements || []).map((x: Json) => `${x.scope === "central" ? "중앙" : x.scope === "task" ? "Task 지역" : "재심사 대기"} ${x.count}`).join(" / ") || "없음"}</p>
+          <p>본문 구간 {ingestion.completed_units} / {ingestion.total_units} · 후보 {ingestion.proposed}개 · 최초 채택 이력 {(ingestion.accepted || []).map((x: Json) => `${x.category.toUpperCase()} ${x.count}`).join(" / ") || "심사 대기"}</p>
           <p className="muted">{formatNumber(ingestion.total_tokens)} tokens · {ingestion.model_calls} calls · 토큰 제한 없음 · 원문 근거와 제출·채택 이력 보존</p>
           {ingestion.plan && <p className="muted">Handler 분석 방향: {ingestion.plan.focus}</p>}
           {ingestion.error_code && <ErrorBox error={`본문 처리 중단: ${ingestion.error_code}`} />}
@@ -615,7 +620,7 @@ export function TaskDetail({
             <section className="panel">
               <h2>지식 제출·채택</h2>
               <p className="muted">
-                업무 완료와 중앙 지식 반영은 독립적으로 기록됩니다.
+                상황·진행·일회성 문제는 Task 지역 지식에 남습니다. 중앙에는 이후 판단과 행동에 재사용할 항목만 채택합니다.
               </p>
               <ErrorBox error={knowledge.error} />
               {knowledge.data?.submissions?.map((s: Json) => (
@@ -626,17 +631,20 @@ export function TaskDetail({
                     <p>{s.rationale}</p>
                   </div>
                   <div>
-                    <Badge value={s.status} />
+                    <Badge value={s.retention_scope ?? s.status} />
+                    <button onClick={() => setSubmissionView(s.id)}>제출 내용·판단 근거</button>
                     {s.item_id && (
                       <button
                         onClick={() => w.openKnowledge(s.item_id, s.version)}
                       >
-                        채택 근거 v{s.version} ↗
+                        보관 기록 v{s.version} ↗
                       </button>
                     )}
                   </div>
                 </div>
               ))}
+              <div className="row"><button disabled={!knowledgeAfter} onClick={() => setKnowledgeAfter(undefined)}>처음</button><button disabled={(knowledge.data?.submissions?.length ?? 0) < 100} onClick={() => setKnowledgeAfter(knowledge.data?.next_after_id)}>다음</button></div>
+              {submissionView && <SubmissionReview id={submissionView} onClose={() => setSubmissionView(undefined)} />}
               {!knowledge.data?.submissions?.length && (
                 <Empty title="제출된 재사용 지식이 없습니다" />
               )}

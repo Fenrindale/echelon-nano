@@ -290,7 +290,7 @@ pub async fn request(pool: &PgPool, a: &Claims, input: &Value) -> AppResult<Valu
 }
 
 // All predicates are bound parameters. Candidate discovery never fetches an external URI.
-const MATCHES: &str = "SELECT s.item_id,s.version,s.document,(1 + (SELECT count(*)*3 FROM unnest($2::text[]) p(pattern) WHERE s.document->>'title' ILIKE p.pattern) + (SELECT count(*) FROM unnest($2::text[]) p(pattern) WHERE s.document->>'content' ILIKE p.pattern)) AS score FROM knowledge_revisions s JOIN knowledge_items k ON k.tenant_id=s.tenant_id AND k.id=s.item_id WHERE s.tenant_id=$1 AND (s.version=k.version OR s.document->>'truth_state'='refuted' OR s.document->>'outcome'='failed') AND (cardinality($2::text[])=0 OR EXISTS(SELECT 1 FROM unnest($2::text[]) p(pattern) WHERE concat_ws(' ',s.document->>'title',s.document->>'content',s.document->>'applicability',s.document->'assessment'->>'conditions',s.document->'assessment'->>'observed',s.document->'assessment'->>'avoid') ILIKE p.pattern)) AND (s.document->'tags') @> $3::jsonb AND (cardinality($4::text[])=0 OR s.document->>'category'=ANY($4::text[])) AND (NOT $5 OR s.document->>'truth_state'='refuted' OR s.document->>'outcome'='failed') ORDER BY score DESC,s.item_id,s.version DESC LIMIT $6 OFFSET $7";
+const MATCHES: &str = "SELECT s.item_id,s.version,s.document,(1 + (SELECT count(*)*3 FROM unnest($2::text[]) p(pattern) WHERE s.document->>'title' ILIKE p.pattern) + (SELECT count(*) FROM unnest($2::text[]) p(pattern) WHERE s.document->>'content' ILIKE p.pattern)) AS score FROM knowledge_revisions s JOIN knowledge_items k ON k.tenant_id=s.tenant_id AND k.id=s.item_id WHERE s.tenant_id=$1 AND k.retention_scope='central' AND (s.version=k.version OR s.document->>'truth_state'='refuted' OR s.document->>'outcome'='failed') AND (cardinality($2::text[])=0 OR EXISTS(SELECT 1 FROM unnest($2::text[]) p(pattern) WHERE concat_ws(' ',s.document->>'title',s.document->>'content',s.document->>'applicability',s.document->'assessment'->>'conditions',s.document->'assessment'->>'observed',s.document->'assessment'->>'avoid') ILIKE p.pattern)) AND (s.document->'tags') @> $3::jsonb AND (cardinality($4::text[])=0 OR s.document->>'category'=ANY($4::text[])) AND (NOT $5 OR s.document->>'truth_state'='refuted' OR s.document->>'outcome'='failed') ORDER BY score DESC,s.item_id,s.version DESC LIMIT $6 OFFSET $7";
 async fn matches(
     tx: &mut Transaction<'_, Postgres>,
     tenant: Uuid,
@@ -389,7 +389,7 @@ pub async fn curate(pool: &PgPool, a: &Claims, input: &Value) -> AppResult<Value
             .ok_or_else(missing)?;
             let criteria: Criteria = parse(&criteria)?;
             if let Some(id) = criteria.protocol_id {
-                let rows=sqlx::query("SELECT m.item_id,m.item_version AS version,r.document FROM protocol_members m JOIN knowledge_revisions r ON r.tenant_id=m.tenant_id AND r.item_id=m.item_id AND r.version=m.item_version WHERE m.tenant_id=$1 AND m.protocol_id=$2 AND m.protocol_version=$3 ORDER BY m.item_id,m.item_version LIMIT $4 OFFSET $5")
+                let rows=sqlx::query("SELECT m.item_id,m.item_version AS version,r.document FROM protocol_members m JOIN knowledge_revisions r ON r.tenant_id=m.tenant_id AND r.item_id=m.item_id AND r.version=m.item_version WHERE m.tenant_id=$1 AND EXISTS(SELECT 1 FROM knowledge_items k WHERE k.tenant_id=m.tenant_id AND k.id=m.item_id AND k.retention_scope='central') AND m.protocol_id=$2 AND m.protocol_version=$3 ORDER BY m.item_id,m.item_version LIMIT $4 OFFSET $5")
                     .bind(a.tenant_id).bind(id).bind(criteria.protocol_version).bind(limit+1).bind(offset).fetch_all(&mut *tx).await.map_err(database)?;
                 let more = rows.len() > limit as usize;
                 let candidates=rows.iter().take(limit as usize).map(|r|{let d:Value=r.get("document");json!({"item_id":r.get::<Uuid,_>("item_id"),"version":r.get::<i32,_>("version"),"score":1,"preview":preview(&d)})}).collect::<Vec<_>>();
@@ -437,7 +437,7 @@ fn caution(document: &Value) -> bool {
         || crate::knowledge::effective_freshness(document) != "current"
 }
 
-const CLOSURE: &str = "WITH RECURSIVE closure(item_id,version) AS (SELECT * FROM unnest($2::uuid[],$3::int[]) UNION SELECT n.item_id,n.version FROM closure c CROSS JOIN LATERAL (SELECT e.target_id AS item_id,e.target_version AS version FROM knowledge_edges e WHERE e.tenant_id=$1 AND e.source_id=c.item_id AND e.source_version=c.version UNION SELECT r.item_id,r.version FROM knowledge_revisions r WHERE r.tenant_id=$1 AND r.item_id=c.item_id AND (r.document->>'truth_state'='refuted' OR r.document->>'outcome'='failed') UNION SELECT k.id,k.version FROM knowledge_items k WHERE k.tenant_id=$1 AND k.id=c.item_id UNION SELECT e.source_id,e.source_version FROM knowledge_edges e JOIN knowledge_items k ON k.tenant_id=e.tenant_id AND k.id=e.source_id AND k.version=e.source_version WHERE e.tenant_id=$1 AND e.target_id=c.item_id AND e.kind='contradicts') n) SELECT item_id,version FROM closure LIMIT $4";
+const CLOSURE: &str = "WITH RECURSIVE closure(item_id,version) AS (SELECT * FROM unnest($2::uuid[],$3::int[]) UNION SELECT n.item_id,n.version FROM closure c CROSS JOIN LATERAL (SELECT e.target_id AS item_id,e.target_version AS version FROM knowledge_edges e WHERE e.tenant_id=$1 AND e.source_id=c.item_id AND e.source_version=c.version UNION SELECT r.item_id,r.version FROM knowledge_revisions r WHERE r.tenant_id=$1 AND r.item_id=c.item_id AND (r.document->>'truth_state'='refuted' OR r.document->>'outcome'='failed') UNION SELECT k.id,k.version FROM knowledge_items k WHERE k.tenant_id=$1 AND k.id=c.item_id UNION SELECT e.source_id,e.source_version FROM knowledge_edges e JOIN knowledge_items k ON k.tenant_id=e.tenant_id AND k.id=e.source_id AND k.version=e.source_version WHERE e.tenant_id=$1 AND e.target_id=c.item_id AND e.kind='contradicts') n) SELECT c.item_id,c.version FROM closure c JOIN knowledge_items k ON k.tenant_id=$1 AND k.id=c.item_id WHERE k.retention_scope='central' LIMIT $4";
 
 async fn deliver(pool: &PgPool, a: &Claims, delivery: Delivery) -> AppResult<Value> {
     delivery.validate()?;
@@ -483,7 +483,7 @@ async fn deliver(pool: &PgPool, a: &Claims, delivery: Delivery) -> AppResult<Val
     let mut roots = BTreeMap::new();
     let mut seeds = BTreeSet::new();
     for selected in &delivery.selections {
-        let exists:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM knowledge_revisions WHERE tenant_id=$1 AND item_id=$2 AND version=$3)")
+        let exists:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM knowledge_revisions r JOIN knowledge_items k ON k.tenant_id=r.tenant_id AND k.id=r.item_id WHERE r.tenant_id=$1 AND r.item_id=$2 AND r.version=$3 AND k.retention_scope='central')")
             .bind(a.tenant_id).bind(selected.item_id).bind(selected.version).fetch_one(&mut *tx).await.map_err(database)?;
         if !exists {
             return Err(AppError::bad("context_selection_unavailable"));
@@ -522,6 +522,12 @@ async fn deliver(pool: &PgPool, a: &Claims, delivery: Delivery) -> AppResult<Val
             roots
                 .entry(pair)
                 .or_insert("Required protocol evidence".into());
+        }
+    }
+    for (item, _) in &seeds {
+        let central: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM knowledge_items WHERE tenant_id=$1 AND id=$2 AND retention_scope='central')").bind(a.tenant_id).bind(item).fetch_one(&mut *tx).await.map_err(database)?;
+        if !central {
+            return Err(AppError::bad("context_selection_not_central"));
         }
     }
     if seeds.len() > criteria.max_references as usize {
@@ -666,7 +672,7 @@ pub async fn read(pool: &PgPool, a: &Claims, input: &Value) -> AppResult<Value> 
     }
 }
 async fn resolve(pool: &PgPool, a: &Claims, pack: Uuid, reference: Uuid) -> AppResult<Value> {
-    let row=sqlx::query("SELECT f.item_id,f.version,f.document_sha256,r.document,r.source_task_id,r.submission_id,r.created_at::text AS recorded_at,k.version AS current_version,k.truth_state,k.outcome,CASE WHEN h.document->>'freshness'='superseded' THEN 'superseded' WHEN (h.document->>'valid_until')::bigint<=extract(epoch from now()) THEN 'expired' ELSE h.document->>'freshness' END AS current_freshness FROM context_pack_refs f JOIN knowledge_revisions r ON r.tenant_id=f.tenant_id AND r.item_id=f.item_id AND r.version=f.version JOIN knowledge_items k ON k.tenant_id=f.tenant_id AND k.id=f.item_id JOIN knowledge_revisions h ON h.tenant_id=k.tenant_id AND h.item_id=k.id AND h.version=k.version WHERE f.tenant_id=$1 AND f.task_id=$2 AND f.pack_id=$3 AND f.id=$4")
+    let row=sqlx::query("SELECT f.item_id,f.version,f.document_sha256,r.document,r.source_task_id,r.submission_id,r.created_at::text AS recorded_at,k.version AS current_version,k.retention_scope,k.truth_state,k.outcome,CASE WHEN h.document->>'freshness'='superseded' THEN 'superseded' WHEN (h.document->>'valid_until')::bigint<=extract(epoch from now()) THEN 'expired' ELSE h.document->>'freshness' END AS current_freshness FROM context_pack_refs f JOIN knowledge_revisions r ON r.tenant_id=f.tenant_id AND r.item_id=f.item_id AND r.version=f.version JOIN knowledge_items k ON k.tenant_id=f.tenant_id AND k.id=f.item_id JOIN knowledge_revisions h ON h.tenant_id=k.tenant_id AND h.item_id=k.id AND h.version=k.version WHERE f.tenant_id=$1 AND f.task_id=$2 AND f.pack_id=$3 AND f.id=$4")
         .bind(a.tenant_id).bind(a.task_id).bind(pack).bind(reference).fetch_optional(pool).await.map_err(database)?.ok_or_else(missing)?;
     let document: Value = row.get("document");
     let hash: String = row.get("document_sha256");
@@ -682,7 +688,7 @@ async fn resolve(pool: &PgPool, a: &Claims, pack: Uuid, reference: Uuid) -> AppR
     let truth: String = row.get("truth_state");
     let outcome: String = row.get("outcome");
     let freshness: String = row.get("current_freshness");
-    let notice = json!({"current_version":current,"version_changed":changed,"truth_state":truth,"outcome":outcome,"freshness":freshness,
+    let notice = json!({"retention_scope":row.get::<String,_>("retention_scope"),"current_version":current,"version_changed":changed,"truth_state":truth,"outcome":outcome,"freshness":freshness,
         "refresh_context_recommended":changed || matches!(truth.as_str(),"refuted"|"conflicted") || outcome=="failed" || freshness!="current"});
     let mut tx = pool.begin().await.map_err(database)?;
     event(

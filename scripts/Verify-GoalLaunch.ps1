@@ -1,5 +1,6 @@
 param([switch]$Resume,[switch]$WithAttachments)
 . (Join-Path $PSScriptRoot 'Common.ps1')
+. (Join-Path $PSScriptRoot 'KnowledgeFixture.ps1')
 Initialize-PrivateDirectory (Join-Path $script:RuntimeRoot 'evidence')
 $checks=0
 function Check-Goal([bool]$Value,[string]$Message){if(-not $Value){throw $Message};$script:checks++}
@@ -13,7 +14,7 @@ $tenant=(Invoke-Echelon '/v1/operator/tenants' 'POST' @{name='Owned prompt-only 
 $admin=(Invoke-Echelon "/v1/operator/tenants/$tenant/workspace" 'POST' @{}).administration_task_id
 $document=@{category='info';title='가상 진행 보고의 계산 기준';storage_mode='excerpt';content='검증:목표실행의 가상 진행 보고는 전체 10건, 완료 7건, 대기 3건이며 완료율은 70%다. 실제 회사 성과로 일반화하지 않는다.';truth_state='supported';tags=@('검증:목표실행');sources=@(@{uri='https://example.com/echelon-owned/prompt-only-report'})}
 $submission=Invoke-Echelon '/v1/operator/domain' 'POST' @{tenant_id=$tenant;task_id=$admin;tool='knowledge.submit';input=@{op='submit';request_id=[guid]::NewGuid().ToString();document=$document;rationale='Operator-authored synthetic fixture'}}
-$submission=Invoke-Echelon '/v1/operator/domain' 'POST' @{tenant_id=$tenant;task_id=$admin;tool='knowledge.publish';input=@{submission_id=$submission.submission.id;decision='accept';reason='Known owned fixture values'}}
+$submission=Invoke-Echelon '/v1/operator/domain' 'POST' @{tenant_id=$tenant;task_id=$admin;tool='knowledge.publish';input=@{submission_id=$submission.submission.id;decision='accept';reuse=(New-FixtureReuse $submission.submission.document);reason='Known owned fixture values'}}
 $request=@{tenant_id=$tenant;request_id=[guid]::NewGuid().ToString();goal='검증:목표실행 태그의 기준으로 프로젝트 진행 현황을 간단한 한국어 Markdown 보고서 파일로 만들어 주세요. 전체 10건 중 완료 7건과 대기 3건을 표로 정리하고 완료율을 계산해 주세요. 근거의 정보 ID와 버전을 인용하고, 실제 회사 성과가 아닌 가상 자료라는 한계를 명시해 주세요.'}
 if($WithAttachments){
  $request.attachments=@(

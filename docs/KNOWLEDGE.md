@@ -112,3 +112,5 @@ API에는 삭제 동작이 없다. DB 트리거는 개정·태그·관계의 UPD
 기존 DB를 private dump로 백업한 뒤 추가 마이그레이션을 적용했다. 별도 검증 DB와 네트워크는 종료·제거했고, 로컬 API 검증에서 만든 합성 tenant와 기록은 삭제하지 않았다. 식별자와 결과는 `.runtime/evidence/knowledge*.json`에 보관한다. 공개 문서에는 실제 업무 내용이나 자격증명을 포함하지 않는다.
 
 Task 종료와 제출의 자동 연결, Analyst의 LLM 선별, Handler Context Pack, Master 최적화, 프로토콜 및 전체 웹 UI는 이 단계의 구현 범위 밖이다. 이번 단계는 해당 역할 계약과 수동·코드 기반 호출을 위한 영속 API를 제공한다.
+
+See [central versus Task-local retention](RETENTION.md) for decision-utility requirements, legacy review, local preservation and verification. Central adoption counts are historical receipts, distinct from current placement.

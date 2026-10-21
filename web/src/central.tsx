@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { api, domain, key, labels } from "./api";
 import { useWorkspace } from "./context";
 import {
@@ -15,6 +15,8 @@ import {
   type Json,
 } from "./components";
 export const blankDocument: Json = {
+  retention_scope: "task",
+  reuse: null,
   category: "data",
   title: "",
   storage_mode: "reference",
@@ -36,6 +38,9 @@ const options = (values: string[]) =>
       {labels[v] ?? v}
     </option>
   ));
+function ReuseFields({ value, onChange }: { value: Json | null; onChange: (v: Json) => void }) {
+  return <>{[["applicable_when", "어떤 후속 업무·조건에 재사용하는가"], ["decision_or_action", "이 지식으로 달라지는 판단·행동"], ["evidence", "이를 뒷받침하는 본문 원문 또는 정확한 출처 URL"]].map(([key, label]) => <Field key={key} label={label}><textarea required minLength={8} maxLength={1600} value={value?.[key] ?? ""} onChange={e => onChange({ ...value, [key]: e.target.value })} /></Field>)}</>;
+}
 export function KnowledgeForm({
   initial = blankDocument,
   target,
@@ -189,6 +194,12 @@ export function KnowledgeForm({
           }
         />
       </Field>
+      <Field label="보관 범위">
+        <select value={doc.retention_scope ?? "task"} onChange={e => set("retention_scope", e.target.value)}>
+          <option value="task">Task 지역 지식</option><option value="central">중앙 채택 후보</option>
+        </select>
+      </Field>
+      {doc.retention_scope === "central" && <ReuseFields value={doc.reuse} onChange={v => set("reuse", v)} />}
       <Field label="적용 범위·조건">
         <textarea
           value={doc.applicability}
@@ -379,15 +390,34 @@ export function Central() {
   const [after, setAfter] = useState<string>();
   const [review, setReview] = useState<string>();
   const [status, setStatus] = useState("pending");
+  const [reviewTick, setReviewTick] = useState(0);
+  const [reviewError, setReviewError] = useState<unknown>();
+  const reviews = useAsync(() => api(`/v1/operator/knowledge-reviews?tenant_id=${w.tenant}`), [w.tenant, w.revision, reviewTick]);
+  const activeReview = reviews.data?.jobs?.find((j: Json) => ["queued", "running", "paused"].includes(j.status));
+  useEffect(() => {
+    if (!activeReview || activeReview.status === "paused") return;
+    const timer = setInterval(() => setReviewTick(v => v + 1), 3000);
+    return () => clearInterval(timer);
+  }, [activeReview?.id, activeReview?.status]);
+  async function reviewAction(job?: Json) {
+    setReviewError(undefined);
+    try {
+      if (job) await api(`/v1/operator/knowledge-reviews/${job.id}/control`, "POST", {tenant_id:w.tenant,task_id:job.task_id,action:["running","queued"].includes(job.status)?"pause":"resume"});
+      else await api("/v1/operator/knowledge-reviews", "POST", {tenant_id:w.tenant,task_id:w.admin,request_id:key(),connection_id:w.connection,model:w.model});
+      w.refresh();
+    } catch (e) { setReviewError(e); }
+  }
+
   const r = useAsync(
     () =>
       domain(
         w.tenant,
         w.admin,
         "knowledge.read",
-        tab === "items"
+        (tab === "items" || tab === "review")
           ? {
               op: "list",
+              retention_scope: tab === "review" ? "review_needed" : "central",
               category: category || null,
               query: search || null,
               tags: tags
@@ -408,6 +438,7 @@ export function Central() {
     [
       w.tenant,
       w.revision,
+      reviewTick,
       tab,
       search,
       category,
@@ -424,16 +455,23 @@ export function Central() {
           <p className="eyebrow">CENTRAL / KNOWLEDGE</p>
           <h1>판단의 근거를 쌓습니다.</h1>
           <p className="muted">
-            원천과 맥락, 판단을 연결하고 실패까지 보존합니다.
+            다음 업무의 판단·행동을 바꿀 재사용 지식만 중앙에 보관합니다. 상황·진행 기록은 원본 Task에 남습니다.
           </p>
         </div>
         <button className="primary" onClick={() => setCreate(true)}>
           ＋ 지식 제출
         </button>
       </div>
+      <section className="panel">
+        <div className="row"><h2>Analyst 재사용성 심사</h2><button disabled={!w.connection || !w.model || !!activeReview} onClick={() => reviewAction()}>기존 지식 재심사</button></div>
+        <p className="muted">상황 기록은 원본 Task에 보관하고 중앙 검색에서 제외합니다. 내용과 실패 이력은 보존합니다.</p>
+        <ErrorBox error={reviewError || reviews.error} />
+        {reviews.data?.jobs?.slice(0,3).map((job: Json) => <div className="row" key={job.id}><Badge value={job.status}/><span>{job.processed}/{job.total} · 중앙 {job.central} · Task 지역 {job.local} · 동시 변경 {job.stale}</span>{["queued","running","paused","failed"].includes(job.status) && <button onClick={() => reviewAction(job)}>{["queued","running"].includes(job.status)?"일시정지":"재개"}</button>}{job.error_code && <code>{job.error_code}</code>}</div>)}
+      </section>
       <div className="tabs">
         {[
           ["items", "중앙 지식"],
+          ["review", "기존 지식 재심사"],
           ["submissions", "Analyst 채택 대기열"],
         ].map(([id, label]) => (
           <button
@@ -449,7 +487,7 @@ export function Central() {
         ))}
       </div>
       <div className="toolbar">
-        {tab === "items" ? (
+        {tab !== "submissions" ? (
           <>
             <input
               aria-label="지식 검색"
@@ -580,7 +618,7 @@ export function Central() {
     </>
   );
 }
-function SubmissionReview({
+export function SubmissionReview({
   id,
   onClose,
 }: {
@@ -596,7 +634,8 @@ function SubmissionReview({
       }),
     [id, w.revision],
   );
-  const [decision, setDecision] = useState("accept");
+  const [decision, setDecision] = useState("local");
+  const [reuse, setReuse] = useState<Json | null>(null);
   const [reason, setReason] = useState("");
   const [category, setCategory] = useState("");
   const [tags, setTags] = useState("");
@@ -628,6 +667,7 @@ function SubmissionReview({
                 await domain(w.tenant, w.admin, "knowledge.publish", {
                   submission_id: id,
                   decision,
+                  reuse: decision === "accept" ? (reuse ?? s.document.reuse) : null,
                   reason,
                   category: category || null,
                   tags: tags
@@ -647,7 +687,8 @@ function SubmissionReview({
                     value={decision}
                     onChange={(e) => setDecision(e.target.value)}
                   >
-                    <option value="accept">채택</option>
+                    <option value="accept">중앙 채택</option>
+                    <option value="local">Task 지역 지식으로 보관</option>
                     <option value="reject">반려 · 제출 이력 보존</option>
                   </select>
                 </Field>
@@ -664,6 +705,7 @@ function SubmissionReview({
               <Field label="태그 조정 · 비우면 제출 태그 유지">
                 <input value={tags} onChange={(e) => setTags(e.target.value)} />
               </Field>
+              {decision === "accept" && <ReuseFields value={reuse ?? s.document.reuse} onChange={setReuse} />}
               <Field label="판단 이유">
                 <textarea
                   required
@@ -698,6 +740,7 @@ export function DocumentView({ document: d }: { document: Json }) {
               : d.freshness
           }
         />
+        <Badge value={d.retention_scope ?? "task"} />
         <span className="muted">{d.storage_mode}</span>
       </div>
       <h2>{d.title}</h2>
@@ -711,6 +754,7 @@ export function DocumentView({ document: d }: { document: Json }) {
         <div className="notice warning">외부 모델 전송 금지</div>
       )}
       <p className="prose">{d.content}</p>
+      {d.reuse && <section><h3>재사용 기준</h3><p>{d.reuse.applicable_when}</p><p>{d.reuse.decision_or_action}</p><blockquote>{d.reuse.evidence}</blockquote></section>}
       {d.applicability && (
         <div className="applicability">
           <strong>적용 범위</strong>
@@ -856,7 +900,7 @@ export function KnowledgeDetail({
                 유효 전송 정책: 외부 모델 금지 · 이전 본문과 개정은 보존됩니다.
               </div>
             )}
-          <DocumentView document={item.document} />
+          <DocumentView document={{...item.document, retention_scope: r.data?.retention_scope ?? item.document.retention_scope}} />
           <div className="revision-footer">
             <small>
               {item.actor_role} · {item.reason}

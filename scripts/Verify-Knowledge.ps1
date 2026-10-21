@@ -1,5 +1,6 @@
 param([switch]$RestartCore)
 . (Join-Path $PSScriptRoot 'Common.ps1')
+. (Join-Path $PSScriptRoot 'KnowledgeFixture.ps1')
 $script:Assertions = 0
 function Assert-Knowledge {
     param([bool]$Condition,[string]$Description)
@@ -52,7 +53,7 @@ function Submit-Document {
 }
 function Accept-Submission {
     param($Submission)
-    Invoke-KnowledgeTool 'knowledge.publish' @{submission_id=$Submission.submission.id;decision='accept';reason='Analyst adopted the submitted evidence'}
+    Invoke-KnowledgeTool 'knowledge.publish' @{submission_id=$Submission.submission.id;decision='accept';reason='Analyst adopted the submitted evidence';reuse=(New-FixtureReuse $Submission.submission.document)}
 }
 function Read-Item { param([string]$Id)
     Invoke-KnowledgeTool 'knowledge.read' @{op='get';item_id=$Id}
@@ -65,7 +66,7 @@ Assert-Knowledge ($pending.submission.status -eq 'pending') 'Submission was not 
 Assert-Knowledge (@((Invoke-KnowledgeTool 'knowledge.read' @{}).items).Count -eq 0) 'An unaccepted submission entered the central store.'
 $replayed=Invoke-KnowledgeTool 'knowledge.submit' $payload $handler $sourceTask
 Assert-Knowledge ($replayed.replayed -and $replayed.submission.id -eq $pending.submission.id) 'Submission retry was not idempotent.'
-$acceptance=@{submission_id=$pending.submission.id;decision='accept';reason='Analyst adopted the submitted evidence'}
+$acceptance=@{submission_id=$pending.submission.id;decision='accept';reason='Analyst adopted the submitted evidence';reuse=(New-FixtureReuse $document)}
 Assert-KnowledgeDenied 'knowledge.publish' $acceptance 403 $handler $sourceTask
 Assert-KnowledgeDenied 'knowledge.submit' $payload 403
 $queue=Invoke-KnowledgeTool 'knowledge.read' @{op='submissions';status='pending'}
@@ -131,8 +132,9 @@ $two=Submit-Document (New-ReferenceDocument) $root 4 $laterHandler $curationTask
 $endpoint=$script:ApiBase+'/v1/tools/invoke'
 $analystTenant=$curationTask.tenant_id;$analystTask=$curationTask.task_id
 $decisions=@($one.submission.id,$two.submission.id)
+$concurrentReuse=New-FixtureReuse (New-ReferenceDocument)
 $statuses=@($decisions | ForEach-Object -Parallel {
-    $body=@{tool='knowledge.publish';tenant_id=$using:analystTenant;task_id=$using:analystTask;input=@{submission_id=$_;decision='accept';reason='Concurrent adoption verification'}} | ConvertTo-Json -Depth 8 -Compress
+    $body=@{tool='knowledge.publish';tenant_id=$using:analystTenant;task_id=$using:analystTask;input=@{submission_id=$_;decision='accept';reason='Concurrent adoption verification';reuse=$using:concurrentReuse}} | ConvertTo-Json -Depth 8 -Compress
     $response=Invoke-WebRequest -Method POST -Uri $using:endpoint -Headers @{Authorization=('Bearer '+$using:analyst)} -ContentType 'application/json; charset=utf-8' -Body ([Text.Encoding]::UTF8.GetBytes($body)) -SkipHttpErrorCheck
     [int]$response.StatusCode
 } -ThrottleLimit 2)
