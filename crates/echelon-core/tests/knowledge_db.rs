@@ -821,6 +821,54 @@ async fn work_orders_scope_results_and_interrupted_runs() {
     let mut agent = actor(tenant, task, Role::Agent);
     agent.work_order_id = Some(order_id);
     agent.targets = vec!["synthetic:summary".into()];
+    let receipt_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO tool_receipts(tenant_id,task_id,work_order_id,request_key,request_hash,tool,status,result) VALUES($1,$2,$3,$4,'owned-request-hash','shell.exec','completed',$5)")
+        .bind(tenant).bind(task).bind(order_id).bind(receipt_id).bind(json!({"job_id":receipt_id,"exit_code":0,"timed_out":false,"replayed":true,"stdout":"x".repeat(2000),"execution":{"script":"printf OWNED","script_sha256":"owned-hash","outputs":[],"timeout_seconds":5}})).execute(&pool).await.unwrap();
+    let receipt_view = work::read(
+        &pool,
+        &h,
+        &json!({"work_order_id":order_id,"receipt_limit":1}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        receipt_view["execution_receipts"][0]["request_id"],
+        json!(receipt_id)
+    );
+    assert_eq!(
+        receipt_view["execution_receipts"][0]["result"]["replayed"],
+        true
+    );
+    assert_eq!(
+        receipt_view["execution_receipts"][0]["result"]["stdout_truncated"],
+        true
+    );
+    assert_eq!(
+        receipt_view["execution_receipts"][0]["result"]["stdout"]
+            .as_str()
+            .unwrap()
+            .len(),
+        1024
+    );
+    assert!(
+        work::read(
+            &pool,
+            &h,
+            &json!({"work_order_id":order_id,"receipt_limit":17})
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(
+        work::read(
+            &pool,
+            &h,
+            &json!({"work_order_id":order_id,"receipt_offset":1})
+        )
+        .await
+        .unwrap()["execution_receipts"],
+        json!([])
+    );
     let loaded = work::read(&pool, &agent, &json!({"work_order_id":order_id}))
         .await
         .unwrap();
@@ -880,6 +928,40 @@ async fn work_orders_scope_results_and_interrupted_runs() {
             .await
             .is_err()
     );
+    let file_task = Uuid::new_v4();
+    sqlx::query("INSERT INTO tasks(id,tenant_id,goal,contract) VALUES($1,$2,'Owned staged file workflow',$3)")
+        .bind(file_task).bind(tenant).bind(json!({"kind":"work","output_format":"result.txt","allowed_tools":["artifact.write"],"max_work_orders":2})).execute(&pool).await.unwrap();
+    let file_handler = actor(tenant, file_task, Role::Handler);
+    let staged = json!({"target":"owned:staged","objective":"Observe before file creation","expected_output":"Partial observation, then file in a later Work Order","references":[]});
+    let first = work::delegate(&pool, &file_handler, &staged).await.unwrap();
+    let mut file_agent = actor(tenant, file_task, Role::Agent);
+    file_agent.work_order_id = Some(id(&first["work_order_id"]));
+    file_agent.targets = vec!["owned:staged".into()];
+    assert_eq!(
+        work::complete(
+            &pool,
+            &file_agent,
+            &json!({"outcome":"completed","summary":"No file exists"})
+        )
+        .await
+        .unwrap_err()
+        .code,
+        "work_artifact_required"
+    );
+    let partial = json!({"outcome":"partial","summary":"Objective observed; file not yet created","evidence":[],"limitations":["File creation and verification remain for Handler's next Work Order"]});
+    work::complete(&pool, &file_agent, &partial).await.unwrap();
+    assert_eq!(
+        work::read(
+            &pool,
+            &file_handler,
+            &json!({"work_order_id":first["work_order_id"]})
+        )
+        .await
+        .unwrap()["result"],
+        partial
+    );
+    let second = work::delegate(&pool, &file_handler, &staged).await.unwrap();
+    assert_ne!(first["work_order_id"], second["work_order_id"]);
     let run = Uuid::new_v4();
     sqlx::query("INSERT INTO execution_runs(id,tenant_id,task_id,request_key,config,state,status) VALUES($1,$2,$3,$4,'{}','{}','running')").bind(run).bind(tenant).bind(task).bind(Uuid::new_v4()).execute(&pool).await.unwrap();
     assert!(sqlx::query("INSERT INTO execution_runs(id,tenant_id,task_id,request_key,config,state,status) VALUES($1,$2,$3,$4,'{}','{}','running')").bind(Uuid::new_v4()).bind(tenant).bind(task).bind(Uuid::new_v4()).execute(&pool).await.is_err());

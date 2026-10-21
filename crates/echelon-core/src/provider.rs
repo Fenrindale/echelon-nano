@@ -28,7 +28,7 @@ fn client() -> AppResult<reqwest::Client> {
     reqwest::Client::builder()
         .https_only(true)
         .redirect(reqwest::redirect::Policy::none())
-        .timeout(std::time::Duration::from_secs(120))
+        .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|_| AppError::internal("provider_client_failed"))
 }
@@ -157,14 +157,14 @@ pub async fn infer(
         }
         let (key, generation) =
             credential(s, tenant, Uuid::parse_str(id).map_err(|_| bad())?).await?;
-        let response=client()?.post("https://api.openai.com/v1/responses").bearer_auth(key.api_key).json(&json!({"model":model,"instructions":instructions,"input":input,"tools":tools,"tool_choice":"required","parallel_tool_calls":false,"store":false,"stream":true,"include":["reasoning.encrypted_content"]})).send().await.map_err(|_|AppError::bad("provider_unavailable"))?;
+        let response=crate::persistence::inference_client().map_err(|_|AppError::internal("provider_client_failed"))?.post("https://api.openai.com/v1/responses").bearer_auth(key.api_key).json(&json!({"model":model,"instructions":instructions,"input":input,"tools":tools,"tool_choice":"required","parallel_tool_calls":false,"store":false,"stream":true,"include":["reasoning.encrypted_content"]})).send().await.map_err(crate::persistence::transport_error)?;
         if !response.status().is_success() {
-            return Err(AppError::bad("inference_rejected"));
+            return Err(crate::persistence::rejected(response).await);
         }
         let mut stream = response.bytes_stream();
         let mut parser = SseProbe::default();
         while let Some(chunk) = stream.next().await {
-            parser.feed(&chunk.map_err(|_| AppError::bad("inference_stream_interrupted"))?)?;
+            parser.feed(&chunk.map_err(crate::persistence::transport_error)?)?;
         }
         let (output, usage) = parser.finish_output()?;
         Ok(ModelReply {

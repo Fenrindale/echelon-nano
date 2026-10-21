@@ -191,12 +191,22 @@ pub async fn delegate(pool: &PgPool, a: &Claims, input: &Value) -> AppResult<Val
 #[serde(deny_unknown_fields)]
 struct Read {
     work_order_id: Uuid,
+    #[serde(default)]
+    receipt_offset: i64,
+    #[serde(default = "receipt_limit")]
+    receipt_limit: i64,
+}
+fn receipt_limit() -> i64 {
+    8
 }
 pub async fn read(pool: &PgPool, a: &Claims, input: &Value) -> AppResult<Value> {
     if !matches!(a.role, Role::Handler | Role::Agent) {
         return Err(AppError::forbidden("role_denied"));
     }
     let r: Read = serde_json::from_value(input.clone()).map_err(|_| invalid())?;
+    if !(0..=100000).contains(&r.receipt_offset) || !(1..=16).contains(&r.receipt_limit) {
+        return Err(invalid());
+    }
     if a.role == Role::Agent && a.work_order_id != Some(r.work_order_id) {
         return Err(missing());
     }
@@ -205,8 +215,23 @@ pub async fn read(pool: &PgPool, a: &Claims, input: &Value) -> AppResult<Value> 
     let artifacts=sqlx::query("SELECT id,name,media_type,sha256,work_order_id,octet_length(body) AS bytes FROM artifacts WHERE tenant_id=$1 AND task_id=$2 AND work_order_id=$3 ORDER BY created_at LIMIT 64").bind(a.tenant_id).bind(a.task_id).bind(r.work_order_id).fetch_all(pool).await.map_err(db)?;
     let observations=sqlx::query("SELECT id,content FROM observations WHERE tenant_id=$1 AND task_id=$2 AND work_order_id=$3 ORDER BY created_at LIMIT 32").bind(a.tenant_id).bind(a.task_id).bind(r.work_order_id).fetch_all(pool).await.map_err(db)?;
     let tool_evidence = crate::credentials::work_evidence(pool, a, r.work_order_id).await?;
+    let receipts=sqlx::query("SELECT request_key,request_hash,tool,status,result FROM tool_receipts WHERE tenant_id=$1 AND task_id=$2 AND work_order_id=$3 ORDER BY created_at,request_key OFFSET $4 LIMIT $5").bind(a.tenant_id).bind(a.task_id).bind(r.work_order_id).bind(r.receipt_offset).bind(r.receipt_limit+1).fetch_all(pool).await.map_err(db)?;
+    let execution_receipts:Vec<Value>=receipts.iter().take(r.receipt_limit as usize).map(|row| {
+        let raw:Value=row.get::<Option<Value>,_>("result").unwrap_or(Value::Null);
+        let mut result=json!({});
+        for key in ["job_id","exit_code","timed_out","replayed","artifacts","artifact","execution","status","url","sanitized_sha256"] {
+            if let Some(value)=raw.get(key) { result[key]=value.clone(); }
+        }
+        for key in ["stdout","stderr","content"] {
+            if let Some(text)=raw[key].as_str() {
+                result[key]=json!(text.chars().take(1024).collect::<String>());
+                result[format!("{key}_truncated")]=json!(text.chars().count()>1024);
+            }
+        }
+        json!({"request_id":row.get::<Uuid,_>("request_key"),"request_hash":row.get::<String,_>("request_hash"),"tool":row.get::<String,_>("tool"),"status":row.get::<String,_>("status"),"result":result})
+    }).collect();
     Ok(
-        json!({"work_order_id":r.work_order_id,"target":row.get::<String,_>("target"),"status":row.get::<String,_>("status"),"contract":row.get::<Value,_>("contract"),"result":row.get::<Option<Value>,_>("result"),"artifacts":artifacts.iter().map(crate::workspace::artifact_header).collect::<Vec<_>>(),"observations":observations.iter().map(|o|json!({"id":o.get::<Uuid,_>("id"),"content":o.get::<Value,_>("content")})).collect::<Vec<_>>(),"tool_evidence":tool_evidence}),
+        json!({"work_order_id":r.work_order_id,"target":row.get::<String,_>("target"),"status":row.get::<String,_>("status"),"contract":row.get::<Value,_>("contract"),"result":row.get::<Option<Value>,_>("result"),"artifacts":artifacts.iter().map(crate::workspace::artifact_header).collect::<Vec<_>>(),"observations":observations.iter().map(|o|json!({"id":o.get::<Uuid,_>("id"),"content":o.get::<Value,_>("content")})).collect::<Vec<_>>(),"tool_evidence":tool_evidence,"execution_receipts":execution_receipts,"receipt_offset":r.receipt_offset,"next_receipt_offset":if receipts.len()>r.receipt_limit as usize {Some(r.receipt_offset+r.receipt_limit)}else{None}}),
     )
 }
 
@@ -250,7 +275,9 @@ pub async fn complete(pool: &PgPool, a: &Claims, input: &Value) -> AppResult<Val
     if r.artifacts.len() > 16 {
         return Err(invalid());
     }
-    if matches!(r.outcome.as_str(), "completed" | "partial")
+    // A partial attempt may precede file creation. Handler must be able to collect it
+    // and delegate remaining work; only a completed file result requires an artifact.
+    if r.outcome == "completed"
         && !contract["tool_policy"]["output_format"]
             .as_str()
             .unwrap_or_default()

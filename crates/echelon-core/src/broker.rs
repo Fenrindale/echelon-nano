@@ -421,6 +421,7 @@ async fn shell(
     }
     result.as_object_mut().ok_or_else(bad)?.remove("outputs");
     result["artifacts"] = json!(artifacts);
+    result["execution"] = json!({"script":job.script.chars().take(1024).collect::<String>(),"script_truncated":job.script.chars().count()>1024,"script_sha256":workspace::digest(job.script.as_bytes()),"outputs":job.outputs,"timeout_seconds":job.timeout_seconds});
     Ok(result)
 }
 fn tool_timeout() -> u64 {

@@ -181,6 +181,7 @@ pub struct Callback {
 #[derive(Clone)]
 pub struct OAuthService {
     client: Client,
+    inference_client: Client,
     vault: VaultStore,
     pool: PgPool,
     host_id: String,
@@ -201,8 +202,10 @@ impl OAuthService {
             client: Client::builder()
                 .https_only(true)
                 .redirect(reqwest::redirect::Policy::none())
+                .connect_timeout(Duration::from_secs(30))
                 .timeout(Duration::from_secs(120))
                 .build()?,
+            inference_client: crate::persistence::inference_client()?,
             vault,
             pool,
             host_id,
@@ -706,9 +709,9 @@ impl OAuthService {
         if !record.plan_enabled() {
             return Err(AppError::forbidden("plan_usage_not_granted"));
         }
-        // SIWC rejects max_output_tokens. Bound calls, elapsed time and stream bytes locally.
+        // Model generation has connect/idle/total deadlines independent of Task lifetime.
         let response = self
-            .client
+            .inference_client
             .post(format!("{RESOURCE}/responses"))
             .bearer_auth(&record.access_token)
             .json(
@@ -718,14 +721,14 @@ impl OAuthService {
             )
             .send()
             .await
-            .map_err(|_| AppError::internal("provider_unavailable"))?;
+            .map_err(crate::persistence::transport_error)?;
         if !response.status().is_success() {
-            return Err(AppError::bad("inference_rejected"));
+            return Err(crate::persistence::rejected(response).await);
         }
         let mut stream = response.bytes_stream();
         let mut parser = SseProbe::default();
         while let Some(chunk) = stream.next().await {
-            parser.feed(&chunk.map_err(|_| AppError::bad("inference_stream_interrupted"))?)?;
+            parser.feed(&chunk.map_err(crate::persistence::transport_error)?)?;
         }
         let (output, usage) = parser.finish_output()?;
         Ok(ModelReply {

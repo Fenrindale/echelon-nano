@@ -11,6 +11,7 @@ pub mod execution;
 pub mod ingestion;
 pub mod knowledge;
 pub mod maintenance;
+pub mod persistence;
 pub mod policy;
 pub mod protocol;
 pub mod provider;

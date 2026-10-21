@@ -61,6 +61,13 @@ Assert-Recovery (@($taskState.work_orders).Count -eq 1) 'Restart duplicated a Wo
 $receipts=@($taskState.tool_receipts|Where-Object tool -eq 'shell.exec')
 Assert-Recovery ($receipts.Count -eq 1 -and $receipts[0].status -eq 'completed') 'Restart duplicated or lost the shell effect receipt.'
 Assert-Recovery ($receipts[0].result.replayed) 'Worker did not return the original job receipt after core interruption.'
+$native=Invoke-Echelon '/v1/operator/domain' 'POST' @{tenant_id=$tenant;task_id=$task;tool='work_order.read';input=@{work_order_id=$taskState.work_orders[0].id}}
+$nativeReceipts=@($native.execution_receipts|Where-Object tool -eq 'shell.exec')
+Assert-Recovery ($nativeReceipts.Count -eq 1 -and $nativeReceipts[0].result.replayed -and $nativeReceipts[0].result.exit_code -eq 0 -and -not $nativeReceipts[0].result.timed_out) 'Handler cannot inspect the actual recovered native execution receipt.'
+$execution=$nativeReceipts[0].result.execution
+Assert-Recovery (-not $execution.script_truncated -and $execution.script -match 'sleep\s+12' -and $execution.outputs -contains 'resume.txt') 'Native receipt omitted the actual execution parameters.'
+$scriptHash=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($execution.script))).ToLowerInvariant()
+Assert-Recovery ($scriptHash -eq $execution.script_sha256) 'Native execution script differs from its server-recorded hash.'
 $output=@($taskState.artifacts|Where-Object {$_.work_order_id -and $_.name -eq 'resume.txt'})
 Assert-Recovery ($output.Count -eq 1) 'The resumed effect produced duplicate output artifacts.'
 Assert-Recovery ((Invoke-Echelon "/v1/operator/artifacts/$($output[0].id)?tenant_id=$tenant").content -eq 'RESUME_OK') 'Recovered output content differs.'
