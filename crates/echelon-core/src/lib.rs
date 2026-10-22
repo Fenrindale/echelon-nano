@@ -11,6 +11,7 @@ pub mod execution;
 pub mod ingestion;
 pub mod knowledge;
 pub mod maintenance;
+pub mod mcp;
 pub mod observability;
 pub mod persistence;
 pub mod policy;

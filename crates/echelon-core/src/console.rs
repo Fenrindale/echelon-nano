@@ -28,6 +28,7 @@ use uuid::Uuid;
 type Shared = Arc<AppState>;
 pub fn routes() -> Router<Shared> {
     Router::new()
+        .merge(crate::mcp::routes())
         .route("/v1/ui/session", get(session).post(open_session))
         .route("/v1/ui/logout", post(logout))
         .route("/v1/operator/tenants", get(tenants).post(create_tenant))
@@ -396,6 +397,7 @@ pub async fn validate_contract(
         }
     }
     crate::credentials::validate_task_bindings(pool, tenant, task, c).await?;
+    crate::mcp::validate_grants(pool, tenant, &c.mcp_tools).await?;
     Ok(())
 }
 async fn credential_catalog(
@@ -542,7 +544,7 @@ async fn domain(
         | Capability::AgentDelegate
         | Capability::WorkOrderRead
         | Capability::ArtifactRead => Role::Handler,
-        Capability::CredentialInspect => Role::Handler,
+        Capability::CredentialInspect | Capability::McpInspect => Role::Handler,
         _ => {
             return Err(crate::error::AppError::forbidden(
                 "operator_domain_tool_denied",

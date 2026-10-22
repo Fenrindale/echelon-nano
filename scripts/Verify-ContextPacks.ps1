@@ -117,6 +117,10 @@ Assert-ContextDenied 'knowledge.read' @{op='get';item_id=$rule;version=1} 403 $h
 $ruleRef=@($headers | Where-Object item_id -eq $rule)[0].ref_id
 $resolved=Read-Context @{op='resolve';pack_id=$pack.id;ref_id=$ruleRef}
 Assert-Context ($resolved.document.content -eq 'CONTEXT_RULE_BODY_VERSION_ONE' -and $resolved.reference.version -eq 1) 'The selected rule did not resolve to its pinned version.'
+$batch=Read-Context @{op='resolve_many';pack_id=$pack.id;ref_ids=@($ruleRef)}
+Assert-Context ($batch.resolved.Count -eq 1 -and $batch.resolved[0].reference.document_sha256 -eq $resolved.reference.document_sha256) 'Batch resolution did not preserve the pinned document.'
+Assert-ContextDenied 'context.read' @{op='resolve_many';pack_id=$pack.id;ref_ids=@($ruleRef)} 404 $foreignHandler $foreignTask
+Assert-ContextDenied 'context.read' @{op='resolve_many';pack_id=$pack.id;ref_ids=@()} 400 $handler $handlerTask
 Assert-Context ($resolved.reference.document_sha256 -eq @($headers | Where-Object ref_id -eq $ruleRef)[0].document_sha256) 'Reference document hash changed.'
 Assert-Context (@($resolved.links).Count -eq 1) 'A pinned evidence link was not granted.'
 $evidence=Read-Context @{op='resolve';pack_id=$pack.id;ref_id=$resolved.links[0].ref_id}

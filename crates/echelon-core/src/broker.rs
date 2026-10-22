@@ -427,7 +427,7 @@ async fn shell(
 fn tool_timeout() -> u64 {
     20
 }
-fn redact_response(text: &str, secret: Option<&str>) -> String {
+pub(crate) fn redact_response(text: &str, secret: Option<&str>) -> String {
     let mut text = text.to_owned();
     if let Some(value) = secret {
         for part in [Some(value), value.strip_prefix("Bearer ")]

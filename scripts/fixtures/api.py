@@ -6,6 +6,46 @@ import json
 
 class Handler(BaseHTTPRequestHandler):
     counts = {}
+    resolved = set()
+
+    def do_POST(self):
+        if self.path not in ('/mcp', '/mcp-lost'):
+            self.send_error(404)
+            return
+        message = json.loads(self.rfile.read(int(self.headers.get('Content-Length', 0))))
+        method = message.get('method')
+        if 'id' not in message:
+            self.send_response(202)
+            self.end_headers()
+            return
+        if method == 'initialize':
+            result = {'protocolVersion': '2025-03-26', 'capabilities': {'tools': {}},
+                      'serverInfo': {'name': 'owned-fixture', 'version': '1'}}
+        elif method == 'tools/list':
+            result = {'tools': [
+                {'name': 'list_items', 'description': 'List owned synthetic unresolved work items', 'inputSchema': {'type': 'object', 'properties': {}}},
+                {'name': 'resolve_item', 'description': 'Resolve one owned synthetic work item', 'inputSchema': {'type': 'object', 'properties': {'id': {'type': 'string'}}, 'required': ['id']}}
+            ]}
+        elif method == 'tools/call':
+            name = message['params']['name']
+            self.counts[name] = self.counts.get(name, 0) + 1
+            if name == 'resolve_item':
+                self.resolved.add(message['params']['arguments']['id'])
+                if self.path == '/mcp-lost':
+                    self.close_connection = True
+                    return
+            result = {'content': [{'type': 'text', 'text': json.dumps({'fixture': True, 'items': ['owned-item-A', 'owned-item-B'], 'resolved': sorted(self.resolved), 'call_count': self.counts[name], 'auth_echo': self.headers.get('Authorization', '')})}]}
+        else:
+            self.send_error(400)
+            return
+        body = json.dumps({'jsonrpc': '2.0', 'id': message['id'], 'result': result}).encode()
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/event-stream')
+        payload = b'data: ' + body + b'\n\n'
+        self.send_header('Content-Length', str(len(payload)))
+        self.send_header('Mcp-Session-Id', 'owned-fixture-session')
+        self.end_headers()
+        self.wfile.write(payload)
 
     def log_message(self, *args):
         pass  # Request headers and credentials must never reach container logs.

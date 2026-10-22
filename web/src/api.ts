@@ -3,6 +3,14 @@ export function setCsrf(value: string) {
   csrf = value;
 }
 const messages: Record<string, string> = {
+  mcp_host_operation_failed: "MCP 설치 또는 초기화에 실패했습니다. 패키지 버전·실행 파일·Vault 변수 연결을 확인하세요.",
+  mcp_package_install_failed: "MCP 패키지를 설치하지 못했습니다. 패키지 이름·정확한 버전·런타임 의존성을 확인하세요.",
+  mcp_process_closed: "MCP 프로세스가 초기화 또는 실행 중 종료됐습니다. 실행 파일·인자·Vault 변수 연결을 확인하세요.",
+  mcp_timeout: "MCP가 실행 시간 안에 응답하지 않았습니다. 변경 작업은 외부 상태 확인 전까지 다시 실행하지 않습니다.",
+  mcp_not_ready: "이 MCP는 연결 확인이 필요합니다.",
+  mcp_credentials_require_vault: "인자·주소에 비밀번호나 토큰을 넣을 수 없습니다. Vault 변수 연결을 사용하세요.",
+  mcp_version_conflict: "MCP 설정이 변경됐습니다. 현재 설정을 다시 열어 주세요.",
+  mcp_outcome_unknown_do_not_retry: "MCP 실행 결과가 불명확합니다. 외부 상태 확인 전에는 자동 재실행하지 않습니다.",
   unauthorized: "운영 서버 연결을 새로 확인해 주세요.",
   csrf_denied: "연결 정보를 새로 확인해 주세요.",
   origin_denied: "로컬 운영 화면에서 요청해 주세요.",

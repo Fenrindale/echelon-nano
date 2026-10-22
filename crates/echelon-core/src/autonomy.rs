@@ -289,6 +289,8 @@ pub async fn catalog(s: &AppState, c: &StartRun, models: &Value) -> AppResult<Va
             .await
             .map_err(db)?;
     let value = json!({"models":models["models"],"protocols":protocols,"secrets":secrets,"credentials":credentials,"input_artifacts":artifacts,"historical_work_orders":work_orders,"source_ids":source_ids,"execution_capabilities":{"workspace_registration_required":false,"agent_actions":["artifact.write","shell.exec","external.fetch","credential.import","credential.check"],"credential_binding_source":"User goal or selected configuration input; Handler selects and pins connections in the Work Order","identity_adapters":["gitlab","jenkins","databricks"],"handler_verification":"work_order.read.tool_evidence returns server storage receipts and actual identity observations"}});
+    let mut value = value;
+    value["mcp"] = crate::mcp::catalog(&s.pool, c.tenant_id, true).await?;
     if serde_json::to_vec(&value).map_err(|_| bad())?.len() > 65536 {
         return Err(AppError::bad("setup_catalog_budget_exceeded"));
     }

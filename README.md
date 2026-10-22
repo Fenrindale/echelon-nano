@@ -26,6 +26,8 @@ See the [beta guide and API contracts](docs/BETA.md), [execution contracts](docs
 
 The initial model connection uses the official Sign in with ChatGPT route. It does not reuse another application's Codex credentials, call private ChatGPT inference endpoints, or silently fall back to a billed API key.
 
+Shared workspace MCP installations now have a dedicated **MCP** menu. Handler selects installed tools, Agent executes only Work Order grants, and Vault injects referenced credentials. npm/Python stdio and Streamable HTTP transports are supported; see [MCP setup, boundaries and continuation](docs/MCP.md).
+
 ## Requirements
 
 - Docker Desktop with Linux containers and Compose.
@@ -103,6 +105,7 @@ Compose's parallel build can reject non-ASCII Windows workspace paths on some Do
 ```powershell
 docker build --target runtime -t echelon-nano:local .
 docker build --target worker -t echelon-nano-worker:local .
+docker build --target mcp-host -t echelon-nano-mcp:local .
 ./scripts/Initialize-Local.ps1 -SkipBuild
 ```
 

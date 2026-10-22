@@ -14,6 +14,7 @@ import {
 import { Tasks, TaskDetail, TaskForm } from "./tasks";
 import { Central, KnowledgeDetail } from "./central";
 import { Protocols, Dreaming, Vault, Settings } from "./governance";
+import { Mcp } from "./mcp";
 import { applyAccent } from "./theme";
 import "./style.css";
 
@@ -171,6 +172,7 @@ const nav = [
   ["protocols", "◎", "Protocols", "프로토콜"],
   ["dreaming", "◇", "Dreaming", "감사·정리"],
   ["vault", "⌁", "Vault", "기밀 참조"],
+  ["mcp", "⛓", "MCP", "공통 도구"],
   ["settings", "⚙", "Settings", "설정"],
 ];
 function Shell({
@@ -430,6 +432,7 @@ function Shell({
                 {view === "protocols" && <Protocols />}
                 {view === "dreaming" && <Dreaming />}
                 {view === "vault" && <Vault />}
+                {view === "mcp" && <Mcp />}
                 {view === "settings" && <Settings />}
                 <ErrorBox error={providerData.error || catalog.error} />
               </>

@@ -519,6 +519,8 @@ async fn dispatch(s: &AppState, a: &Claims, req: &ToolRequest) -> AppResult<Valu
         Capability::CredentialInspect => crate::credentials::inspect(s, a, &req.input).await,
         Capability::CredentialImport => crate::credentials::import(s, a, &req.input).await,
         Capability::CredentialCheck => crate::credentials::check(s, a, &req.input).await,
+        Capability::McpInspect => crate::mcp::inspect(s, a, &req.input).await,
+        Capability::McpCall => crate::mcp::call(s, a, &req.input).await,
         Capability::ArtifactWrite => {
             let policy = broker::order_policy(&s.pool, a).await?;
             if !policy.allowed_tools.iter().any(|t| t == "artifact.write") {

@@ -56,6 +56,7 @@ pub struct TaskContract {
     pub credential_bundles: Vec<Uuid>,
     pub credential_connectors: Vec<CredentialConnectorGrant>,
     pub credential_bindings: Vec<CredentialBinding>,
+    pub mcp_tools: Vec<crate::mcp::Grant>,
     pub input_artifacts: Vec<Uuid>,
     pub verification: String,
     pub max_work_orders: u32,
@@ -118,6 +119,7 @@ impl TaskContract {
             || self.credential_bundles.len() > 16
             || self.credential_connectors.len() > 8
             || self.credential_bindings.len() > 8
+            || self.mcp_tools.len() > 16
             || self.credential_connectors.iter().any(|g| g.version < 1)
             || self.input_artifacts.len() > 16
             || self.max_work_orders > 8
@@ -129,6 +131,7 @@ impl TaskContract {
                         | "artifact.write"
                         | "credential.import"
                         | "credential.check"
+                        | "mcp.call"
                 )
             })
         {

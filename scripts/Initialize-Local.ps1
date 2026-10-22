@@ -29,6 +29,8 @@ try {
         if($LASTEXITCODE -ne 0){throw 'Core runtime build failed.'}
         & docker build --target worker -t echelon-nano-worker:local $script:ProjectRoot
         if($LASTEXITCODE -ne 0){throw 'Worker runtime build failed.'}
+        & docker build --target mcp-host -t echelon-nano-mcp:local $script:ProjectRoot
+        if($LASTEXITCODE -ne 0){throw 'MCP runtime build failed.'}
     }
     Invoke-Compose @('up','-d','postgres','vault')
     Start-Sleep -Seconds 2

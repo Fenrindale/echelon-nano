@@ -55,3 +55,9 @@ USER 0:0
 RUN apt-get update && apt-get install -y --no-install-recommends python3 git libseccomp2 && rm -rf /var/lib/apt/lists/* && mkdir -p /root/.broker /jobs && chmod 0700 /root /root/.broker
 EXPOSE 9090
 CMD ["worker"]
+
+FROM node:24-bookworm-slim@sha256:55fb5f5a527ea2c5c4a95f963e48ef90aa38c7b346054fdc8ee9957a2b55d205 AS mcp-host
+RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-pip ca-certificates && rm -rf /var/lib/apt/lists/* && mkdir -p /root/.broker /packages && chmod 0700 /root /root/.broker
+COPY crates/echelon-core/src/mcp_host.py /app/mcp_host.py
+RUN python3 -c "import ast,pathlib; ast.parse(pathlib.Path('/app/mcp_host.py').read_text())"
+ENTRYPOINT ["python3", "/app/mcp_host.py"]

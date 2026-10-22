@@ -217,6 +217,10 @@ enum ReadInput {
         pack_id: Uuid,
         ref_id: Uuid,
     },
+    ResolveMany {
+        pack_id: Uuid,
+        ref_ids: Vec<Uuid>,
+    },
 }
 async fn event(
     tx: &mut Transaction<'_, Postgres>,
@@ -669,6 +673,16 @@ pub async fn read(pool: &PgPool, a: &Claims, input: &Value) -> AppResult<Value> 
             Ok(json!({"pack":manifest}))
         }
         ReadInput::Resolve { pack_id, ref_id } => resolve(pool, a, pack_id, ref_id).await,
+        ReadInput::ResolveMany { pack_id, ref_ids } => {
+            if ref_ids.is_empty() || ref_ids.len() > 16 {
+                return Err(invalid());
+            }
+            let mut values = Vec::new();
+            for reference in ref_ids {
+                values.push(resolve(pool, a, pack_id, reference).await?);
+            }
+            Ok(json!({"resolved":values}))
+        }
     }
 }
 async fn resolve(pool: &PgPool, a: &Claims, pack: Uuid, reference: Uuid) -> AppResult<Value> {

@@ -50,6 +50,10 @@ pub enum Capability {
     CredentialImport,
     #[serde(rename = "credential.check")]
     CredentialCheck,
+    #[serde(rename = "mcp.inspect")]
+    McpInspect,
+    #[serde(rename = "mcp.call")]
+    McpCall,
     #[serde(rename = "task.observe")]
     TaskObserve,
     #[serde(rename = "external.fetch")]
@@ -70,7 +74,7 @@ pub enum Capability {
     VaultRawRead,
 }
 
-pub const ALL: [Capability; 25] = [
+pub const ALL: [Capability; 27] = [
     Capability::KnowledgeRead,
     Capability::KnowledgeClassify,
     Capability::KnowledgePublish,
@@ -87,6 +91,8 @@ pub const ALL: [Capability; 25] = [
     Capability::CredentialInspect,
     Capability::CredentialImport,
     Capability::CredentialCheck,
+    Capability::McpInspect,
+    Capability::McpCall,
     Capability::TaskObserve,
     Capability::ExternalFetch,
     Capability::ShellExec,
@@ -115,6 +121,7 @@ pub fn role_allows(role: Role, action: Capability) -> bool {
                 | WorkOrderRead
                 | ArtifactRead
                 | CredentialInspect
+                | McpInspect
         ),
         Role::Agent => matches!(
             action,
@@ -128,6 +135,7 @@ pub fn role_allows(role: Role, action: Capability) -> bool {
                 | CredentialInspect
                 | CredentialImport
                 | CredentialCheck
+                | McpCall
         ),
         Role::Master => matches!(
             action,

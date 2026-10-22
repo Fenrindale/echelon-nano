@@ -16,7 +16,9 @@ jobs:
         run: docker build --target runtime -t echelon-nano:ci .
       - name: Build the isolated Worker and its child syscall policy
         run: docker build --target worker -t echelon-nano-worker:ci .
-      - name: PostgreSQL knowledge, Context Packs, Work Orders and immutable history
+      - name: Build shared MCP runtime and validate supervisor syntax
+        run: docker build --target mcp-host -t echelon-nano-mcp:ci .
+      - name: PostgreSQL domain and immutable history regression
         run: docker compose -f compose.verify.yaml up --build --abort-on-container-exit --exit-code-from tests
       - name: Remove the isolated verification containers
         if: always()

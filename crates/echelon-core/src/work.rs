@@ -154,7 +154,8 @@ pub async fn delegate(pool: &PgPool, a: &Claims, input: &Value) -> AppResult<Val
         }
         Value::Null
     };
-    let contract = json!({"objective":d.objective,"expected_output":d.expected_output,"references":d.references,"evidence":evidence,"protocol":procedure,"input_artifacts":policy.input_artifacts,"tool_policy":policy,"request":input});
+    let mcp_schemas = crate::mcp::granted_tools(pool, a.tenant_id, &policy.mcp_tools).await?;
+    let contract = json!({"mcp_schemas":mcp_schemas,"objective":d.objective,"expected_output":d.expected_output,"references":d.references,"evidence":evidence,"protocol":procedure,"input_artifacts":policy.input_artifacts,"tool_policy":policy,"request":input});
     if serde_json::to_vec(&contract).map_err(|_| invalid())?.len() > 131072 {
         return Err(AppError::bad("work_evidence_budget_exceeded"));
     }
@@ -214,7 +215,8 @@ pub async fn read(pool: &PgPool, a: &Claims, input: &Value) -> AppResult<Value> 
         .bind(r.work_order_id).bind(a.tenant_id).bind(a.task_id).fetch_optional(pool).await.map_err(db)?.ok_or_else(missing)?;
     let artifacts=sqlx::query("SELECT id,name,media_type,sha256,work_order_id,octet_length(body) AS bytes FROM artifacts WHERE tenant_id=$1 AND task_id=$2 AND work_order_id=$3 ORDER BY created_at LIMIT 64").bind(a.tenant_id).bind(a.task_id).bind(r.work_order_id).fetch_all(pool).await.map_err(db)?;
     let observations=sqlx::query("SELECT id,content FROM observations WHERE tenant_id=$1 AND task_id=$2 AND work_order_id=$3 ORDER BY created_at LIMIT 32").bind(a.tenant_id).bind(a.task_id).bind(r.work_order_id).fetch_all(pool).await.map_err(db)?;
-    let tool_evidence = crate::credentials::work_evidence(pool, a, r.work_order_id).await?;
+    let mut tool_evidence = crate::credentials::work_evidence(pool, a, r.work_order_id).await?;
+    tool_evidence["mcp_calls"] = crate::mcp::work_evidence(pool, a, r.work_order_id).await?;
     let receipts=sqlx::query("SELECT request_key,request_hash,tool,status,result FROM tool_receipts WHERE tenant_id=$1 AND task_id=$2 AND work_order_id=$3 ORDER BY created_at,request_key OFFSET $4 LIMIT $5").bind(a.tenant_id).bind(a.task_id).bind(r.work_order_id).bind(r.receipt_offset).bind(r.receipt_limit+1).fetch_all(pool).await.map_err(db)?;
     let execution_receipts:Vec<Value>=receipts.iter().take(r.receipt_limit as usize).map(|row| {
         let raw:Value=row.get::<Option<Value>,_>("result").unwrap_or(Value::Null);
@@ -307,6 +309,7 @@ pub async fn complete(pool: &PgPool, a: &Claims, input: &Value) -> AppResult<Val
             .as_array()
             .is_some_and(|refs| !refs.is_empty())
         && r.evidence.is_empty()
+        && r.artifacts.is_empty()
     {
         return Err(AppError::bad("work_evidence_required"));
     }

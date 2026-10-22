@@ -214,12 +214,75 @@ struct ArtifactRequest {
     request_id: Option<Uuid>,
 }
 pub async fn inspect(s: &AppState, a: &Claims, input: &Value) -> AppResult<Value> {
+    if let Some(bundle) = input.get("bundle_id") {
+        if input.as_object().is_none_or(|o| o.len() != 1) {
+            return Err(bad());
+        }
+        let id: Uuid = serde_json::from_value(bundle.clone()).map_err(|_| bad())?;
+        if a.role == crate::policy::Role::Agent
+            && !broker::order_policy(&s.pool, a)
+                .await?
+                .credential_bundles
+                .contains(&id)
+        {
+            return Err(missing());
+        }
+        let row=sqlx::query("SELECT b.source_artifact_id,b.source_sha256,a.body FROM credential_bundles b JOIN artifacts a ON a.tenant_id=b.tenant_id AND a.id=b.source_artifact_id JOIN tasks t ON t.tenant_id=b.tenant_id AND t.id=b.source_task_id WHERE b.tenant_id=$1 AND b.id=$2 AND COALESCE(t.contract->>'model_access','')<>'blocked'").bind(a.tenant_id).bind(id).fetch_optional(&s.pool).await.map_err(db)?.ok_or_else(missing)?;
+        let bytes: Vec<u8> = row.get("body");
+        if workspace::digest(&bytes) != row.get::<String, _>("source_sha256") {
+            return Err(AppError::bad("credential_version_unconfirmed"));
+        }
+        let entries = parse(std::str::from_utf8(&bytes).map_err(|_| bad())?)?;
+        let configuration: BTreeMap<_, _> = entries
+            .iter()
+            .filter(|(k, _)| !secret_name(k) && (k.ends_with("_REGION") || k.ends_with("_MODE")))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        return Ok(
+            json!({"bundle_id":id,"source_artifact_id":row.get::<Uuid,_>("source_artifact_id"),"manifest":manifest(&entries),"configuration":configuration}),
+        );
+    }
     let r: ArtifactRequest = serde_json::from_value(input.clone()).map_err(|_| bad())?;
     let value = workspace::artifact(&s.pool, a, r.artifact_id).await?;
     let text = value["content"]
         .as_str()
         .ok_or_else(|| AppError::bad("credential_format_unsupported"))?;
     Ok(json!({"artifact":value["artifact"],"manifest":manifest(&parse(text)?)}))
+}
+pub async fn mcp_environment(
+    s: &AppState,
+    tenant: Uuid,
+    bindings: &[crate::mcp::EnvironmentBinding],
+) -> AppResult<BTreeMap<String, String>> {
+    let mut environment = BTreeMap::new();
+    for binding in bindings {
+        let row=sqlx::query("SELECT source_artifact_id,source_sha256,vault_version FROM credential_bundles WHERE tenant_id=$1 AND id=$2").bind(tenant).bind(binding.bundle_id).fetch_optional(&s.pool).await.map_err(db)?.ok_or_else(missing)?;
+        let stored = s
+            .vault
+            .get::<Bundle>(&format!("usersecrets/{}", binding.bundle_id))
+            .await?
+            .ok_or_else(missing)?;
+        if stored.value.tenant_id != tenant
+            || stored.version as i64 != row.get::<i64, _>("vault_version")
+            || stored.value.source_artifact_id != row.get::<Uuid, _>("source_artifact_id")
+            || stored.value.source_sha256 != row.get::<String, _>("source_sha256")
+        {
+            return Err(AppError::bad("credential_version_unconfirmed"));
+        }
+        let value = stored
+            .value
+            .variables
+            .get(&binding.variable)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| AppError::bad("mcp_credential_variable_missing"))?;
+        if environment
+            .insert(binding.name.clone(), value.clone())
+            .is_some()
+        {
+            return Err(bad());
+        }
+    }
+    Ok(environment)
 }
 #[derive(Serialize, Deserialize, PartialEq)]
 struct Bundle {

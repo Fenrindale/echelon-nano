@@ -91,6 +91,8 @@ services:
         condition: service_healthy
       vault:
         condition: service_started
+      mcp-host:
+        condition: service_started
     networks: [roles, data, secrets, provider, tools]
     read_only: true
     cap_drop: [ALL]
@@ -131,6 +133,25 @@ services:
     pids_limit: 16
     mem_limit: 64m
 
+  mcp-host:
+    image: echelon-nano-mcp:local
+    build:
+      context: .
+      target: mcp-host
+    user: '0:0'
+    volumes:
+      - ./.runtime/bootstrap/worker-token:/root/.broker/token:ro
+      - mcp-packages:/packages
+    networks: [tools, provider]
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [SETUID, SETGID, CHOWN, KILL, DAC_OVERRIDE]
+    security_opt: [no-new-privileges:true]
+    tmpfs: ["/tmp:rw,nosuid,nodev,size=256m,mode=1777"]
+    pids_limit: 160
+    mem_limit: 768m
+    cpus: 2.0
+
   analyst:
     <<: *role
     command: [role-probe, --role, analyst]
@@ -160,6 +181,7 @@ networks:
     internal: true
 
 volumes:
+  mcp-packages: {}
   postgres-data: {}
   vault-data: {}
 
