@@ -1,6 +1,6 @@
 """Private MCP stdio host. No DB, Vault, Docker socket or host filesystem access.
 
-Packages persist; each invocation gets a fresh process, UID, home and MCP session.
+Packages persist; calls share an isolated MCP session within one Work Order.
 Only the supervisor can read the control token. Child environment is constructed.
 """
 import hashlib
@@ -25,6 +25,8 @@ KEY = Path('/root/.broker/token').read_text().strip()
 UIDS = itertools.count(100000)
 LOCK = threading.Lock()
 PROTOCOL = '2025-03-26'
+POOL = {}
+POOL_LOCK = threading.Lock()
 
 
 def identity():
@@ -111,6 +113,7 @@ class Session:
         self.p.stdin.flush()
 
     def rpc(self, number, method, params):
+        self.deadline = time.monotonic() + 75
         self.send(dict(jsonrpc='2.0', id=number, method=method, params=params))
         while time.monotonic() < self.deadline:
             if b'\n' not in self.buffer:
@@ -134,7 +137,7 @@ class Session:
         raise ValueError('mcp_timeout')
 
 
-def invoke(request):
+def invoke_fresh(request):
     spec = request['spec']
     target = install(spec)
     if request['op'] == 'install':
@@ -181,6 +184,106 @@ def invoke(request):
             stop(p)
 
 
+class LeasedSession:
+    def __init__(self, request):
+        self.scope = request['session_scope']
+        self.lock, self.last, self.number = threading.Lock(), time.monotonic(), 2
+        self.home = tempfile.TemporaryDirectory()
+        uid = identity()
+        os.chown(self.home.name, uid, uid)
+        spec = request['spec']
+        target = install(spec)
+        extra = request.get('environment', {})
+        if any(k in extra for k in ('PATH', 'HOME', 'TMPDIR', 'PYTHONPATH', 'NODE_OPTIONS', 'LD_PRELOAD', 'LD_LIBRARY_PATH')):
+            self.home.cleanup()
+            raise ValueError('mcp_environment_invalid')
+        executable = spec['executable']
+        if not re.fullmatch(r'[A-Za-z0-9_.-]{1,128}', executable):
+            self.home.cleanup()
+            raise ValueError('mcp_executable_invalid')
+        env = environment(self.home.name, extra)
+        if spec['transport'] == 'npm':
+            binary = target / 'node_modules' / '.bin' / executable
+            if not binary.resolve().is_relative_to(target):
+                self.home.cleanup()
+                raise ValueError('mcp_executable_invalid')
+            cmd = [str(binary)]
+        else:
+            env['PYTHONPATH'] = str(target)
+            cmd = ['python3', '-m', executable]
+        self.p = subprocess.Popen(cmd + spec.get('args', []), cwd=self.home.name, env=env,
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  stderr=subprocess.DEVNULL, preexec_fn=child(uid))
+        self.rpc = Session(self.p)
+        try:
+            init = self.rpc.rpc(1, 'initialize', dict(protocolVersion=PROTOCOL, capabilities={}, clientInfo=dict(name='echelon-nano', version='0.3')))
+            if init.get('protocolVersion') not in ('2024-11-05', PROTOCOL, '2025-06-18', '2025-11-25'):
+                raise ValueError('mcp_protocol_version_unsupported')
+            self.rpc.send(dict(jsonrpc='2.0', method='notifications/initialized'))
+        except Exception:
+            self.close()
+            raise
+
+    def close(self):
+        stop(self.p)
+        self.rpc.selector.close()
+        self.home.cleanup()
+
+
+def invoke(request):
+    scope = request.get('session_scope')
+    if not scope:
+        return invoke_fresh(request)
+    if not isinstance(scope, str) or not re.fullmatch(r'[A-Za-z0-9:_-]{1,200}', scope):
+        raise ValueError('mcp_session_scope_invalid')
+    with POOL_LOCK:
+        for key, entry in list(POOL.items()):
+            if (request['op'] == 'close' and entry.scope == scope) or time.monotonic() - entry.last > 1800:
+                if entry.lock.acquire(blocking=False):
+                    try:
+                        POOL.pop(key, None)
+                        entry.close()
+                    finally:
+                        entry.lock.release()
+        if request['op'] == 'close':
+            return dict(closed=True)
+        if request['op'] != 'call':
+            raise ValueError('mcp_session_operation_invalid')
+        key = hashlib.sha256(json.dumps([scope, request['spec'], request.get('environment', {})], sort_keys=True).encode()).hexdigest()
+        if key not in POOL:
+            if len(POOL) >= 24:
+                raise ValueError('mcp_session_capacity_reached')
+            POOL[key] = LeasedSession(request)
+        entry = POOL[key]
+        entry.last = time.monotonic()
+    entry.lock.acquire()
+    try:
+        entry.number += 1
+        return entry.rpc.rpc(entry.number, 'tools/call', dict(name=request['tool'], arguments=request['arguments']))
+    except Exception:
+        # Unknown effects are handled by the core receipt, never retried here.
+        with POOL_LOCK:
+            POOL.pop(key, None)
+        entry.close()
+        raise
+    finally:
+        entry.last = time.monotonic()
+        entry.lock.release()
+
+
+def reap_sessions():
+    while True:
+        time.sleep(30)
+        with POOL_LOCK:
+            for key, entry in list(POOL.items()):
+                if time.monotonic() - entry.last > 1800 and entry.lock.acquire(blocking=False):
+                    try:
+                        POOL.pop(key, None)
+                        entry.close()
+                    finally:
+                        entry.lock.release()
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_):
         pass
@@ -210,4 +313,5 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == '__main__':
     ROOT.mkdir(exist_ok=True)
+    threading.Thread(target=reap_sessions, daemon=True).start()
     ThreadingHTTPServer(('0.0.0.0', 9091), Handler).serve_forever()

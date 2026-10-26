@@ -228,7 +228,6 @@ pub fn validate_contract(
         || c.output_format.trim().is_empty()
         || c.completion_conditions.is_empty()
         || c.verification.trim().is_empty()
-        || c.max_work_orders == 0
     {
         return Err(bad());
     }

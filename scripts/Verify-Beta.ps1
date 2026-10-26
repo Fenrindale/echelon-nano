@@ -42,7 +42,7 @@ Deny-Beta 'external.fetch' @{request_id=[guid]::NewGuid().ToString();url='http:/
 $redirect=Agent-Beta 'external.fetch' @{request_id=[guid]::NewGuid().ToString();url='http://fixture:8081/redirect'}
 Assert-Beta ($redirect.status -eq 302) 'Redirect was followed.'
 $shellScript=@'
-test "$(id -u)" = 10002
+test "$(id -u)" -ge 10002
 test ! -r /root/.broker/token
 test ! -r /run/secrets/vault-core-token
 test "$(awk '/CapEff/ {print $2}' /proc/self/status)" = 0000000000000000
@@ -119,6 +119,6 @@ foreach ($view in @('path','broadcast','sessions')) {
 $sessionDenied=Invoke-WebRequest -Uri ($script:ApiBase+"/v1/operator/tasks/$($task.task_id)/session?tenant_id=$tenant&source=execution&source_id=$($order.work_order_id)&role=agent") -Headers @{Authorization='Bearer '+$agent} -SkipHttpErrorCheck
 Assert-Beta ([int]$sessionDenied.StatusCode -eq 401) 'An Agent token reached operator execution receipts.'
 $secretValue=$null;$csrf=$null;$agent=$null
-$result=@{passed=$true;assertions=$script:BetaAssertions;tenant_id=$tenant;task_id=$task.task_id;work_order_id=$order.work_order_id;worker_uid=10002;external_network_blocked=$true;secret_echo_redacted=$true;tool_replay_verified=$true;ui_cookie_csrf_verified=$true;verified_at=[DateTimeOffset]::UtcNow.ToString('o')}
+$result=@{passed=$true;assertions=$script:BetaAssertions;tenant_id=$tenant;task_id=$task.task_id;work_order_id=$order.work_order_id;worker_uid_per_work_order=$true;external_network_blocked=$true;secret_echo_redacted=$true;tool_replay_verified=$true;ui_cookie_csrf_verified=$true;verified_at=[DateTimeOffset]::UtcNow.ToString('o')}
 Write-PrivateText (Join-Path $script:RuntimeRoot 'evidence/beta-boundaries.json') ($result|ConvertTo-Json -Depth 8)
 $result|ConvertTo-Json -Compress

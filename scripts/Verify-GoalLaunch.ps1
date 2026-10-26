@@ -64,7 +64,7 @@ $file=Invoke-Echelon "/v1/operator/artifacts/$($outputs[-1].id)?tenant_id=$tenan
 foreach($value in @('10','7','3','70')){Check-Goal ($file.content.Contains($value)) "Actual report omitted required value $value"}
 $hash=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($file.content))).ToLowerInvariant()
 Check-Goal ($hash -eq $file.artifact.sha256) 'Recovered report differs from its immutable hash.'
-Check-Goal ($file.content.Contains($submission.submission.item_id) -and $file.content -match 'v1|버전\s*:?\s*1|version\s*:?\s*1') 'Actual report omitted its pinned evidence citation.'
+Check-Goal ($file.content.Contains($submission.submission.item_id) -and $file.content -match 'v1\b|(?:버전|version)[\s:：*_`]*1\b') 'Actual report omitted its pinned evidence citation.'
 if($request.ContainsKey('attachments')){
  $inputs=@($task.artifacts|Where-Object {-not $_.work_order_id})
  Check-Goal ($inputs.Count -eq 2) 'Attachment upload replay duplicated or lost files.'

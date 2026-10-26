@@ -513,7 +513,12 @@ async fn dispatch(s: &AppState, a: &Claims, req: &ToolRequest) -> AppResult<Valu
         }
         Capability::AgentDelegate => work::delegate(&s.pool, a, &req.input).await,
         Capability::WorkOrderRead => work::read(&s.pool, a, &req.input).await,
-        Capability::WorkOrderComplete => work::complete(&s.pool, a, &req.input).await,
+        Capability::WorkOrderComplete => {
+            let result = work::complete(&s.pool, a, &req.input).await?;
+            crate::mcp::close_work(s, a).await;
+            crate::broker::close_workspace(a).await;
+            Ok(result)
+        }
         Capability::ExternalFetch | Capability::ShellExec => broker::invoke(s, a, req).await,
         Capability::ArtifactRead => workspace::read_artifact(&s.pool, a, &req.input).await,
         Capability::CredentialInspect => crate::credentials::inspect(s, a, &req.input).await,

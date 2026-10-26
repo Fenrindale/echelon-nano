@@ -363,69 +363,245 @@ async fn shell(
     #[serde(deny_unknown_fields)]
     struct Shell {
         request_id: Uuid,
+        #[serde(default)]
+        op: String,
+        #[serde(default)]
         script: String,
         #[serde(default)]
         outputs: Vec<String>,
         #[serde(default = "tool_timeout")]
         timeout_seconds: u64,
+        #[serde(default)]
+        job_id: Option<Uuid>,
+        #[serde(default)]
+        wait_seconds: u64,
     }
     let f: Shell = serde_json::from_value(input.clone()).map_err(|_| bad())?;
     let _ = f.request_id;
-    let mut files = vec![];
-    for id in &p.input_artifacts {
-        let file = workspace::artifact(&s.pool, a, *id).await?;
-        if crate::credentials::model_view(&file).is_some() {
-            return Err(AppError::forbidden("credential_material_not_for_shell"));
-        }
-        files.push(InputFile {
-            name: file["artifact"]["name"].as_str().ok_or_else(bad)?.into(),
-            content: file["content"]
-                .as_str()
-                .ok_or_else(|| AppError::bad("worker_input_not_utf8"))?
-                .into(),
-        });
+    if f.wait_seconds > 20 || !matches!(f.op.as_str(), "" | "exec" | "start" | "poll" | "cancel") {
+        return Err(bad());
     }
-    let job = Job {
-        id: key,
-        script: f.script,
-        files,
-        outputs: f.outputs,
-        timeout_seconds: f.timeout_seconds,
+    let order = a.work_order_id.ok_or_else(bad)?;
+    let polling = matches!(f.op.as_str(), "poll" | "cancel");
+    let asynchronous = f.op == "start" || f.timeout_seconds > 30;
+    let job_id = if polling {
+        f.job_id.ok_or_else(bad)?
+    } else {
+        key
     };
+    if polling {
+        if !f.script.is_empty() || !f.outputs.is_empty() {
+            return Err(bad());
+        }
+        let allowed:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM worker_job_bindings WHERE id=$1 AND tenant_id=$2 AND task_id=$3 AND work_order_id=$4)").bind(job_id).bind(a.tenant_id).bind(a.task_id).bind(order).fetch_one(&s.pool).await.map_err(db)?;
+        if !allowed {
+            return Err(AppError::forbidden("worker_job_scope_denied"));
+        }
+        if let Some(value) =
+            sqlx::query_scalar::<_, Value>("SELECT result FROM worker_job_results WHERE id=$1")
+                .bind(job_id)
+                .fetch_optional(&s.pool)
+                .await
+                .map_err(db)?
+        {
+            return Ok(value);
+        }
+    }
+    let mut files = vec![];
+    if !polling {
+        if f.job_id.is_some() {
+            return Err(bad());
+        }
+        for id in &p.input_artifacts {
+            let file = workspace::artifact(&s.pool, a, *id).await?;
+            if crate::credentials::model_view(&file).is_some() {
+                return Err(AppError::forbidden("credential_material_not_for_shell"));
+            }
+            files.push(InputFile {
+                name: file["artifact"]["name"].as_str().ok_or_else(bad)?.into(),
+                content: file["content"]
+                    .as_str()
+                    .ok_or_else(|| AppError::bad("worker_input_not_utf8"))?
+                    .into(),
+            });
+        }
+    }
     let token = tokio::fs::read_to_string("/run/secrets/worker-token")
         .await
         .map_err(|_| AppError::internal("worker_not_configured"))?;
-    let reply = reqwest::Client::builder()
+    let client = reqwest::Client::builder()
         .no_proxy()
-        .timeout(Duration::from_secs(40))
+        .timeout(Duration::from_secs(if asynchronous || polling {
+            30
+        } else {
+            f.timeout_seconds.saturating_add(10).min(3610)
+        }))
         .build()
-        .map_err(|_| AppError::internal("worker_client_failed"))?
-        .post("http://worker:9090/jobs")
-        .bearer_auth(token.trim())
-        .json(&job)
-        .send()
-        .await
-        .map_err(|_| AppError::bad("worker_unavailable"))?;
-    if !reply.status().is_success() {
-        return Err(AppError::bad("worker_job_rejected"));
-    }
-    let mut result: Value = reply
-        .json()
-        .await
-        .map_err(|_| AppError::bad("worker_response_invalid"))?;
+        .map_err(|_| AppError::internal("worker_client_failed"))?;
+    let mut result = if polling {
+        let method = if f.op == "cancel" {
+            reqwest::Method::POST
+        } else {
+            reqwest::Method::GET
+        };
+        let path = format!(
+            "http://worker:9090/jobs/{job_id}{}",
+            if f.op == "cancel" { "/cancel" } else { "" }
+        );
+        let until = tokio::time::Instant::now() + Duration::from_secs(f.wait_seconds);
+        loop {
+            let reply = client
+                .request(method.clone(), &path)
+                .bearer_auth(token.trim())
+                .send()
+                .await
+                .map_err(|_| AppError::bad("worker_unavailable"))?;
+            if !reply.status().is_success() {
+                let error: Value = reply.json().await.unwrap_or(Value::Null);
+                if error["error"]["code"] == "worker_job_not_found" {
+                    sqlx::query("INSERT INTO worker_job_results(id,result) VALUES($1,$2) ON CONFLICT DO NOTHING").bind(job_id).bind(json!({"job_id":job_id,"status":"unknown","reason":"worker_session_lost","artifacts":[]})).execute(&s.pool).await.map_err(db)?;
+                }
+                return Err(AppError::bad("worker_outcome_unknown_do_not_retry"));
+            }
+            let value: Value = reply
+                .json()
+                .await
+                .map_err(|_| AppError::bad("worker_response_invalid"))?;
+            if !matches!(value["status"].as_str(), Some("running" | "cancelling"))
+                || tokio::time::Instant::now() >= until
+            {
+                break value;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    } else {
+        let job = Job {
+            id: job_id,
+            script: f.script,
+            files,
+            outputs: f.outputs,
+            timeout_seconds: f.timeout_seconds,
+            workspace_id: Some(order),
+        };
+        if !(1..=3600).contains(&job.timeout_seconds) || !workspace::nonempty(&job.script, 24000) {
+            return Err(bad());
+        }
+        crate::worker::validate(&job)?;
+        let hash = workspace::digest(&serde_json::to_vec(&job).map_err(|_| bad())?);
+        let inserted=sqlx::query("INSERT INTO worker_job_bindings(id,tenant_id,task_id,work_order_id,request_hash) VALUES($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING").bind(job_id).bind(a.tenant_id).bind(a.task_id).bind(order).bind(&hash).execute(&s.pool).await.map_err(db)?;
+        let existing:Value=sqlx::query_scalar("SELECT jsonb_build_object('hash',request_hash,'tenant',tenant_id,'task',task_id,'order',work_order_id) FROM worker_job_bindings WHERE id=$1").bind(job_id).fetch_one(&s.pool).await.map_err(db)?;
+        if existing["hash"] != hash
+            || existing["tenant"] != a.tenant_id.to_string()
+            || existing["task"] != a.task_id.to_string()
+            || existing["order"] != order.to_string()
+        {
+            return Err(AppError::forbidden("worker_job_scope_denied"));
+        }
+        if inserted.rows_affected() == 0 {
+            if let Some(mut value) =
+                sqlx::query_scalar::<_, Value>("SELECT result FROM worker_job_results WHERE id=$1")
+                    .bind(job_id)
+                    .fetch_optional(&s.pool)
+                    .await
+                    .map_err(db)?
+            {
+                value["replayed"] = json!(true);
+                return Ok(value);
+            }
+            // A previously dispatched job is only reconciled, never launched again.
+            let reply = client
+                .get(format!("http://worker:9090/jobs/{job_id}"))
+                .bearer_auth(token.trim())
+                .send()
+                .await
+                .map_err(|_| AppError::bad("worker_unavailable"))?;
+            if !reply.status().is_success() {
+                return Err(AppError::bad("worker_outcome_unknown_do_not_retry"));
+            }
+            let mut value: Value = reply
+                .json()
+                .await
+                .map_err(|_| AppError::bad("worker_response_invalid"))?;
+            if !asynchronous {
+                while matches!(value["status"].as_str(), Some("running" | "cancelling")) {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    value = client
+                        .get(format!("http://worker:9090/jobs/{job_id}"))
+                        .bearer_auth(token.trim())
+                        .send()
+                        .await
+                        .map_err(|_| AppError::bad("worker_unavailable"))?
+                        .json()
+                        .await
+                        .map_err(|_| AppError::bad("worker_response_invalid"))?;
+                }
+            }
+            value
+        } else {
+            let endpoint = if asynchronous { "jobs/start" } else { "jobs" };
+            let reply = client
+                .post(format!("http://worker:9090/{endpoint}"))
+                .bearer_auth(token.trim())
+                .json(&job)
+                .send()
+                .await
+                .map_err(|_| AppError::bad("worker_unavailable"))?;
+            if !reply.status().is_success() {
+                return Err(AppError::bad("worker_job_rejected"));
+            }
+            reply
+                .json()
+                .await
+                .map_err(|_| AppError::bad("worker_response_invalid"))?
+        }
+    };
     let mut artifacts = vec![];
-    for output in result["outputs"].as_array().ok_or_else(bad)? {
+    for output in result["outputs"].as_array().into_iter().flatten() {
         let name = output["name"].as_str().ok_or_else(bad)?;
-        let artifact=workspace::put_artifact(&s.pool,a,&json!({"request_id":workspace::effect_key(key,name),"name":name,"media_type":"text/plain","content":output["content"]}),false).await?;
+        let artifact=workspace::put_artifact(&s.pool,a,&json!({"request_id":workspace::effect_key(job_id,name),"name":name,"media_type":"text/plain","content":output["content"]}),false).await?;
         artifacts.push(artifact["artifact"].clone());
     }
     result.as_object_mut().ok_or_else(bad)?.remove("outputs");
     result["artifacts"] = json!(artifacts);
-    result["execution"] = json!({"script":job.script.chars().take(1024).collect::<String>(),"script_truncated":job.script.chars().count()>1024,"script_sha256":workspace::digest(job.script.as_bytes()),"outputs":job.outputs,"timeout_seconds":job.timeout_seconds});
+    if !matches!(result["status"].as_str(), Some("running" | "cancelling")) {
+        sqlx::query(
+            "INSERT INTO worker_job_results(id,result) VALUES($1,$2) ON CONFLICT DO NOTHING",
+        )
+        .bind(job_id)
+        .bind(&result)
+        .execute(&s.pool)
+        .await
+        .map_err(db)?;
+        let _ = client
+            .post(format!("http://worker:9090/jobs/{job_id}/release"))
+            .bearer_auth(token.trim())
+            .send()
+            .await;
+    }
+    if result["status"] == "failed" {
+        return Err(AppError::bad("worker_job_failed"));
+    }
     Ok(result)
 }
 fn tool_timeout() -> u64 {
     20
+}
+pub async fn close_workspace(a: &Claims) {
+    let Some(order) = a.work_order_id else { return };
+    let Ok(token) = tokio::fs::read_to_string("/run/secrets/worker-token").await else {
+        return;
+    };
+    if let Ok(client) = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()
+    {
+        let _ = client
+            .post(format!("http://worker:9090/workspaces/{order}/close"))
+            .bearer_auth(token.trim())
+            .send()
+            .await;
+    }
 }
 pub(crate) fn redact_response(text: &str, secret: Option<&str>) -> String {
     let mut text = text.to_owned();

@@ -135,6 +135,11 @@ struct RequestInput {
     request_id: Uuid,
     criteria: Criteria,
 }
+pub(crate) fn normalize_criteria(value: &Value) -> AppResult<Value> {
+    let mut criteria: Criteria = parse(value)?;
+    criteria.normalize()?;
+    encode(&criteria)
+}
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Selection {

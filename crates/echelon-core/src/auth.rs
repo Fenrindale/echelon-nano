@@ -716,7 +716,7 @@ impl OAuthService {
             .bearer_auth(&record.access_token)
             .json(
                 &json!({"model":model,"instructions":instructions,"input":input,
-                "tools":tools,"tool_choice":"required","parallel_tool_calls":false,"store":false,"stream":true,
+                "tools":tools,"tool_choice":"required","parallel_tool_calls":true,"store":false,"stream":true,
                 "include":["reasoning.encrypted_content"]}),
             )
             .send()
@@ -746,6 +746,7 @@ pub struct SseProbe {
     text: String,
     completed: bool,
     failed: bool,
+    failure_code: Option<&'static str>,
     total: usize,
     usage: Value,
     output: Vec<Value>,
@@ -826,7 +827,23 @@ impl SseProbe {
                     }
                 }
             }
-            Some("response.failed" | "response.incomplete" | "error") => self.failed = true,
+            Some("response.failed" | "response.incomplete" | "error") => {
+                self.failed = true;
+                self.failure_code = match value["response"]["incomplete_details"]["reason"].as_str()
+                {
+                    Some("max_output_tokens") => Some("inference_output_truncated"),
+                    _ if matches!(
+                        value["response"]["error"]["code"]
+                            .as_str()
+                            .or_else(|| value["error"]["code"].as_str()),
+                        Some("context_length_exceeded" | "input_too_long")
+                    ) =>
+                    {
+                        Some("inference_context_overflow")
+                    }
+                    _ => None,
+                };
+            }
             _ => {}
         }
         Ok(())
@@ -842,7 +859,9 @@ impl SseProbe {
         }
         self.event()?;
         if self.failed {
-            return Err(AppError::bad("inference_failed"));
+            return Err(AppError::bad(
+                self.failure_code.unwrap_or("inference_failed"),
+            ));
         }
         if !self.completed {
             return Err(AppError::bad("inference_missing_completion"));

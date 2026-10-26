@@ -25,6 +25,108 @@ fn actor(tenant: Uuid, task: Uuid, role: Role) -> Claims {
 
 #[tokio::test]
 #[ignore = "requires the isolated compose.verify.yaml PostgreSQL database"]
+async fn task_harness_has_unlimited_orders_and_owned_evidence_with_immutable_history() {
+    use echelon_core::harness::{self, Evidence};
+    let pool = PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&std::env::var("DATABASE_URL").unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT current_database()")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        "echelon_verification"
+    );
+    sqlx::migrate!("../../migrations").run(&pool).await.unwrap();
+    let tenant = Uuid::new_v4();
+    let task = Uuid::new_v4();
+    let other = Uuid::new_v4();
+    sqlx::query("INSERT INTO tenants(id,name) VALUES($1,'Owned harness fixture')")
+        .bind(tenant)
+        .execute(&pool)
+        .await
+        .unwrap();
+    for t in [task, other] {
+        sqlx::query("INSERT INTO tasks(id,tenant_id,goal,contract) VALUES($1,$2,'Owned harness verification','{\"max_work_orders\":0,\"allowed_tools\":[\"shell.exec\"]}')").bind(t).bind(tenant).execute(&pool).await.unwrap();
+    }
+    let handler = actor(tenant, task, Role::Handler);
+    let mut last = Uuid::nil();
+    for n in 0..12 {
+        let order=work::delegate(&pool,&handler,&json!({"request_id":Uuid::new_v4(),"target":"owned:harness","objective":format!("Owned attempt {n}"),"expected_output":"Owned result"})).await.unwrap();
+        last = serde_json::from_value(order["work_order_id"].clone()).unwrap();
+    }
+    assert_ne!(last, Uuid::nil());
+    let receipt = Uuid::new_v4();
+    sqlx::query("INSERT INTO tool_receipts(tenant_id,task_id,work_order_id,request_key,request_hash,tool,status,result) VALUES($1,$2,$3,$4,'owned-hash','shell.exec','completed','{\"exit_code\":1,\"timed_out\":false}')").bind(tenant).bind(task).bind(last).bind(receipt).execute(&pool).await.unwrap();
+    let evidence = Evidence {
+        kind: "receipt".into(),
+        id: receipt,
+    };
+    assert!(
+        harness::validate_evidence(&pool, tenant, task, &evidence, true)
+            .await
+            .is_err()
+    );
+    harness::validate_evidence(&pool, tenant, task, &evidence, false)
+        .await
+        .unwrap();
+    assert!(
+        harness::validate_evidence(&pool, tenant, other, &evidence, false)
+            .await
+            .is_err()
+    );
+    let job = Uuid::new_v4();
+    sqlx::query("INSERT INTO worker_job_bindings(id,tenant_id,task_id,work_order_id,request_hash) VALUES($1,$2,$3,$4,'owned-job')").bind(job).bind(tenant).bind(task).bind(last).execute(&pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO worker_job_results(id,result) VALUES($1,'{\"status\":\"completed\"}')",
+    )
+    .bind(job)
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert!(
+        sqlx::query("UPDATE worker_job_results SET result='{}' WHERE id=$1")
+            .bind(job)
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+    assert!(
+        sqlx::query("DELETE FROM worker_job_bindings WHERE id=$1")
+            .bind(job)
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+    let run = Uuid::new_v4();
+    sqlx::query("INSERT INTO execution_runs(id,tenant_id,task_id,request_key,config,state,status) VALUES($1,$2,$3,$4,'{}','{}','paused')").bind(run).bind(tenant).bind(task).bind(Uuid::new_v4()).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO execution_context_archives(run_id,role,phase,round,history,sha256) VALUES($1,'handler','delegate',0,'[]','owned-archive')").bind(run).execute(&pool).await.unwrap();
+    assert!(
+        sqlx::query("UPDATE execution_context_archives SET history='{}' WHERE run_id=$1")
+            .bind(run)
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+    sqlx::query("UPDATE tasks SET contract='{\"max_work_orders\":12}' WHERE id=$1")
+        .bind(task)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        work::delegate(&pool, &handler, &json!({"target":"owned:harness"}))
+            .await
+            .unwrap_err()
+            .code,
+        "work_order_budget_exceeded"
+    );
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the isolated compose.verify.yaml PostgreSQL database"]
 async fn task_observability_spans_jobs_pins_versions_and_pages_without_role_or_tenant_leaks() {
     use echelon_core::observability::{self, Page, SessionQuery};
     let pool = PgPoolOptions::new()

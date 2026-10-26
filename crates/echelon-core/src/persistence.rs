@@ -35,6 +35,14 @@ pub async fn rejected(response: reqwest::Response) -> AppError {
         body.extend_from_slice(&chunk);
     }
     let value: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+    if status == 413
+        || matches!(
+            value["error"]["code"].as_str(),
+            Some("context_length_exceeded" | "input_too_long")
+        )
+    {
+        return AppError::bad("inference_context_overflow");
+    }
     let permanent_quota = matches!(
         value["error"]["code"].as_str(),
         Some("insufficient_quota" | "billing_hard_limit_reached")

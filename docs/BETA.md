@@ -65,7 +65,7 @@ Master는 감사·등록 정보·성공한 반복 구조를 읽는다. 동일 �
 | 도구 | 범위와 결과 |
 | --- | --- |
 | `external.fetch` | Work Order와 현재 Task 양쪽에서 허용한 정확한 URL의 GET만 실행. DNS 결과를 고정하고 리다이렉트·메타데이터·루프백·core/DB/Vault/Worker 대상은 차단. 내부망·HTTP는 계약에서 별도 지정 |
-| `shell.exec` | 승인한 UTF-8 입력 파일, POSIX shell·Python3·git, 상대 출력 경로. UID 10002, 권한 없는 자식, 네트워크 syscall 차단, 1–30초, 메모리·파일·프로세스 한도 |
+| `shell.exec` | 승인한 UTF-8 입력 파일, POSIX shell·Python3·git, 상대 출력 경로. Work Order별 고유 UID와 비공개 작업 공간, 권한 없는 자식, 네트워크 syscall 차단, 최대 3,600초와 비동기 조회·취소, 메모리·파일·프로세스 한도 |
 | `artifact.write/read` | Task/Work Order 범위의 불변 파일, SHA256·형식·크기·출처. 최대 1 MiB, 작업 출력당 128 KiB·합계 512 KiB |
 | Secret Broker | Vault의 불투명 ID·용도·정확한 허용 주소·버전. 요청 순간에 인증 헤더를 주입. 비활성화·CAS 회전·버전 일치 검사와 알려진 값·일반 인코딩·민감 JSON 필드 마스킹 |
 

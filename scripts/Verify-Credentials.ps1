@@ -190,7 +190,7 @@ if($Live) {
     Check-Cred ($reuseListing.bundles.Count -eq 1) 'Relaunch duplicated the existing Vault bundle.'
     $repeatedTask=Invoke-Echelon "/v1/operator/tasks/$($partial.task_id)?tenant_id=$unconfiguredTenant"
     Check-Cred ($repeatedTask.work_orders.Count -ge 2 -and $partialRun.result.outcome -eq 'partial') 'Relaunch lost the earlier Work Order or its result.'
-    Check-Cred (($repeatedTask.contract.allowed_tools -contains 'credential.import' -or $repeatedTask.contract.credential_bundles.Count -gt 0) -and $repeatedTask.contract.max_work_orders -ge $repeatedTask.work_orders.Count) 'Handler reused an obsolete credential scope or exhausted historical budget.'
+    Check-Cred (($repeatedTask.contract.allowed_tools -contains 'credential.import' -or $repeatedTask.contract.credential_bundles.Count -gt 0) -and ($repeatedTask.contract.max_work_orders -eq 0 -or $repeatedTask.contract.max_work_orders -ge $repeatedTask.work_orders.Count)) 'Handler reused an obsolete credential scope or exhausted historical budget.'
     $repeatSql="SELECT count(*) FROM execution_runs WHERE id='$($rerun.run_id)' AND position('owned-identity-token' IN state::text)>0;"
     $leaks=$repeatSql|docker compose exec -T postgres psql -X -qAt -v ON_ERROR_STOP=1 -U echelon -d echelon
     Check-Cred ($LASTEXITCODE -eq 0 -and "$leaks".Trim() -eq '0') 'Relaunch leaked fixture values to its model checkpoint.'

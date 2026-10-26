@@ -157,7 +157,7 @@ pub async fn infer(
         }
         let (key, generation) =
             credential(s, tenant, Uuid::parse_str(id).map_err(|_| bad())?).await?;
-        let response=crate::persistence::inference_client().map_err(|_|AppError::internal("provider_client_failed"))?.post("https://api.openai.com/v1/responses").bearer_auth(key.api_key).json(&json!({"model":model,"instructions":instructions,"input":input,"tools":tools,"tool_choice":"required","parallel_tool_calls":false,"store":false,"stream":true,"include":["reasoning.encrypted_content"]})).send().await.map_err(crate::persistence::transport_error)?;
+        let response=crate::persistence::inference_client().map_err(|_|AppError::internal("provider_client_failed"))?.post("https://api.openai.com/v1/responses").bearer_auth(key.api_key).json(&json!({"model":model,"instructions":instructions,"input":input,"tools":tools,"tool_choice":"required","parallel_tool_calls":true,"store":false,"stream":true,"include":["reasoning.encrypted_content"]})).send().await.map_err(crate::persistence::transport_error)?;
         if !response.status().is_success() {
             return Err(crate::persistence::rejected(response).await);
         }

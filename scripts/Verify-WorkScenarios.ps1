@@ -145,6 +145,9 @@ $independentOutput=Scenario-Output $independentTask 'independent-check.txt'
 Assert-Scenario ($independentOutput.content -match 'Ran 4 tests' -and $independentOutput.content -match '\bOK\b') 'Independent recovered-code check did not pass all four original tests.'
 foreach($role in @('analyst','handler','agent','master')){Assert-Scenario (@($codeRun.events|Where-Object {$_.role -eq $role -and $_.kind -eq 'model.completed'}).Count -gt 0) "No actual model execution for $role in the complete work loop."}
 foreach($tool in @('knowledge.submit','knowledge.publish','run.adoption_done','knowledge.optimize','run.dream_done')){Assert-Scenario (@($codeRun.events|Where-Object {$_.kind -eq 'tool.completed' -and $_.details.tool -eq $tool}).Count -gt 0) "Missing actual post-processing effect: $tool"}
+$postSequence=@('run.postprocess','knowledge.submit','knowledge.publish','run.adoption_done','run.dream_done','run.finish')
+$previousSeq=0L
+foreach($tool in $postSequence){$event=@($codeRun.events|Where-Object {$_.kind -eq 'tool.completed' -and $_.details.tool -eq $tool}|Select-Object -Last 1);Assert-Scenario ($event.Count -eq 1 -and $event[0].seq -gt $previousSeq) "Final Task decision did not follow actual retention/adoption/audit: $tool";$previousSeq=$event[0].seq}
 $classContract=@{kind='work';output_format='routing.csv';allowed_tools=@('shell.exec','artifact.write');max_work_orders=2;completion_conditions=@('One row per request','Apply registered routing policy','Recover routing.csv');verification='Check exact IDs, departments and priorities in the recovered CSV'}
 $classTask=Scenario-StageTask 'classification' '검증:업무분류 태그의 중앙기준을사용해제공한requests.json을분류하세요. routing.csv에id,department,priority열과REQ001,REQ002,REQ003,REQ004각행을만드세요. 모호한요청은NeedsReview/P2로남깁니다. 실제파일을읽고완성한CSV를산출물로회수하고각판단의고정근거를결과에인용하세요. 메일발송이나외부변경은하지않습니다.' $classContract
 $existingClass=Invoke-Echelon "/v1/operator/tasks/$classTask`?tenant_id=$tenant"

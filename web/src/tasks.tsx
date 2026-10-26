@@ -1,4 +1,5 @@
 import { TaskObservability } from "./task-observability";
+import { TaskWorkingState } from "./task-working-state";
 import { useState } from "react";
 import {
   api,
@@ -410,6 +411,7 @@ export function TaskDetail({
         <section className="work-pane">
           {tab === "brief" && (
             <>
+              <TaskWorkingState state={run.data?.working_state} />
               <section className="panel">
                 <div className="section-heading">
                   <h2>{run.data?.handler_settings ? "Handler가 정한 업무 계약" : "업무 계약"}</h2>
@@ -587,7 +589,7 @@ export function TaskDetail({
           <dl>
             <dt>Work Orders</dt>
             <dd>
-              {t.work_orders.length} / {t.contract.max_work_orders || 2}
+                {t.work_orders.length} / {t.contract.max_work_orders > 0 ? t.contract.max_work_orders : "제한 없음"}
             </dd>
             <dt>산출물</dt>
             <dd>{t.artifacts.filter((f: Json) => f.work_order_id).length}</dd>

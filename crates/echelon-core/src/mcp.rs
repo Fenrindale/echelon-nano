@@ -273,7 +273,7 @@ async fn install(
     .ok_or_else(missing)?;
     let spec: Spec = serde_json::from_value(spec).map_err(|_| bad())?;
     let env = credentials::mcp_environment(&s, r.tenant_id, &spec.environment).await?;
-    let result = transport(&spec, &env, "discover", None, None).await;
+    let result = transport(&spec, &env, "discover", None, None, None).await;
     let tools = match result {
         Ok(v) => {
             validate_tools(&v["tools"])?;
@@ -426,15 +426,35 @@ pub async fn call(s: &AppState, a: &Claims, input: &Value) -> AppResult<Value> {
         return Err(AppError::bad("mcp_outcome_unknown_do_not_retry"));
     }
 
-    let response = transport(&spec, &env, "call", Some(&r.tool), Some(&r.arguments)).await;
-    let result = match response {
+    let scope = format!(
+        "wo:{}:server:{}",
+        a.work_order_id.ok_or_else(bad)?,
+        r.server_id
+    );
+    let response = transport(
+        &spec,
+        &env,
+        "call",
+        Some(&r.tool),
+        Some(&r.arguments),
+        Some(&scope),
+    )
+    .await;
+    let mut result = match response {
         Ok(v) => scrub(v, &env),
         Err(e) => {
             sqlx::query("UPDATE mcp_call_receipts SET status='unknown' WHERE tenant_id=$1 AND task_id=$2 AND work_order_id=$3 AND request_key=$4").bind(a.tenant_id).bind(a.task_id).bind(a.work_order_id).bind(r.request_id).execute(&s.pool).await.map_err(db)?;
             return Err(e);
         }
     };
-    let value = json!({"server_id":r.server_id,"server_version":grant.version,"tool":r.tool,"request_id":r.request_id,"operation_ok":result["isError"]!=true,"result":result,"source":"server.mcp_receipt"});
+    let mut artifact = Value::Null;
+    let encoded = result.to_string();
+    if encoded.len() > 24000 {
+        let saved=workspace::put_artifact(&s.pool,a,&json!({"request_id":workspace::effect_key(r.request_id,"mcp-output"),"name":"mcp-output.json","media_type":"application/json","content":encoded}),false).await?;
+        artifact = saved["artifact"].clone();
+        result = json!({"isError":result["isError"],"preview":encoded.chars().take(4000).collect::<String>(),"full_result_artifact":artifact,"truncated":true});
+    }
+    let value = json!({"server_id":r.server_id,"server_version":grant.version,"tool":r.tool,"request_id":r.request_id,"operation_ok":result["isError"]!=true,"result":result,"artifact":artifact,"source":"server.mcp_receipt"});
     sqlx::query("UPDATE mcp_call_receipts SET status='completed',result=$5 WHERE tenant_id=$1 AND task_id=$2 AND work_order_id=$3 AND request_key=$4").bind(a.tenant_id).bind(a.task_id).bind(a.work_order_id).bind(r.request_id).bind(&value).execute(&s.pool).await.map_err(db)?;
     Ok(value)
 }
@@ -483,9 +503,10 @@ async fn transport(
     op: &str,
     tool: Option<&str>,
     arguments: Option<&Value>,
+    session_scope: Option<&str>,
 ) -> AppResult<Value> {
     if spec.transport == "http" {
-        return remote(spec, env, op, tool, arguments).await;
+        return remote(spec, env, op, tool, arguments, session_scope).await;
     }
     let token = tokio::fs::read_to_string("/run/secrets/worker-token")
         .await
@@ -500,7 +521,7 @@ async fn transport(
     let response: Value = client
         .post(format!("{url}/invoke"))
         .bearer_auth(token.trim())
-        .json(&json!({"spec":spec,"environment":env,"op":op,"tool":tool,"arguments":arguments}))
+        .json(&json!({"spec":spec,"environment":env,"op":op,"tool":tool,"arguments":arguments,"session_scope":session_scope}))
         .send()
         .await
         .map_err(|_| AppError::bad("mcp_transport_outcome_unknown"))?
@@ -523,35 +544,116 @@ async fn transport(
     }
     Ok(response["result"].clone())
 }
+pub async fn close_work(s: &AppState, a: &Claims) {
+    let Some(order) = a.work_order_id else { return };
+    let Ok(Some(value))=sqlx::query_scalar::<_,Value>("SELECT contract->'tool_policy'->'mcp_tools' FROM work_orders WHERE tenant_id=$1 AND task_id=$2 AND id=$3").bind(a.tenant_id).bind(a.task_id).bind(order).fetch_optional(&s.pool).await else{return};
+    for grant in value.as_array().into_iter().flatten() {
+        let Ok(id) = serde_json::from_value::<Uuid>(grant["server_id"].clone()) else {
+            continue;
+        };
+        let Ok(version) = serde_json::from_value::<i64>(grant["version"].clone()) else {
+            continue;
+        };
+        let Ok(spec) = sqlx::query_scalar::<_, Value>(
+            "SELECT spec FROM mcp_server_revisions WHERE server_id=$1 AND version=$2",
+        )
+        .bind(id)
+        .bind(version)
+        .fetch_one(&s.pool)
+        .await
+        else {
+            continue;
+        };
+        let Ok(spec) = serde_json::from_value::<Spec>(spec) else {
+            continue;
+        };
+        {
+            let _ = transport(
+                &spec,
+                &BTreeMap::new(),
+                "close",
+                None,
+                None,
+                Some(&format!("wo:{order}:server:{id}")),
+            )
+            .await;
+        }
+    }
+}
 async fn remote(
     spec: &Spec,
     env: &BTreeMap<String, String>,
     op: &str,
     tool: Option<&str>,
     arguments: Option<&Value>,
+    session_scope: Option<&str>,
 ) -> AppResult<Value> {
+    let scoped = if let Some(scope) = session_scope {
+        let mut pool = http_sessions().lock().await;
+        if op == "close" {
+            pool.retain(|k, _| !k.starts_with(&format!("{scope}:")));
+            return Ok(json!({"closed":true}));
+        }
+        pool.retain(|_, entry| {
+            entry
+                .try_lock()
+                .map_or(true, |s| crate::unix_time().saturating_sub(s.last) < 1800)
+        });
+        let fingerprint = workspace::digest(
+            json!({"spec":spec,"environment":env})
+                .to_string()
+                .as_bytes(),
+        );
+        let key = format!("{scope}:{fingerprint}");
+        if !pool.contains_key(&key) && pool.len() >= 64 {
+            return Err(AppError::bad("mcp_session_capacity_reached"));
+        }
+        Some(
+            pool.entry(key)
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(HttpSession::default())))
+                .clone(),
+        )
+    } else {
+        None
+    };
+    let fresh = tokio::sync::Mutex::new(HttpSession::default());
+    let mut state = if let Some(entry) = &scoped {
+        entry.lock().await
+    } else {
+        fresh.lock().await
+    };
+    state.last = crate::unix_time();
     let (client, url) = broker::pinned_client(&spec.grant()).await?;
-    let mut session = None;
-    let mut protocol = "2025-03-26".to_string();
-    let init=http_rpc(&client,&url,env,&mut session,&protocol,json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":protocol,"capabilities":{},"clientInfo":{"name":"echelon-nano","version":"0.3"}}})).await?;
-    protocol = init["protocolVersion"]
-        .as_str()
-        .ok_or_else(bad)?
-        .to_string();
-    if !["2025-03-26", "2025-06-18", "2025-11-25"].contains(&protocol.as_str()) {
-        return Err(AppError::bad("mcp_protocol_version_unsupported"));
+    let mut session = state.session.clone();
+    let mut protocol = state.protocol.clone();
+    if !state.initialized {
+        let init=http_rpc(&client,&url,env,&mut session,&protocol,json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":protocol,"capabilities":{},"clientInfo":{"name":"echelon-nano","version":"0.3"}}})).await?;
+        protocol = init["protocolVersion"]
+            .as_str()
+            .ok_or_else(bad)?
+            .to_string();
+        if !["2025-03-26", "2025-06-18", "2025-11-25"].contains(&protocol.as_str()) {
+            return Err(AppError::bad("mcp_protocol_version_unsupported"));
+        }
+        http_rpc(
+            &client,
+            &url,
+            env,
+            &mut session,
+            &protocol,
+            json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+        )
+        .await?;
+        state.session = session.clone();
+        state.protocol = protocol.clone();
+        state.initialized = true;
     }
-    http_rpc(
-        &client,
-        &url,
-        env,
-        &mut session,
-        &protocol,
-        json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
-    )
-    .await?;
     if op == "call" {
-        return http_rpc(&client,&url,env,&mut session,&protocol,json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":tool,"arguments":arguments}})).await;
+        state.number += 1;
+        let result=http_rpc(&client,&url,env,&mut session,&protocol,json!({"jsonrpc":"2.0","id":state.number,"method":"tools/call","params":{"name":tool,"arguments":arguments}})).await;
+        state.session = session;
+        state.last = crate::unix_time();
+        return result;
     }
     let mut tools = vec![];
     let mut cursor = Value::Null;
@@ -567,6 +669,29 @@ async fn remote(
         }
     }
     Err(AppError::bad("mcp_tools_too_large"))
+}
+struct HttpSession {
+    session: Option<String>,
+    protocol: String,
+    initialized: bool,
+    last: u64,
+    number: u64,
+}
+impl Default for HttpSession {
+    fn default() -> Self {
+        Self {
+            session: None,
+            protocol: "2025-03-26".into(),
+            initialized: false,
+            last: crate::unix_time(),
+            number: 2,
+        }
+    }
+}
+type HttpSessions = tokio::sync::Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<HttpSession>>>>;
+fn http_sessions() -> &'static HttpSessions {
+    static SESSIONS: std::sync::OnceLock<HttpSessions> = std::sync::OnceLock::new();
+    SESSIONS.get_or_init(|| tokio::sync::Mutex::new(BTreeMap::new()))
 }
 async fn http_rpc(
     client: &reqwest::Client,

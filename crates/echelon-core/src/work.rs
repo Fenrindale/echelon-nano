@@ -41,6 +41,8 @@ struct Delegate {
     references: Vec<Evidence>,
     #[serde(default)]
     protocol_parameters: Value,
+    #[serde(default)]
+    step_id: Option<String>,
 }
 
 pub async fn delegate(pool: &PgPool, a: &Claims, input: &Value) -> AppResult<Value> {
@@ -48,6 +50,9 @@ pub async fn delegate(pool: &PgPool, a: &Claims, input: &Value) -> AppResult<Val
         return Err(AppError::forbidden("role_denied"));
     }
     let d: Delegate = serde_json::from_value(input.clone()).map_err(|_| invalid())?;
+    if d.step_id.as_ref().is_some_and(|v| !bounded(v, 64)) {
+        return Err(invalid());
+    }
     if let Some(key) = d.request_id
         && let Some(row)=sqlx::query("SELECT id,target,contract,status FROM work_orders WHERE tenant_id=$1 AND task_id=$2 AND request_key=$3").bind(a.tenant_id).bind(a.task_id).bind(key).fetch_optional(pool).await.map_err(db)? {
             if row.get::<Value,_>("contract")["request"]!=*input {return Err(AppError::new(StatusCode::CONFLICT,"work_idempotency_conflict"));}
@@ -83,7 +88,7 @@ pub async fn delegate(pool: &PgPool, a: &Claims, input: &Value) -> AppResult<Val
             .fetch_one(&mut *tx)
             .await
             .map_err(db)?;
-    if count >= policy.max_work_orders.max(1) as i64 {
+    if policy.max_work_orders > 0 && count >= policy.max_work_orders as i64 {
         return Err(AppError::new(
             StatusCode::CONFLICT,
             "work_order_budget_exceeded",
@@ -257,6 +262,12 @@ pub async fn complete(pool: &PgPool, a: &Claims, input: &Value) -> AppResult<Val
         .work_order_id
         .ok_or_else(|| AppError::forbidden("work_order_required"))?;
     let r: ResultInput = serde_json::from_value(input.clone()).map_err(|_| invalid())?;
+    {
+        let pending:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM worker_job_bindings b LEFT JOIN worker_job_results r ON r.id=b.id WHERE b.tenant_id=$1 AND b.task_id=$2 AND b.work_order_id=$3 AND r.id IS NULL)").bind(a.tenant_id).bind(a.task_id).bind(id).fetch_one(pool).await.map_err(db)?;
+        if pending {
+            return Err(AppError::bad("work_pending_jobs"));
+        }
+    }
     if !matches!(
         r.outcome.as_str(),
         "completed" | "partial" | "blocked" | "failed"

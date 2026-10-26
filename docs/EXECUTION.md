@@ -12,7 +12,7 @@
 4. Agent가 자기 Work Order를 조회한다. 계약에 지정한 버전의 문서·해시·출처·주의 이력이 증거 스냅샷으로 전달된다. Agent는 중앙 DB와 다른 Work Order를 탐색할 수 없다. 관찰을 남기고 근거가 연결된 결과를 반환한다.
 5. Handler가 저장된 Agent 결과를 다시 조회하고 목표 달성 여부를 판단한다. Agent의 partial/blocked/failed 결과를 completed로 올릴 수 없다. 루프 완료와 업무 결과의 completed/partial/blocked/failed는 별도 값이다.
 
-Agent는 허용한 URL의 읽기, 격리 코드 실행과 실제 산출물 회수를 수행할 수 있다. `retain_knowledge`를 선택하면 Handler가 재사용 항목을 제출하고 Analyst가 지정한 제출만 채택·반려한다. `dream_after`는 이후 별도 Master 감사·정리 검토안 단계를 실행한다. 후처리 오류가 이미 확정된 업무 결과를 바꾸지 않는다. 한 Task의 Work Order는 순차 처리하며 여러 Task 실행은 서버의 동시성 한도 안에서 진행한다.
+Agent는 허용한 URL의 읽기, 격리 코드 실행과 실제 산출물 회수를 수행할 수 있다. `retain_knowledge`를 선택하면 Handler가 재사용 항목을 제출하고 Analyst가 지정한 제출만 채택·반려한다. `dream_after`는 이후 별도 Master 감사·정리 검토안 단계를 실행한다. 후처리 오류가 이미 확정된 업무 결과를 바꾸지 않는다. 한 Task의 Work Order는 의존 관계를 가진 작업 대기열에서 순차 처리하고, Agent의 도구 경계에서 Handler가 감독한다. 여러 Task는 서버의 동시성 한도 안에서 진행한다.
 
 ## 운영자 API
 
@@ -26,7 +26,7 @@ Agent는 허용한 URL의 읽기, 격리 코드 실행과 실제 산출물 회�
 }
 ```
 
-응답은 `task_id`, `run_id`, `replayed`를 반환한다. 같은 요청 키와 목표의 재전송은 같은 Task와 실행을 반환한다. 다른 목표로 키를 재사용할 수 없다. 설정 단계가 실패해도 초안을 보존한다. `GET /v1/operator/runs/{id}`의 `handler_settings`와 `contract_finalized`로 Handler 결정을 확인한다. 설정 효과는 체크포인트와 감사 기록에 남고 명시적 재개 시 동일 효과를 복원한다. 자동 업무 실행의 모델 라운드는 32–48회, Dreaming은 16–48회 안에서 Handler가 결정한다. 자동 Task는 호출 수·30분·컨텍스트 크기 경계에서 목표·역할·Work Order·확정 영수증을 보존하고 새 컨텍스트로 이어 간다. 같은 상태로 세 라운드 연속 진전이 없으면 execution_no_progress를 남기며 완료로 처리하지 않는다. 직접 설정한 수동 실행의 전체 호출·30분 제한은 유지한다. 누적 토큰 상한은 적용하지 않고 사용량을 수집한다. 이전 요청·설정의 `max_total_tokens`는 호환을 위해 받지만 중단 조건에 쓰지 않는다. 새 Handler 설정은 이 값을 요구하지 않는다. 연결 계정 선택은 저장된 업무실 기본값 또는 기존 OAuth 연결을 사용하고 임의 API 키로 전환하지 않는다.
+응답은 `task_id`, `run_id`, `replayed`를 반환한다. 같은 요청 키와 목표의 재전송은 같은 Task와 실행을 반환한다. 다른 목표로 키를 재사용할 수 없다. 설정 단계가 실패해도 초안을 보존한다. `GET /v1/operator/runs/{id}`의 `handler_settings`와 `contract_finalized`로 Handler 결정을 확인한다. 설정 효과는 체크포인트와 감사 기록에 남고 명시적 재개 시 동일 효과를 복원한다. 자동 업무 실행의 모델 라운드는 32–48회, Dreaming은 16–48회 안에서 Handler가 결정한다. 자동 Task는 호출 수·30분·컨텍스트 크기 경계에서 목표·역할·Work Order·확정 영수증을 보존하고 새 컨텍스트로 이어 간다. 실제 도구 결과·작업 상태로 진전을 확인한다. 세 라운드 연속 무진전인 Agent는 Handler 감독으로 보내고, 여섯 라운드 연속 무진전이면 execution_no_progress로 남긴다. 직접 설정한 수동 실행의 전체 호출·30분 제한은 유지한다. 누적 토큰 상한은 적용하지 않고 사용량을 수집한다. 이전 요청·설정의 `max_total_tokens`는 호환을 위해 받지만 중단 조건에 쓰지 않는다. 새 Handler 설정은 이 값을 요구하지 않는다. 연결 계정 선택은 저장된 업무실 기본값 또는 기존 OAuth 연결을 사용하고 임의 API 키로 전환하지 않는다.
 
 기존 Task는 `POST /v1/operator/tasks/{id}/launch`로 설정 입력 없이 실행한다. 새 방식으로 생성한 Task는 Handler 설정 단계를 다시 수행한다. 기존 수동 계약으로 만든 Task는 기존 제한을 보존한다. 아래 명시적 설정 API는 자동화와 검증용으로 유지한다.
 
@@ -56,7 +56,7 @@ Agent는 허용한 URL의 읽기, 격리 코드 실행과 실제 산출물 회�
 
 공식 Sign in with ChatGPT의 OAuth 자격증명을 Vault에서 사용한다. 각 추론 전에 기존 만료 검사와 직렬화된 갱신을 거친다. 계정 카탈로그에 없는 모델은 시작 시 거부한다. API 키나 다른 계정으로 자동 전환하지 않는다.
 
-Responses 요청은 `store:false`, `stream:true`, 입력 배열, namespace 안의 엄격한 함수 스키마를 사용한다. 필요 이력과 암호화된 reasoning 항목은 같은 역할 단계 안에서만 다시 전송한다. 역할 전환 시 다음 역할에 필요한 계약·ID만 넘겨 대화를 새로 시작한다. `response.completed` 전에는 함수 호출을 실행하지 않는다. 미완료 스트림의 도구 호출은 폐기한다. 연결·시간 초과·완료 없는 단절과 HTTP 408/429/500/502/503/504는 모델 생성만 자동 재시도한다. 인증 거부·확인된 과금 한도·잘못된 응답·정책 오류·DB 오류는 자동 반복하지 않는다.
+Responses 요청은 `store:false`, `stream:true`, 입력 배열, namespace 안의 엄격한 함수 스키마를 사용한다. Handler와 활성 Work Order의 Agent는 각자의 대화를 복원한다. 역할 간 대화는 섞지 않고 필요한 계약·ID·작업 상태를 전달한다. 압축 전 원문은 비공개 불변 archive에 남기고 최근 영수증·작업 기억으로 모델 입력을 다시 구성한다. `response.completed` 전에는 함수 호출을 실행하지 않는다. 미완료 스트림의 도구 호출은 폐기한다. 연결·시간 초과·완료 없는 단절과 HTTP 408/429/500/502/503/504는 모델 생성만 자동 재시도한다. 인증 거부·확인된 과금 한도·잘못된 응답·정책 오류·DB 오류는 자동 반복하지 않는다.
 
 직접 실행 API의 호출 수는 1–48회다. 토큰 사용량으로 실행을 중단하지 않는다. 자동 Task의 총 수명과 모델 라운드를 구분한다. 추론 연결 30초·무수신 300초·단일 요청 900초, 스트림 2 MiB, 모델 입력 256 KiB와 중지·취소는 유지한다. 120초 고정 추론 제한은 제거했다. Work Order 계약의 도구·대상·허용 수와 역할 권한은 그대로 검사한다. 연결 계정의 제공자 한도는 별도로 적용된다.
 
@@ -114,3 +114,23 @@ LLM 검증은 명시적으로 연결한 계정에 실제 모델 요청을 보낸
 Handler의 재계획 컨텍스트에는 실제 work_order.read로 수집한 이전 결과·관찰·산출물·영수증과 출처를 보존한다. 이 실행에서 이미 수집한 Work Order ID만 delegate/collect 단계에서 다시 조회할 수 있으며 Agent는 계속 자기 Work Order만 읽는다. 이전 기록은 모델 입력에 최대 48 KiB를 배치하고 초과분은 ID·해시·조회 안내로 남겨 원본을 필요할 때 읽는다. 현재 Handler 설정도 함께 전달하므로 보관·감사 설정을 별도 증명 도구가 없다는 이유로 실패 처리하지 않는다.
 
 `work_order.read`는 `execution_receipts`로 해당 Work Order의 실제 shell/HTTP 영수증을 함께 반환한다. `receipt_offset`과 `receipt_limit`(기본 8, 최대 16) 및 `next_receipt_offset`으로 이어 읽는다. 요청 ID·해시·상태와 작업 ID·exit_code·timed_out·replayed·산출물을 확인할 수 있고, 새 Worker 영수증은 실제 스크립트 미리보기·전체 해시·출력 경로·타임아웃도 기록한다. stdout/stderr/HTTP 본문은 제한 미리보기이며 잘린 여부를 표시한다. 과거 영수증에 없는 실행 메타데이터는 추정해 채우지 않는다. 영수증의 completed는 호출 회수 완료이며 작업 성공은 종료 코드·시간 초과·HTTP 상태와 실제 산출물로 판단한다. Handler는 기존 영수증을 조회하며 증명용 재실행이나 Agent가 영수증을 새로 작성하는 단계를 요구하지 않는다.
+
+
+## Task 하네스
+
+자동 Task의 `max_work_orders:0`은 전체 수명에 걸친 개수 제한이 없다는 뜻이다. 명시적 수동 계약의 양수 제한은 유지한다. 라운드 한도와 실행 도구의 자원 제한은 별개다.
+
+Handler는 `run.work {steps:[{id,objective,depends_on,priority,status}],note}`로 Task 지역 작업 상태를 저장한다. `agent.delegate`의 선택적 `step_id`는 의존 작업이 완료된 pending 단계만 가리킬 수 있다. 완료된 시도는 수정하지 않고 새로운 접근을 별도 단계로 만든다. 각 Work Order는 순차 실행하며 여러 Agent의 동시 실행은 제공하지 않는다. 작업 메모·실패 시도는 중앙 지식으로 자동 채택되지 않는다.
+
+Agent가 8회 도구를 사용하거나 120초의 점검 경계에 도달하면 Handler가 실제 Work Order와 영수증을 읽는다. `run.supervise {decision:'continue'|'steer'|'recall',message}`로 계속 실행·방향 수정·결과 회수를 지시한다. 점검은 도구 경계에서 실행한다. 회수 중인 Agent는 기존 파일 작업 조회·취소와 결과 반환만 가능하며 새 행동을 시작할 수 없다. 실행 중인 파일 작업은 조회·취소해 정리한 뒤 Work Order를 완료한다.
+
+`run.context_refresh {criteria:{need,query,tags,max_references}}`는 실행 중 새 Analyst 선별을 요청한다. 이전 Pack과 Work Order의 근거는 그대로 보존하고 후속 지시에 새 Pack을 고정한다. 첫 Work Order 이후 원래 완료 조건은 바꾸지 않는다.
+
+`run.verify {proofs:[{goal_id,reason,evidence:[{kind:'artifact'|'receipt'|'observation'|'work_order',id}]}]}`는 완료 조건과 실제 소유 증거를 연결한다. 실패·시간 초과·진행 중 영수증은 성공 근거가 될 수 없다. 자동 완료는 모든 조건의 증거 연결을 요구한다. 부분/차단/실패 종료에도 `run.finish.evidence_refs`로 실제 실패 영수증·관찰·미완료 Work Order를 제시해야 한다. 증거 소유와 상태는 서버가 확인하고, 내용이 조건을 충족하는지는 Handler가 판단한다.
+
+함수 이름의 `__`는 문서상의 `.`에 해당한다. 예를 들어 `context__read`는 JSON 인자를 직접 받는다. 과거 `invoke`의 중첩 문자열 요청은 재생 호환용으로만 받는다. 독립적인 자료·Pack·Work Order·메타데이터 조회는 최대 8개를 한 응답에서 병렬 실행할 수 있고 행동·제어 도구는 한 번에 하나만 처리한다. terminal 성공 전 도구 실행 금지는 유지한다. 도구 없는 응답에는 제한적으로 수정 지시를 제공하고, 컨텍스트 초과·출력 잘림은 미실행 출력 폐기 후 보존 상태에서 복구한다.
+
+`shell.exec {op:'start',script,outputs,timeout_seconds:1..3600}`는 작업 ID를 즉시 반환한다. `op:'poll',job_id,wait_seconds:0..20`으로 회수하고 `op:'cancel',job_id`로 취소한다. 기존 `op:'exec'` 또는 op 생략은 30초 이하에서 동기 실행이며, 더 긴 요청은 자동으로 비동기 전환한다. 같은 Work Order의 파일 작업은 제한된 tmpfs 작업 공간을 공유한다. CPU·메모리·파일·네트워크·기밀 격리는 유지한다. 컨테이너를 다시 만들면 임시 작업 공간은 사라지므로 산출물은 명시적으로 회수해야 한다. 잃어버린 Worker 작업은 미확정 결과로 보존하며 자동 재실행하지 않는다.
+
+실행 조회의 `working_state`는 완료 조건, 작업 그래프, 짧은 판단 메모와 Pack 이력을 제공한다. 원문 모델 이력은 이 API나 UI에 공개하지 않는다. `scripts/Verify-Harness.ps1 -WithOAuth`는 격리된 18432 환경에서 장기 작업·파일 연속성·취소·범위·stdio 세션과 실제 역할 감독·추가 Pack·증거 연결을 검증한다.
+지식 보관 또는 감사가 활성화된 업무는 Agent 결과 회수 후 `run.postprocess {}`를 호출한다. Handler 제출·Analyst 심사와 선택적 Master 감사를 실제 수행한 뒤 같은 Handler의 collect 단계로 돌아온다. `postprocessing.adoption_receipts`와 `audit_report`를 확인한 후 원래 목표별 근거와 최종 `run.finish`를 제출한다. 후처리 전 종료는 `execution_postprocessing_required`로 거부한다. 수동·자동 실행 모두 실제 설정을 seed에 제공하며, 단계별 도구가 collect에서 보이지 않는 것을 어댑터 부재로 해석하지 않는다. 독립 dream 실행은 계속 Master 감사로 종료하고 업무를 실행하지 않는다.

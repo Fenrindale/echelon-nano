@@ -122,7 +122,6 @@ impl TaskContract {
             || self.mcp_tools.len() > 16
             || self.credential_connectors.iter().any(|g| g.version < 1)
             || self.input_artifacts.len() > 16
-            || self.max_work_orders > 8
             || self.allowed_tools.iter().any(|s| {
                 !matches!(
                     s.as_str(),

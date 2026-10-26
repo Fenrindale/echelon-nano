@@ -20,6 +20,20 @@ jobs:
         run: docker build --target mcp-host -t echelon-nano-mcp:ci .
       - name: PostgreSQL domain and immutable history regression
         run: docker compose -f compose.verify.yaml up --build --abort-on-container-exit --exit-code-from tests
+      - name: Export the verified Linux executable
+        run: |
+          mkdir -p executable
+          container=$(docker create echelon-nano:ci)
+          docker cp "$container:/usr/local/bin/echelon" executable/echelon
+          docker rm "$container"
+          git rev-parse HEAD > executable/source-commit.txt
+          (cd executable && sha256sum echelon > SHA256SUMS)
+      - name: Retain the executable and its source identity
+        uses: actions/upload-artifact@v4
+        with:
+          name: echelon-linux-${{ github.sha }}
+          path: executable/
+          retention-days: 3
       - name: Remove the isolated verification containers
         if: always()
         run: docker compose -f compose.verify.yaml down --remove-orphans
