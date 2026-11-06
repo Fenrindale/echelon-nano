@@ -1545,6 +1545,7 @@ fn independent_read(c: &Call) -> bool {
     matches!(
         c.tool.as_str(),
         "artifact.read"
+            | "run.output"
             | "context.read"
             | "work_order.read"
             | "credential.inspect"
@@ -2451,6 +2452,14 @@ async fn execute_read_batch(
     p: &mut Checkpoint,
 ) -> AppResult<()> {
     let calls = p.read_batch.clone();
+    let batch_id = crate::workspace::digest(
+        calls
+            .iter()
+            .map(|c| c.call_id.as_str())
+            .collect::<Vec<_>>()
+            .join(":")
+            .as_bytes(),
+    );
     let a = claims(c, p);
     let mut inputs = vec![];
     for call in &calls {
@@ -2460,7 +2469,7 @@ async fn execute_read_batch(
             id,
             p.role(),
             "tool.pending",
-            json!({"phase":p.phase,"tool":call.tool,"call_id":call.call_id,"batch":true}),
+            json!({"phase":p.phase,"tool":call.tool,"call_id":call.call_id,"batch":true,"batch_id":batch_id}),
         )
         .await?;
         inputs.push(prepare(id, c, p, call));
@@ -2480,6 +2489,9 @@ async fn execute_read_batch(
                 return Ok(value);
             }
             let result = match input {
+                Ok(input) if call.tool == "run.output" => {
+                    crate::continuity::read_output(&s.pool, id, a, &input).await
+                }
                 Ok(input) => {
                     invoke_as(
                         s,
@@ -2533,7 +2545,7 @@ async fn execute_read_batch(
         if p.role() == Role::Agent {
             p.agent_actions += 1;
         }
-        event(&s.pool,id,p.role(),if value["ok"]==true {"tool.completed"}else{"tool.failed"},json!({"phase":p.phase,"tool":call.tool,"call_id":call.call_id,"batch":true,"error":value["error"]})).await?;
+        event(&s.pool,id,p.role(),if value["ok"]==true {"tool.completed"}else{"tool.failed"},json!({"phase":p.phase,"tool":call.tool,"call_id":call.call_id,"batch":true,"batch_id":batch_id,"error":value["error"]})).await?;
     }
     p.read_batch.clear();
     Ok(())
@@ -2953,6 +2965,42 @@ mod tests {
             call("context__read", "b", json!({"op":"pack"})),
         ];
         assert_eq!(parse_calls(&reads).unwrap().len(), 2);
+        let references = vec![
+            call(
+                "run__output",
+                "r1",
+                json!({"id":Uuid::new_v4(),"pointer":"/ok"}),
+            ),
+            call(
+                "run__output",
+                "r2",
+                json!({"id":Uuid::new_v4(),"pointer":"/result"}),
+            ),
+            reads[0].clone(),
+        ];
+        assert_eq!(parse_calls(&references).unwrap().len(), 3);
+        assert!(
+            parse_calls(&[
+                references[0].clone(),
+                call(
+                    "mcp__call",
+                    "effect",
+                    json!({"server_id":Uuid::new_v4(),"tool":"close_incident","arguments":{}})
+                )
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_calls(&[
+                references[0].clone(),
+                call(
+                    "run__supervise",
+                    "control",
+                    json!({"decision":"continue","message":"continue"})
+                )
+            ])
+            .is_err()
+        );
         let audit_reads = vec![
             call("knowledge__optimize", "i", json!({"op":"inspect"})),
             call("audit__read", "j", json!({})),

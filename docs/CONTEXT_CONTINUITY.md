@@ -14,6 +14,8 @@ JSON Pointer enters JSON encoded inside strings, including MCP `content[].text`.
 
 `run.output {op:'list',tool?:'mcp.call',offset:0,limit:20}` recovers older reference IDs after a long session. This index enforces the same role/Work Order scope and returns metadata only. Omit `op` for a read by ID.
 
+Independent original-output reads may share one native batch with artifact or Work Order reads. Every result retains the same scope checks; business calls and control operations cannot enter such a batch. Execution events retain a stable `batch_id` so mixed read execution is independently verifiable.
+
 `artifact.read {artifact_id,format:'json',pointer,offset,limit}` offers the same selection over authorized UTF-8 JSON. Default text reads are paginated without base64; operator downloads retain exact bytes. Text pages use up to 16,000 characters and JSON pages up to 100 entries. Oversized legacy requests normalize to a page rather than repeatedly failing. Work Order receipt pages normalize to 1–16 entries. View sizes do not end a Task. Storage/transport protections and credential masking remain in effect.
 
 ## Summary and continuation
