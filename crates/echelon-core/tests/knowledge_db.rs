@@ -178,6 +178,20 @@ async fn context_outputs_are_scoped_immutable_and_queryable_after_restart() {
     .await
     .unwrap();
     agent.work_order_id = Some(order);
+    let agent_index = continuity::read_output(&pool, run, &agent, &json!({"op":"list"}))
+        .await
+        .unwrap();
+    assert_eq!(agent_index["outputs"].as_array().unwrap().len(), 1);
+    assert_eq!(agent_index["outputs"][0]["id"], id.to_string());
+    let handler_index = continuity::read_output(
+        &pool,
+        run,
+        &actor(tenant, task, Role::Handler),
+        &json!({"op":"list"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(handler_index["outputs"].as_array().unwrap().len(), 2);
     assert!(
         continuity::read_output(
             &pool,

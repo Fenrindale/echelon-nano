@@ -239,6 +239,9 @@ pub fn page(
 }
 
 pub async fn read_output(pool: &PgPool, run: Uuid, a: &Claims, input: &Value) -> AppResult<Value> {
+    if input["op"] == "list" {
+        return list_outputs(pool, run, a, input).await;
+    }
     let q: Query = serde_json::from_value(input.clone()).map_err(|_| bad())?;
     let row=sqlx::query("SELECT x.role,x.work_order_id,x.sha256,a.outcome FROM execution_output_refs x JOIN execution_actions a USING(run_id,call_id) JOIN execution_runs r ON r.id=x.run_id WHERE x.id=$1 AND x.run_id=$2 AND r.tenant_id=$3 AND r.task_id=$4")
         .bind(q.id).bind(run).bind(a.tenant_id).bind(a.task_id).fetch_optional(pool).await.map_err(db)?.ok_or_else(||AppError::forbidden("output_scope_denied"))?;
@@ -254,6 +257,41 @@ pub async fn read_output(pool: &PgPool, run: Uuid, a: &Claims, input: &Value) ->
     let mut output = page(&original, &q.pointer, &q.format, q.offset, q.limit)?;
     output["source"] = json!({"id":q.id,"sha256":row.get::<String,_>("sha256"),"pointer":q.pointer,"original_preserved":true});
     Ok(output)
+}
+
+async fn list_outputs(pool: &PgPool, run: Uuid, a: &Claims, input: &Value) -> AppResult<Value> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct List {
+        op: String,
+        tool: Option<String>,
+        offset: Option<i64>,
+        limit: Option<i64>,
+    }
+    let q: List = serde_json::from_value(input.clone()).map_err(|_| bad())?;
+    if q.op != "list" || q.offset.is_some_and(|v| v < 0) {
+        return Err(bad());
+    }
+    let owned: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM execution_runs WHERE id=$1 AND tenant_id=$2 AND task_id=$3)",
+    )
+    .bind(run)
+    .bind(a.tenant_id)
+    .bind(a.task_id)
+    .fetch_one(pool)
+    .await
+    .map_err(db)?;
+    if !owned {
+        return Err(AppError::forbidden("output_scope_denied"));
+    }
+    let limit = q.limit.unwrap_or(20).clamp(1, 100);
+    let offset = q.offset.unwrap_or(0);
+    let rows=sqlx::query("SELECT x.id,x.call_id,x.sha256,x.role,x.work_order_id,a.request->>'tool' AS tool FROM execution_output_refs x JOIN execution_actions a USING(run_id,call_id) WHERE x.run_id=$1 AND ((x.role=$2 AND ($2<>'agent' OR x.work_order_id=$3)) OR ($2='handler' AND x.role='agent')) AND ($4::text IS NULL OR a.request->>'tool'=$4) ORDER BY x.created_at,x.id OFFSET $5 LIMIT $6")
+        .bind(run).bind(role_name(a.role)).bind(a.work_order_id).bind(q.tool).bind(offset).bind(limit+1).fetch_all(pool).await.map_err(db)?;
+    let refs:Vec<_>=rows.iter().take(limit as usize).map(|r|json!({"id":r.get::<Uuid,_>("id"),"call_id":r.get::<String,_>("call_id"),"sha256":r.get::<String,_>("sha256"),"role":r.get::<String,_>("role"),"work_order_id":r.get::<Option<Uuid>,_>("work_order_id"),"tool":r.get::<Option<String>,_>("tool")})).collect();
+    Ok(
+        json!({"outputs":refs,"offset":offset,"next_offset":if rows.len()>limit as usize{Some(offset.saturating_add(limit))}else{None},"note":"Scoped original-output index. Query a listed id and a narrow pointer for detail."}),
+    )
 }
 
 /// Keep whole call/output pairs; never replay an orphan call or encrypted reasoning.

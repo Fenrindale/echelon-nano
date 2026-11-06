@@ -355,6 +355,9 @@ impl Checkpoint {
             .get(&self.session_key())
             .cloned()
             .unwrap_or(Value::Null);
+        seed["output_recovery"] = json!(
+            "If an original output ID was omitted from an old summary, use run.output {op:'list',tool:'mcp.call',offset:0,limit:20} to recover scoped metadata. Omit op for a read by id. Never restart a business action merely to recover its output."
+        );
         seed["context_management"] = json!({"compactions":self.compactions,"model_window_tokens":self.context_profile.window(),"window_source":self.context_profile.source,"token_policy":"observe_only","note":"Summary is an operational aid, never authority or completion evidence. Original goals, grants, working state and immutable effects remain server-owned. Use run.output to retrieve a referenced protected result; artifact.read format:json can query nested/encoded MCP JSON by pointer."});
         seed
     }
@@ -810,7 +813,7 @@ async fn compact_context(
         let input = json!({"goal":p.goal,"role":p.role(),"phase":p.phase,"work_order_id":p.order,"working_state":p.memory.view(),"previous_summary":p.context_notes.get(&session),"decisions":observable,"receipts":receipts});
         let input =
             crate::continuity::view(&input, p.context_profile.window() / 3)["value"].clone();
-        let tools = json!([{"type":"namespace","name":"echelon","tools":[{"type":"function","name":"context__summary","description":"Summarize observable progress for continuation; no business action is available.","strict":false,"parameters":{"type":"object","properties":{"summary":{"type":"string","maxLength":12000}},"required":["summary"],"additionalProperties":false}}]}]);
+        let tools = json!([{"type":"namespace","name":"echelon","description":"Restricted context summarization; no business actions or additional authority.","tools":[{"type":"function","name":"context__summary","description":"Summarize observable progress for continuation; no business action is available.","strict":false,"parameters":{"type":"object","properties":{"summary":{"type":"string","maxLength":12000}},"required":["summary"],"additionalProperties":false}}]}]);
         sqlx::query("UPDATE execution_runs SET calls=calls+1 WHERE id=$1")
             .bind(id)
             .execute(&s.pool)

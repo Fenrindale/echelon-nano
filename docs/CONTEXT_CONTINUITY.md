@@ -12,6 +12,8 @@ Full protected results remain immutable in `execution_actions.outcome`. Large mo
 
 JSON Pointer enters JSON encoded inside strings, including MCP `content[].text`. A narrow `/result/content/0/text/incidents` query avoids copying a large response through shell or chat. Actual keys must come from the source. Pages return `total_items` or `total_characters`, `next_offset`, and the original hash/reference. JSON offsets refer to array/object entries, not bytes.
 
+`run.output {op:'list',tool?:'mcp.call',offset:0,limit:20}` recovers older reference IDs after a long session. This index enforces the same role/Work Order scope and returns metadata only. Omit `op` for a read by ID.
+
 `artifact.read {artifact_id,format:'json',pointer,offset,limit}` offers the same selection over authorized UTF-8 JSON. Default text reads are paginated without base64; operator downloads retain exact bytes. Text pages use up to 16,000 characters and JSON pages up to 100 entries. Oversized legacy requests normalize to a page rather than repeatedly failing. Work Order receipt pages normalize to 1–16 entries. View sizes do not end a Task. Storage/transport protections and credential masking remain in effect.
 
 ## Summary and continuation

@@ -322,7 +322,7 @@ pub fn schema(tool: &str) -> Value {
     let string = || json!({"type":"string"});
     let strings = || json!({"type":"array","items":{"type":"string"}});
     let object = || json!({"type":"object","additionalProperties":true});
-    let properties = match tool {
+    let mut properties = match tool {
         "mcp.search" => {
             json!({"query":string(),"transport":{"type":"string","enum":["npm","python"]},"limit":{"type":"integer","minimum":1,"maximum":12}})
         }
@@ -372,6 +372,10 @@ pub fn schema(tool: &str) -> Value {
         }
         _ => json!({}),
     };
+    if tool == "run.output" {
+        properties["op"] = json!({"type":"string","enum":["list"],"description":"Omit for a read by id; list recovers older scoped reference IDs."});
+        properties["tool"] = json!({"type":"string","description":"Optional exact tool name for list, such as mcp.call."});
+    }
     // Individual adapters enforce their complete Deserialize contracts and role
     // scopes. Discovery supplies pinned MCP schemas without copying them here.
     json!({"type":"object","properties":properties,"additionalProperties":true})
