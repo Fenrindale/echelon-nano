@@ -20,6 +20,8 @@ JSON Pointer enters JSON encoded inside strings, including MCP `content[].text`.
 
 Complete sessions are archived with their hash before compression. A restricted model call summarizes only observable decisions/results and has no business tools. Calls, usage, failures and unknown usage are recorded. Failed generation leaves a labelled structured-receipt fallback. Summaries are immutable, cached by run/session/source hash and checkpointed separately for each role/Agent Work Order.
 
+Automatic runs use model summaries. Explicitly call-limited manual runs use the structured-receipt continuation without spending an extra summary call outside their requested limit.
+
 Continuation combines that note, complete recent call/output pairs and server-owned state. Original goal, completion conditions, active steps, progress notes, pinned evidence, grants, MCP preparations and effects remain intact. A summary cannot verify goals, publish knowledge, expand permissions or authorize replay. References survive compaction and restart. Restart still requires explicit reconciliation/resume; unknown external effects are never automatically retried. Knowledge adoption remains optional.
 
 ## Verification and references
