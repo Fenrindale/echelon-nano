@@ -26,7 +26,7 @@ See the [beta guide and API contracts](docs/BETA.md), [execution contracts](docs
 
 The initial model connection uses the official Sign in with ChatGPT route. It does not reuse another application's Codex credentials, call private ChatGPT inference endpoints, or silently fall back to a billed API key.
 
-Shared workspace MCP installations now have a dedicated **MCP** menu. Handler selects installed tools, Agent executes only Work Order grants, and Vault injects referenced credentials. npm/Python stdio and Streamable HTTP transports are supported; see [MCP setup, boundaries and continuation](docs/MCP.md).
+Shared workspace MCP installations have a dedicated **MCP** menu. Handler can discover registry packages and prepare missing MCP integrations itself, then select installed tools for Agent. Agent executes only pinned Work Order grants, and Vault injects referenced credentials. npm/Python stdio and Streamable HTTP transports are supported; see [MCP setup, boundaries and continuation](docs/MCP.md).
 
 ## Requirements
 

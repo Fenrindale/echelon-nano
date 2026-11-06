@@ -544,7 +544,11 @@ async fn domain(
         | Capability::AgentDelegate
         | Capability::WorkOrderRead
         | Capability::ArtifactRead => Role::Handler,
-        Capability::CredentialInspect | Capability::McpInspect => Role::Handler,
+        Capability::CredentialInspect
+        | Capability::McpInspect
+        | Capability::McpSearch
+        | Capability::McpDescribe
+        | Capability::McpPrepare => Role::Handler,
         _ => {
             return Err(crate::error::AppError::forbidden(
                 "operator_domain_tool_denied",

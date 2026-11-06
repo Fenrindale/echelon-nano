@@ -14,6 +14,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         message = json.loads(self.rfile.read(int(self.headers.get('Content-Length', 0))))
         method = message.get('method')
+        self.counts['mcp:' + str(method)] = self.counts.get('mcp:' + str(method), 0) + 1
         if 'id' not in message:
             self.send_response(202)
             self.end_headers()
@@ -34,7 +35,7 @@ class Handler(BaseHTTPRequestHandler):
                 if self.path == '/mcp-lost':
                     self.close_connection = True
                     return
-            result = {'content': [{'type': 'text', 'text': json.dumps({'fixture': True, 'items': ['owned-item-A', 'owned-item-B'], 'resolved': sorted(self.resolved), 'call_count': self.counts[name], 'auth_echo': self.headers.get('Authorization', '')})}]}
+            result = {'content': [{'type': 'text', 'text': json.dumps({'fixture': True, 'items': ['owned-item-A', 'owned-item-B'], 'resolved': sorted(self.resolved), 'call_count': self.counts[name], 'authenticated': self.headers.get('Authorization', '') == 'Bearer owned-mcp-prepare-value', 'auth_echo': self.headers.get('Authorization', '')})}]}
         else:
             self.send_error(400)
             return
@@ -53,7 +54,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.counts[self.path] = self.counts.get(self.path, 0) + 1
         auth = self.headers.get("Authorization", "")
-        if self.path == "/snapshot":
+        if self.path == "/mcp-state":
+            data = {"counts": self.counts, "resolved": sorted(self.resolved)}
+        elif self.path == "/snapshot":
             data = {"fixture": True, "week": "synthetic-week-41", "requests": 120,
                     "resolved": 108, "pending": 12, "success_rate": 0.9,
                     "authenticated": bool(auth), "source": "owned synthetic API"}

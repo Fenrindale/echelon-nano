@@ -525,6 +525,9 @@ async fn dispatch(s: &AppState, a: &Claims, req: &ToolRequest) -> AppResult<Valu
         Capability::CredentialImport => crate::credentials::import(s, a, &req.input).await,
         Capability::CredentialCheck => crate::credentials::check(s, a, &req.input).await,
         Capability::McpInspect => crate::mcp::inspect(s, a, &req.input).await,
+        Capability::McpSearch => crate::mcp_setup::search(a, &req.input).await,
+        Capability::McpDescribe => crate::mcp_setup::describe(a, &req.input).await,
+        Capability::McpPrepare => crate::mcp_setup::prepare(s, a, &req.input).await,
         Capability::McpCall => crate::mcp::call(s, a, &req.input).await,
         Capability::ArtifactWrite => {
             let policy = broker::order_policy(&s.pool, a).await?;

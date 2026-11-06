@@ -69,7 +69,7 @@ fn identifier(s: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || b"_.-".contains(&c))
 }
 impl Spec {
-    fn validate(&self) -> AppResult<()> {
+    pub(crate) fn validate(&self) -> AppResult<()> {
         for argument in &self.args {
             let flag = argument
                 .split('=')
@@ -261,18 +261,29 @@ async fn install(
     Json(r): Json<Operation>,
 ) -> AppResult<Json<Value>> {
     operator(&s, &h).await?;
+    install_ready(&s, r.tenant_id, id, r.expected_version, "operator")
+        .await
+        .map(Json)
+}
+pub(crate) async fn install_ready(
+    s: &AppState,
+    tenant: Uuid,
+    id: Uuid,
+    version: i64,
+    actor_role: &str,
+) -> AppResult<Value> {
     let spec: Value = sqlx::query_scalar(
         "SELECT spec FROM mcp_servers WHERE tenant_id=$1 AND id=$2 AND version=$3 AND enabled",
     )
-    .bind(r.tenant_id)
+    .bind(tenant)
     .bind(id)
-    .bind(r.expected_version)
+    .bind(version)
     .fetch_optional(&s.pool)
     .await
     .map_err(db)?
     .ok_or_else(missing)?;
     let spec: Spec = serde_json::from_value(spec).map_err(|_| bad())?;
-    let env = credentials::mcp_environment(&s, r.tenant_id, &spec.environment).await?;
+    let env = credentials::mcp_environment(s, tenant, &spec.environment).await?;
     let result = transport(&spec, &env, "discover", None, None, None).await;
     let tools = match result {
         Ok(v) => {
@@ -280,21 +291,21 @@ async fn install(
             scrub(v["tools"].clone(), &env)
         }
         Err(e) => {
-            sqlx::query("UPDATE mcp_servers SET status='failed',error_code=$4 WHERE tenant_id=$1 AND id=$2 AND version=$3").bind(r.tenant_id).bind(id).bind(r.expected_version).bind(e.code).execute(&s.pool).await.map_err(db)?;
+            sqlx::query("UPDATE mcp_servers SET status='failed',error_code=$4 WHERE tenant_id=$1 AND id=$2 AND version=$3").bind(tenant).bind(id).bind(version).bind(e.code).execute(&s.pool).await.map_err(db)?;
             return Err(e);
         }
     };
     let mut tx = s.pool.begin().await.map_err(db)?;
-    let updated=sqlx::query("UPDATE mcp_servers SET tools=$4,status='ready',error_code=NULL,updated_at=now() WHERE tenant_id=$1 AND id=$2 AND version=$3 AND enabled").bind(r.tenant_id).bind(id).bind(r.expected_version).bind(&tools).execute(&mut *tx).await.map_err(db)?;
+    let updated=sqlx::query("UPDATE mcp_servers SET tools=$4,status='ready',error_code=NULL,updated_at=now() WHERE tenant_id=$1 AND id=$2 AND version=$3 AND enabled").bind(tenant).bind(id).bind(version).bind(&tools).execute(&mut *tx).await.map_err(db)?;
     if updated.rows_affected() != 1 {
         return Err(AppError::bad("mcp_version_conflict"));
     }
-    sqlx::query("INSERT INTO mcp_server_revisions(server_id,version,spec,tools) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING").bind(id).bind(r.expected_version).bind(json!(spec)).bind(&tools).execute(&mut *tx).await.map_err(db)?;
+    sqlx::query("INSERT INTO mcp_server_revisions(server_id,version,spec,tools) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING").bind(id).bind(version).bind(json!(spec)).bind(&tools).execute(&mut *tx).await.map_err(db)?;
     let frozen: Value = sqlx::query_scalar(
         "SELECT tools FROM mcp_server_revisions WHERE server_id=$1 AND version=$2",
     )
     .bind(id)
-    .bind(r.expected_version)
+    .bind(version)
     .fetch_one(&mut *tx)
     .await
     .map_err(db)?;
@@ -302,8 +313,17 @@ async fn install(
         return Err(AppError::bad("mcp_tools_changed_reconfigure_required"));
     }
     tx.commit().await.map_err(db)?;
-    audit(&s.pool,Some(r.tenant_id),None,"operator","mcp.installed","success",json!({"server_id":id,"version":r.expected_version,"tool_count":tools.as_array().map_or(0,Vec::len)})).await?;
-    Ok(Json(json!({"id":id,"status":"ready","tools":tools})))
+    audit(
+        &s.pool,
+        Some(tenant),
+        None,
+        actor_role,
+        "mcp.installed",
+        "success",
+        json!({"server_id":id,"version":version,"tool_count":tools.as_array().map_or(0,Vec::len)}),
+    )
+    .await?;
+    Ok(json!({"id":id,"version":version,"status":"ready","tools":tools}))
 }
 fn validate_tools(tools: &Value) -> AppResult<()> {
     let a = tools

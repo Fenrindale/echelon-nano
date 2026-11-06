@@ -25,6 +25,87 @@ fn actor(tenant: Uuid, task: Uuid, role: Role) -> Claims {
 
 #[tokio::test]
 #[ignore = "requires the isolated compose.verify.yaml PostgreSQL database"]
+async fn mcp_preparation_receipts_are_immutable_and_do_not_promote_failed_evidence() {
+    use echelon_core::harness::{self, Evidence};
+    let pool = PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&std::env::var("DATABASE_URL").unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT current_database()")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        "echelon_verification"
+    );
+    sqlx::migrate!("../../migrations").run(&pool).await.unwrap();
+    let tenant = Uuid::new_v4();
+    let task = Uuid::new_v4();
+    let other = Uuid::new_v4();
+    let server = Uuid::new_v4();
+    sqlx::query("INSERT INTO tenants(id,name) VALUES($1,'Owned MCP preparation fixture')")
+        .bind(tenant)
+        .execute(&pool)
+        .await
+        .unwrap();
+    for id in [task, other] {
+        sqlx::query(
+            "INSERT INTO tasks(id,tenant_id,goal) VALUES($1,$2,'Owned MCP preparation evidence')",
+        )
+        .bind(id)
+        .bind(tenant)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    sqlx::query("INSERT INTO mcp_servers(id,tenant_id,name,spec) VALUES($1,$2,'Owned preparation server','{}')").bind(server).bind(tenant).execute(&pool).await.unwrap();
+    for status in ["ready", "failed"] {
+        let key = Uuid::new_v4();
+        sqlx::query("INSERT INTO mcp_preparations(tenant_id,task_id,request_key,request_hash,request,server_id,server_version,reused) VALUES($1,$2,$3,'owned','{}',$4,1,false)")
+            .bind(tenant).bind(task).bind(key).bind(server).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO mcp_preparation_results(tenant_id,task_id,request_key,result) VALUES($1,$2,$3,$4)")
+            .bind(tenant).bind(task).bind(key).bind(json!({"source":"server.mcp_preparation","status":status})).execute(&pool).await.unwrap();
+        let evidence = Evidence {
+            kind: "receipt".into(),
+            id: key,
+        };
+        assert_eq!(
+            harness::validate_evidence(&pool, tenant, task, &evidence, true)
+                .await
+                .is_ok(),
+            status == "ready"
+        );
+        assert_eq!(
+            harness::validate_evidence(&pool, tenant, task, &evidence, false)
+                .await
+                .is_ok(),
+            status == "failed"
+        );
+        assert!(
+            harness::validate_evidence(&pool, tenant, other, &evidence, true)
+                .await
+                .is_err()
+        );
+        assert!(
+            harness::validate_evidence(&pool, Uuid::new_v4(), task, &evidence, true)
+                .await
+                .is_err()
+        );
+        for sql in [
+            "UPDATE mcp_preparations SET request_hash='changed' WHERE request_key=$1",
+            "DELETE FROM mcp_preparations WHERE request_key=$1",
+            "UPDATE mcp_preparation_results SET result='{}' WHERE request_key=$1",
+            "DELETE FROM mcp_preparation_results WHERE request_key=$1",
+        ] {
+            assert!(sqlx::query(sql).bind(key).execute(&pool).await.is_err());
+        }
+    }
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the isolated compose.verify.yaml PostgreSQL database"]
 async fn task_harness_has_unlimited_orders_and_owned_evidence_with_immutable_history() {
     use echelon_core::harness::{self, Evidence};
     let pool = PgPoolOptions::new()

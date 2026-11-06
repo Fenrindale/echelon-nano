@@ -13,6 +13,7 @@ pub mod ingestion;
 pub mod knowledge;
 pub mod maintenance;
 pub mod mcp;
+pub mod mcp_setup;
 pub mod observability;
 pub mod persistence;
 pub mod policy;

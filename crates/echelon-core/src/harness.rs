@@ -289,11 +289,11 @@ pub async fn validate_evidence(
         "observation"=>sqlx::query_scalar::<_,bool>("SELECT EXISTS(SELECT 1 FROM observations WHERE tenant_id=$1 AND task_id=$2 AND id=$3)").bind(tenant).bind(task).bind(e.id).fetch_one(pool).await,
         "work_order"=>sqlx::query_scalar::<_,bool>("SELECT EXISTS(SELECT 1 FROM work_order_results WHERE tenant_id=$1 AND task_id=$2 AND work_order_id=$3 AND (result->>'outcome'='completed')=$4)").bind(tenant).bind(task).bind(e.id).bind(successful).fetch_one(pool).await,
         "receipt"=> {
-            let rows=sqlx::query("SELECT status,result FROM tool_receipts WHERE tenant_id=$1 AND task_id=$2 AND request_key=$3 UNION ALL SELECT status,result FROM mcp_call_receipts WHERE tenant_id=$1 AND task_id=$2 AND request_key=$3").bind(tenant).bind(task).bind(e.id).fetch_all(pool).await.map_err(|_|AppError::internal("execution_database_failed"))?;
+            let rows=sqlx::query("SELECT status,result FROM tool_receipts WHERE tenant_id=$1 AND task_id=$2 AND request_key=$3 UNION ALL SELECT status,result FROM mcp_call_receipts WHERE tenant_id=$1 AND task_id=$2 AND request_key=$3 UNION ALL SELECT 'completed' AS status,result FROM mcp_preparation_results WHERE tenant_id=$1 AND task_id=$2 AND request_key=$3").bind(tenant).bind(task).bind(e.id).fetch_all(pool).await.map_err(|_|AppError::internal("execution_database_failed"))?;
             Ok(rows.iter().any(|r| {
                 let status:String=r.get("status");let v:Option<Value>=r.get("result");
                 let v=v.unwrap_or(Value::Null);
-                let good=status=="completed" && (v["operation_ok"]==true || v["exit_code"]==0 && v["timed_out"]==false || v["status"].as_u64().is_some_and(|s|(200..300).contains(&s)));
+                let good=status=="completed" && (v["operation_ok"]==true || v["exit_code"]==0 && v["timed_out"]==false || v["status"].as_u64().is_some_and(|s|(200..300).contains(&s)) || v["source"]=="server.mcp_preparation" && v["status"]=="ready");
                 let bad=status=="unknown" || status=="completed" && (v["operation_ok"]==false || v["exit_code"].as_i64().is_some_and(|s|s!=0) || v["timed_out"]==true || v["status"].as_u64().is_some_and(|s|s>=400) || matches!(v["status"].as_str(),Some("cancelled"|"failed")));
                 if successful {good}else{bad}
             }))
@@ -323,6 +323,17 @@ pub fn schema(tool: &str) -> Value {
     let strings = || json!({"type":"array","items":{"type":"string"}});
     let object = || json!({"type":"object","additionalProperties":true});
     let properties = match tool {
+        "mcp.search" => {
+            json!({"query":string(),"transport":{"type":"string","enum":["npm","python"]},"limit":{"type":"integer","minimum":1,"maximum":12}})
+        }
+        "mcp.describe" => {
+            json!({"package":string(),"transport":{"type":"string","enum":["npm","python"]},"version":string(),"offset":{"type":"integer","minimum":0,"maximum":200000}})
+        }
+        "mcp.prepare" => {
+            json!({"name":string(),"reason":string(),"spec":{"type":"object","properties":{"transport":{"type":"string","enum":["npm","python","http"]},"package":string(),"package_version":string(),"executable":string(),"args":strings(),"url":string(),"allow_private":{"type":"boolean"},"allow_http":{"type":"boolean"},"environment":{"type":"array","items":{"type":"object","properties":{"name":string(),"bundle_id":string(),"variable":string()},"required":["name","bundle_id","variable"],"additionalProperties":false}}},"additionalProperties":false}})
+        }
+        "mcp.inspect" => json!({"server_id":string()}),
+        "mcp.call" => json!({"server_id":string(),"tool":string(),"arguments":object()}),
         "context.request" | "run.context_refresh" => json!({"criteria":object()}),
         "context.read" => {
             json!({"op":{"type":"string","enum":["pack","resolve","resolve_many"]},"ref_id":string(),"ref_ids":strings()})

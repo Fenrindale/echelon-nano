@@ -52,6 +52,12 @@ pub enum Capability {
     CredentialCheck,
     #[serde(rename = "mcp.inspect")]
     McpInspect,
+    #[serde(rename = "mcp.search")]
+    McpSearch,
+    #[serde(rename = "mcp.describe")]
+    McpDescribe,
+    #[serde(rename = "mcp.prepare")]
+    McpPrepare,
     #[serde(rename = "mcp.call")]
     McpCall,
     #[serde(rename = "task.observe")]
@@ -74,7 +80,7 @@ pub enum Capability {
     VaultRawRead,
 }
 
-pub const ALL: [Capability; 27] = [
+pub const ALL: [Capability; 30] = [
     Capability::KnowledgeRead,
     Capability::KnowledgeClassify,
     Capability::KnowledgePublish,
@@ -92,6 +98,9 @@ pub const ALL: [Capability; 27] = [
     Capability::CredentialImport,
     Capability::CredentialCheck,
     Capability::McpInspect,
+    Capability::McpSearch,
+    Capability::McpDescribe,
+    Capability::McpPrepare,
     Capability::McpCall,
     Capability::TaskObserve,
     Capability::ExternalFetch,
@@ -122,6 +131,9 @@ pub fn role_allows(role: Role, action: Capability) -> bool {
                 | ArtifactRead
                 | CredentialInspect
                 | McpInspect
+                | McpSearch
+                | McpDescribe
+                | McpPrepare
         ),
         Role::Agent => matches!(
             action,
@@ -256,6 +268,13 @@ mod tests {
         assert!(!role_allows(Role::Handler, Capability::KnowledgePublish));
         assert!(!role_allows(Role::Master, Capability::ShellExec));
         assert!(!role_allows(Role::Master, Capability::AgentDelegate));
+        for role in [Role::Analyst, Role::Agent, Role::Master] {
+            assert!(!role_allows(role, Capability::McpSearch));
+            assert!(!role_allows(role, Capability::McpDescribe));
+            assert!(!role_allows(role, Capability::McpPrepare));
+        }
+        assert!(role_allows(Role::Handler, Capability::McpPrepare));
+        assert!(!role_allows(Role::Handler, Capability::McpCall));
         for role in [Role::Analyst, Role::Handler, Role::Master] {
             assert!(!role_allows(role, Capability::CredentialImport));
             assert!(!role_allows(role, Capability::CredentialCheck));

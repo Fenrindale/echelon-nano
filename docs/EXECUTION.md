@@ -16,6 +16,8 @@ Agent는 허용한 URL의 읽기, 격리 코드 실행과 실제 산출물 회�
 
 ## 운영자 API
 
+Handler는 필요한 MCP가 없으면 `mcp.search`·`mcp.describe`로 공개 레지스트리의 패키지·고정 버전·설정을 확인하고 `mcp.prepare`로 설치·초기화를 요청할 수 있다. 설치는 별도 MCP 컨테이너가 수행하며 Agent의 Worker와 구분한다. 기밀은 Task 계약에서 선택한 기존 Vault bundle의 변수 참조로 연결한다. 준비 영수증과 발견한 스키마는 이후 Work Order에 정확한 ID·버전·도구 이름으로 고정하며, 실제 업무 호출은 Agent가 수행한다. 실패 기록·재사용·재시작 복원과 권한 경계는 [MCP 문서](MCP.md)를 따른다.
+
 콘솔의 기본 경로는 `POST /v1/operator/tasks/launch`다. 업무 입력은 `goal`과 선택 사항인 `attachments`이며 `tenant_id`와 `request_id`는 클라이언트가 지정하는 범위·멱등 메타데이터다.
 
 ```json
