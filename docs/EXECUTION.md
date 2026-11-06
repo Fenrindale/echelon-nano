@@ -62,7 +62,7 @@ Handler는 필요한 MCP가 없으면 `mcp.search`·`mcp.describe`로 공개 레
 
 Responses 요청은 `store:false`, `stream:true`, 입력 배열, namespace 안의 엄격한 함수 스키마를 사용한다. Handler와 활성 Work Order의 Agent는 각자의 대화를 복원한다. 역할 간 대화는 섞지 않고 필요한 계약·ID·작업 상태를 전달한다. 압축 전 원문은 비공개 불변 archive에 남기고 최근 영수증·작업 기억으로 모델 입력을 다시 구성한다. `response.completed` 전에는 함수 호출을 실행하지 않는다. 미완료 스트림의 도구 호출은 폐기한다. 연결·시간 초과·완료 없는 단절과 HTTP 408/429/500/502/503/504는 모델 생성만 자동 재시도한다. 인증 거부·확인된 과금 한도·잘못된 응답·정책 오류·DB 오류는 자동 반복하지 않는다.
 
-직접 실행 API의 호출 수는 1–48회다. 토큰 사용량으로 실행을 중단하지 않는다. 자동 Task의 총 수명과 모델 라운드를 구분한다. 추론 연결 30초·무수신 300초·단일 요청 900초, 스트림 2 MiB, 모델 입력 256 KiB와 중지·취소는 유지한다. 120초 고정 추론 제한은 제거했다. Work Order 계약의 도구·대상·허용 수와 역할 권한은 그대로 검사한다. 연결 계정의 제공자 한도는 별도로 적용된다.
+직접 실행 API의 호출 수는 1–48회다. 토큰 사용량으로 실행을 중단하지 않는다. 자동 Task의 총 수명과 모델 라운드를 구분한다. 추론 연결 30초·무수신 300초·단일 요청 900초, 스트림 2 MiB와 중지·취소는 유지한다. 모델 입력의 고정 바이트 중단 제한은 없으며 모델 컨텍스트에 맞춰 원본 참조·부분 조회·요약으로 이어 간다. 120초 고정 추론 제한은 제거했다. Work Order 계약의 도구·대상·허용 수와 역할 권한은 그대로 검사한다. 연결 계정의 제공자 한도는 별도로 적용된다.
 
 `GET /v1/operator/metrics?tenant_id=...&task_id=...`는 완료 응답의 입력·출력·캐시·총 토큰을 역할·단계·모델·도구 결정별로 집계한다. 도구별 값은 해당 도구를 선택한 모델 응답의 사용량이며 도구 실행 자체의 비용이 아니다. 다음 추론 전 도구 결정이 없으면 `unassigned`로 남긴다. 미완료 응답은 사용량을 추정하지 않고 `calls_without_completed_usage`에 구분한다. 집계 차원 간 수치는 같은 사용량의 다른 분류이므로 합산하지 않는다. 원본 사용량은 불변 실행 이벤트에 보존한다. 실행·집계 응답은 `token_policy:observe_only`, `token_limit_enforced:false`로 현재 정책을 명시하며 잔여 계정 한도·과금은 추정하지 않는다.
 
@@ -126,7 +126,7 @@ Handler의 재계획 컨텍스트에는 실제 work_order.read로 수집한 이�
 
 Handler는 `run.work {steps:[{id,objective,depends_on,priority,status}],note}`로 Task 지역 작업 상태를 저장한다. `agent.delegate`의 선택적 `step_id`는 의존 작업이 완료된 pending 단계만 가리킬 수 있다. 완료된 시도는 수정하지 않고 새로운 접근을 별도 단계로 만든다. 각 Work Order는 순차 실행하며 여러 Agent의 동시 실행은 제공하지 않는다. 작업 메모·실패 시도는 중앙 지식으로 자동 채택되지 않는다.
 
-Agent가 8회 도구를 사용하거나 120초의 점검 경계에 도달하면 Handler가 실제 Work Order와 영수증을 읽는다. `run.supervise {decision:'continue'|'steer'|'recall',message}`로 계속 실행·방향 수정·결과 회수를 지시한다. 점검은 도구 경계에서 실행한다. 회수 중인 Agent는 기존 파일 작업 조회·취소와 결과 반환만 가능하며 새 행동을 시작할 수 없다. 실행 중인 파일 작업은 조회·취소해 정리한 뒤 Work Order를 완료한다.
+Handler는 중요한 판단 요청(`task.observe needs_handler:true`), 연속 도구 실패, 같은 결과의 반복 조회, 결과 불명 상태와 10분 점검을 기준으로 감독한다. 정상 부분 조회의 횟수만으로 개입하지 않는다. `run.supervise {decision:'continue'|'steer'|'recall',message}`로 계속 실행·방향 수정·결과 회수를 지시한다. 점검은 도구 경계에서 실행하며 독립 조회 묶음의 이벤트는 합쳐 처리한다. 감독 세션은 Work Order별로 구분하되 원래 목표·진행 기록은 서버에 유지한다. 회수 중인 Agent는 기존 파일 작업 조회·취소와 결과 반환만 가능하며 새 행동을 시작할 수 없다. 실행 중인 파일 작업은 조회·취소해 정리한 뒤 Work Order를 완료한다. 이전 자료의 명시적 인계와 검증은 [인계·감독 문서](HANDOFF_SUPERVISION.md)를 따른다.
 
 `run.context_refresh {criteria:{need,query,tags,max_references}}`는 실행 중 새 Analyst 선별을 요청한다. 이전 Pack과 Work Order의 근거는 그대로 보존하고 후속 지시에 새 Pack을 고정한다. 첫 Work Order 이후 원래 완료 조건은 바꾸지 않는다.
 
