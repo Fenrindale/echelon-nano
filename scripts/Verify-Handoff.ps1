@@ -42,7 +42,7 @@ $file=Invoke-Echelon "/v1/operator/artifacts/$($files[0].id)?tenant_id=$tenant"
 Check-Handoff ($file.content -ceq $saved.expected) 'Independent review produced the wrong file bytes.'
 $original=@($t.artifacts|Where-Object name -eq 'source.json');$source=Invoke-Echelon "/v1/operator/artifacts/$($original[0].id)?tenant_id=$tenant"
 Check-Handoff ($source.content -ceq $saved.body) 'Original NUL-bearing JSON changed.'
-Check-Handoff ((Sql-Handoff "SELECT state->>'goal' FROM execution_runs WHERE id='$run';") -ceq $saved.goal) 'Original goal changed.'
+Check-Handoff (($t.goal -ceq $saved.goal) -and (Sql-Handoff "SELECT (r.state->>'goal')=t.goal FROM execution_runs r JOIN tasks t ON t.id=r.task_id WHERE r.id='$run';") -eq 't') 'Original goal changed.'
 $e=@{passed=$true;assertions=$checks;run_id=$run;task_id=$task;calls=$r.calls;total_tokens=$r.total_tokens;work_orders=2;source_preserved=$true;cross_order_reads_verified=$true;nul_projection_stored=$true;event_supervision_verified=$true;final_sha256=$file.artifact.sha256;verified_at=[DateTimeOffset]::UtcNow.ToString('o')}
 Write-PrivateText (Join-Path $script:RuntimeRoot 'evidence/handoff.json') ($e|ConvertTo-Json -Depth 7)
 $e|ConvertTo-Json -Compress
