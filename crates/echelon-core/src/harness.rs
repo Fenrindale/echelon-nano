@@ -384,9 +384,55 @@ pub fn schema(tool: &str) -> Value {
     json!({"type":"object","properties":properties,"additionalProperties":true})
 }
 
+/// Restore a uniquely named tag namespace from the immutable user goal only.
+/// Never widen search, invent tags, or select between ambiguous suffixes.
+pub fn bind_goal_tags(goal: &str, criteria: &mut Value) {
+    let literals: std::collections::BTreeSet<_> = goal
+        .split(|c: char| c.is_whitespace() || "\"'[](){},;".contains(c) || c == char::from(96))
+        .filter(|s| {
+            s.split_once(':')
+                .is_some_and(|(a, b)| !a.is_empty() && !b.is_empty())
+                && !s.contains('/')
+                && !s.contains('\\')
+        })
+        .collect();
+    if let Some(tags) = criteria.get_mut("tags").and_then(Value::as_array_mut) {
+        for tag in tags {
+            let Some(bare) = tag.as_str() else { continue };
+            if bare.contains(':') {
+                continue;
+            }
+            let matches: Vec<_> = literals
+                .iter()
+                .filter(|s| s.rsplit_once(':').is_some_and(|(_, v)| v == bare))
+                .collect();
+            if matches.len() == 1 {
+                *tag = json!(matches[0]);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn only_unambiguous_literal_goal_tag_namespaces_are_restored() {
+        let mut q = json!({"tags":["업무분류","already:exact"],"query":"","constraints":["Keep pinned evidence"]});
+        bind_goal_tags(
+            "Use [검증:업무분류] and already:exact; do not infer policy",
+            &mut q,
+        );
+        assert_eq!(q["tags"], json!(["검증:업무분류", "already:exact"]));
+        assert_eq!(q["constraints"][0], "Keep pinned evidence");
+        let mut q = json!({"tags":["same","missing","//host"]});
+        bind_goal_tags("a:same b:same https://host", &mut q);
+        assert_eq!(q["tags"], json!(["same", "missing", "//host"]));
+        let mut q = json!({"need":"Query-only request","query":"owned"});
+        let before = q.clone();
+        bind_goal_tags("Owned goal", &mut q);
+        assert_eq!(q, before);
+    }
     #[test]
     fn goals_freeze_when_work_is_issued_not_when_a_plan_is_drafted() {
         let mut m = Memory::default();

@@ -2033,6 +2033,7 @@ fn prepare(run_id: Uuid, c: &StartRun, p: &mut Checkpoint, call: &Call) -> AppRe
     }
     match call.tool.as_str() {
         "context.request" => {
+            crate::harness::bind_goal_tags(&p.goal, &mut input["criteria"]);
             bind(
                 &mut input,
                 "request_id",
@@ -2237,6 +2238,7 @@ fn prepare(run_id: Uuid, c: &StartRun, p: &mut Checkpoint, call: &Call) -> AppRe
         }
         "run.context_refresh" => {
             let mut criteria = input["criteria"].clone();
+            crate::harness::bind_goal_tags(&p.goal, &mut criteria);
             if c.protocol_id.is_some() {
                 bind(&mut criteria, "protocol_id", p.protocol["id"].clone())?;
                 bind(

@@ -6,6 +6,8 @@ The server pins artifact/output IDs, hashes and source Work Orders in the immuta
 
 The current Work Order must be collected with work_order.read before replanning. A missing collection returns execution_result_required. Only an exhausted positive Work Order limit returns work_order_budget_exceeded. Automatic Tasks retain their unlimited lifetime setting.
 
+Context requests preserve explicit goal tags as well: if Handler drops a namespace from a tag and the immutable user goal contains exactly one matching literal namespaced tag, the server restores that exact tag. Ambiguous suffixes, unrelated tags and URLs are not guessed or broadened. Both the submitted decision and the actual Context request remain observable.
+
 ## Event-driven supervision
 
 Ordinary partial reads no longer interrupt Agent every eight tool results or two minutes. Handler is invoked at a tool boundary for:
