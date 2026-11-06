@@ -1439,14 +1439,15 @@ async fn work_orders_scope_results_and_interrupted_runs() {
             .len(),
         1024
     );
-    assert!(
+    assert_eq!(
         work::read(
             &pool,
             &h,
             &json!({"work_order_id":order_id,"receipt_limit":17})
         )
         .await
-        .is_err()
+        .unwrap()["execution_receipts"],
+        receipt_view["execution_receipts"]
     );
     assert_eq!(
         work::read(
