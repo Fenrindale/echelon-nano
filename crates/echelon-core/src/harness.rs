@@ -311,11 +311,11 @@ pub fn recent_receipts(history: &[Value]) -> Vec<Value> {
     history.iter().filter(|v| v["type"] == "function_call_output").rev().take(12).map(|v| {
         let raw = v["output"].as_str().unwrap_or("");
         let value: Value = serde_json::from_str(raw).unwrap_or(Value::Null);
-        json!({"call_id":v["call_id"],"ok":value["ok"],"error":value["error"],"result":if raw.len()<=10000 {value["result"].clone()} else {json!({"omitted":true,"sha256":crate::workspace::digest(raw.as_bytes()),"job_id":value["result"]["job_id"],"status":value["result"]["status"],"artifacts":value["result"]["artifacts"],"note":"Full output retained in the scoped execution receipt."})}})
+        json!({"call_id":v["call_id"],"ok":value["ok"],"error":value["error"],"full_output":value["full_output"],"result":crate::continuity::view(&value["result"],600)["value"],"note":"Original effects and full protected outputs are preserved. Follow full_output using run.output when present."})
     }).collect()
 }
 pub fn tool_summary(tool: &str, call_id: &str, value: &Value) -> Value {
-    json!({"tool":tool,"call_id":call_id,"ok":value["ok"],"error":value["error"],"job_id":value["result"]["job_id"],"status":value["result"]["status"],"artifacts":value["result"]["artifacts"],"artifact":value["result"]["artifact"],"note":"Read the scoped Work Order for complete tool receipts and observations."})
+    json!({"tool":tool,"call_id":call_id,"ok":value["ok"],"error":value["error"],"job_id":value["result"]["job_id"],"status":value["result"]["status"],"artifacts":value["result"]["artifacts"],"artifact":value["result"]["artifact"],"full_output":value["full_output"],"note":"Use a narrow original output query; do not reload an unchanged entire Work Order."})
 }
 
 pub fn schema(tool: &str) -> Value {
@@ -339,7 +339,7 @@ pub fn schema(tool: &str) -> Value {
             json!({"op":{"type":"string","enum":["pack","resolve","resolve_many"]},"ref_id":string(),"ref_ids":strings()})
         }
         "artifact.read" => {
-            json!({"artifact_id":string(),"offset":{"type":"integer"},"limit":{"type":"integer"}})
+            json!({"artifact_id":string(),"format":{"type":"string","enum":["text","json"]},"pointer":{"type":"string","description":"JSON Pointer; may enter JSON encoded inside MCP text. Use a narrow field instead of reading the whole result."},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":16000,"description":"Text characters (max 16000); JSON array/object items (max 100). Larger legacy requests are paged, never discard originals."}})
         }
         "artifact.write" => {
             json!({"name":string(),"media_type":string(),"content":string(),"data_base64":string()})
@@ -352,7 +352,10 @@ pub fn schema(tool: &str) -> Value {
             json!({"objective":string(),"expected_output":string(),"step_id":string(),"references":{"type":"array","items":object()}})
         }
         "work_order.read" => {
-            json!({"work_order_id":string(),"receipt_offset":{"type":"integer"},"receipt_limit":{"type":"integer"}})
+            json!({"work_order_id":string(),"receipt_offset":{"type":"integer","minimum":0,"maximum":100000},"receipt_limit":{"type":"integer","minimum":1,"maximum":16}})
+        }
+        "run.output" => {
+            json!({"id":string(),"pointer":string(),"format":{"type":"string","enum":["json","text"]},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":16000}})
         }
         "work_order.complete" => {
             json!({"outcome":{"type":"string","enum":["completed","partial","blocked","failed"]},"summary":string(),"evidence":{"type":"array","items":object()},"artifacts":strings(),"limitations":strings()})

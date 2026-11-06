@@ -121,3 +121,5 @@ See [the design](docs/PLAN.ko.md), [Phase 0 validation](docs/PHASE0.md), [the kn
 MIT License.
 
 See [central versus Task-local retention](docs/RETENTION.md) for decision-utility requirements, legacy review, local preservation and verification. Central adoption counts are historical receipts, distinct from current placement.
+
+See [context continuity](docs/CONTEXT_CONTINUITY.md) for original-output references, partial reads, model-window summaries and goal/progress checkpoints. Model input does not stop at an application byte threshold.

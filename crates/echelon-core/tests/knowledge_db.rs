@@ -25,6 +25,191 @@ fn actor(tenant: Uuid, task: Uuid, role: Role) -> Claims {
 
 #[tokio::test]
 #[ignore = "requires the isolated compose.verify.yaml PostgreSQL database"]
+async fn context_outputs_are_scoped_immutable_and_queryable_after_restart() {
+    use echelon_core::continuity;
+    let pool = PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&std::env::var("DATABASE_URL").unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT current_database()")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        "echelon_verification"
+    );
+    sqlx::migrate!("../../migrations").run(&pool).await.unwrap();
+    let tenant = Uuid::new_v4();
+    let task = Uuid::new_v4();
+    let other = Uuid::new_v4();
+    let run = Uuid::new_v4();
+    let order = Uuid::new_v4();
+    sqlx::query("INSERT INTO tenants(id,name) VALUES($1,'Owned context continuity fixture')")
+        .bind(tenant)
+        .execute(&pool)
+        .await
+        .unwrap();
+    for id in [task, other] {
+        sqlx::query("INSERT INTO tasks(id,tenant_id,goal) VALUES($1,$2,'Owned context source')")
+            .bind(id)
+            .bind(tenant)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    sqlx::query(
+        "INSERT INTO work_orders(id,tenant_id,task_id,target) VALUES($1,$2,$3,'owned:context')",
+    )
+    .bind(order)
+    .bind(tenant)
+    .bind(task)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO execution_runs(id,tenant_id,task_id,request_key,config,state,status) VALUES($1,$2,$3,$4,'{}','{}','paused')").bind(run).bind(tenant).bind(task).bind(Uuid::new_v4()).execute(&pool).await.unwrap();
+    let output = json!({"ok":true,"result":{"items":(0..5000).map(|i|json!({"id":i,"text":"Owned evidence ".repeat(8)})).collect::<Vec<_>>()}});
+    let hash = workspace::digest(output.to_string().as_bytes());
+    sqlx::query(
+        "INSERT INTO execution_actions(run_id,call_id,request,outcome) VALUES($1,'large','{}',$2)",
+    )
+    .bind(run)
+    .bind(&output)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let view =
+        continuity::model_output(&pool, run, "large", Role::Agent, Some(order), &output, 2000)
+            .await
+            .unwrap();
+    assert_eq!(view["abbreviated"], true);
+    let id: Uuid = serde_json::from_value(view["full_output"]["id"].clone()).unwrap();
+    let mut agent = actor(tenant, task, Role::Agent);
+    agent.work_order_id = Some(order);
+    let query = json!({"id":id,"pointer":"/result/items","format":"json","offset":4990,"limit":10});
+    let page = continuity::read_output(&pool, run, &agent, &query)
+        .await
+        .unwrap();
+    assert_eq!(page["value"][0]["id"], 4990);
+    assert_eq!(page["total_items"], 5000);
+    assert_eq!(page["source"]["sha256"], hash);
+    assert!(
+        continuity::read_output(&pool, run, &actor(tenant, task, Role::Handler), &query)
+            .await
+            .is_ok()
+    );
+    for role in [Role::Analyst, Role::Master] {
+        assert!(
+            continuity::read_output(&pool, run, &actor(tenant, task, role), &query)
+                .await
+                .is_err()
+        );
+    }
+    agent.work_order_id = Some(Uuid::new_v4());
+    assert!(
+        continuity::read_output(&pool, run, &agent, &query)
+            .await
+            .is_err()
+    );
+    let mut foreign = actor(tenant, other, Role::Handler);
+    assert!(
+        continuity::read_output(&pool, run, &foreign, &query)
+            .await
+            .is_err()
+    );
+    foreign.tenant_id = Uuid::new_v4();
+    assert!(
+        continuity::read_output(&pool, run, &foreign, &query)
+            .await
+            .is_err()
+    );
+    assert!(
+        continuity::read_output(
+            &pool,
+            Uuid::new_v4(),
+            &actor(tenant, task, Role::Handler),
+            &query
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        sqlx::query("UPDATE execution_output_refs SET sha256='tampered' WHERE id=$1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+    let summary = Uuid::new_v4();
+    sqlx::query("INSERT INTO execution_context_summaries(id,run_id,session_key,source_sha256,summary) VALUES($1,$2,'agent:owned','owned','{\"summary\":\"Continue page 13; goal and confirmed write unchanged\"}')").bind(summary).bind(run).execute(&pool).await.unwrap();
+    assert!(
+        sqlx::query("DELETE FROM execution_context_summaries WHERE id=$1")
+            .bind(summary)
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+    let replay =
+        continuity::model_output(&pool, run, "large", Role::Agent, Some(order), &output, 2000)
+            .await
+            .unwrap();
+    assert_eq!(replay["full_output"], view["full_output"]);
+    assert_eq!(
+        sqlx::query_scalar::<_, Value>(
+            "SELECT outcome FROM execution_actions WHERE run_id=$1 AND call_id='large'"
+        )
+        .bind(run)
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        output
+    );
+    let handler_output = json!({"ok":true,"result":{"private_plan":"Handler scope, never Agent"}});
+    sqlx::query("INSERT INTO execution_actions(run_id,call_id,request,outcome) VALUES($1,'handler','{}',$2)").bind(run).bind(&handler_output).execute(&pool).await.unwrap();
+    continuity::model_output(
+        &pool,
+        run,
+        "handler",
+        Role::Handler,
+        None,
+        &handler_output,
+        1000,
+    )
+    .await
+    .unwrap();
+    agent.work_order_id = Some(order);
+    assert!(
+        continuity::read_output(
+            &pool,
+            run,
+            &agent,
+            &json!({"id":workspace::effect_key(run,"output:handler")})
+        )
+        .await
+        .is_err()
+    );
+    let body =
+        json!({"content":[{"text":json!({"items":[{"id":"last-owned-record"}]}).to_string()}]})
+            .to_string();
+    let written=workspace::put_artifact(&pool,&agent,&json!({"request_id":Uuid::new_v4(),"name":"owned-large.json","media_type":"application/json","content":body}),false).await.unwrap();
+    let artifact = written["artifact"]["id"].clone();
+    let selected=workspace::read_artifact(&pool,&agent,&json!({"artifact_id":artifact,"format":"json","pointer":"/content/0/text/items","limit":300000})).await.unwrap();
+    assert_eq!(selected["value"][0]["id"], "last-owned-record");
+    assert_eq!(selected["original_preserved"], true);
+    agent.work_order_id = Some(Uuid::new_v4());
+    assert!(
+        workspace::read_artifact(
+            &pool,
+            &agent,
+            &json!({"artifact_id":artifact,"format":"json"})
+        )
+        .await
+        .is_err()
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires the isolated compose.verify.yaml PostgreSQL database"]
 async fn mcp_preparation_receipts_are_immutable_and_do_not_promote_failed_evidence() {
     use echelon_core::harness::{self, Evidence};
     let pool = PgPoolOptions::new()

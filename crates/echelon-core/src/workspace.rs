@@ -298,22 +298,40 @@ pub async fn read_artifact(pool: &PgPool, a: &Claims, input: &Value) -> AppResul
         artifact_id: Uuid,
         offset: Option<usize>,
         limit: Option<usize>,
+        format: Option<String>,
+        pointer: Option<String>,
     }
     let r: Read = serde_json::from_value(input.clone()).map_err(|_| bad())?;
-    if r.offset.is_some_and(|v| v > 1048576) || r.limit.is_some_and(|v| v == 0 || v > 16000) {
-        return Err(bad());
-    }
     let value = artifact(pool, a, r.artifact_id).await?;
     if let Some(masked) = crate::credentials::model_view(&value) {
         return Ok(masked);
     }
-    if r.offset.is_none() && r.limit.is_none() {
-        return Ok(value);
+    if r.format.as_deref() == Some("json") {
+        let content = value["content"].as_str().ok_or_else(bad)?;
+        let data: Value = serde_json::from_str(content).map_err(|_| bad())?;
+        let mut page = crate::continuity::page(
+            &data,
+            r.pointer.as_deref().unwrap_or(""),
+            "json",
+            r.offset.unwrap_or(0),
+            r.limit,
+        )?;
+        page["artifact"] = value["artifact"].clone();
+        page["pointer"] = json!(r.pointer.unwrap_or_default());
+        page["original_preserved"] = json!(true);
+        return Ok(page);
+    }
+    if r.format.as_deref().is_some_and(|f| f != "text")
+        || r.pointer.as_ref().is_some_and(|p| !p.is_empty())
+    {
+        return Err(bad());
     }
     Ok(artifact_preview(
         value,
         r.offset.unwrap_or(0),
-        r.limit.unwrap_or(4000),
+        r.limit
+            .unwrap_or(4000)
+            .clamp(1, crate::continuity::TEXT_PAGE),
     ))
 }
 fn artifact_preview(value: Value, offset: usize, limit: usize) -> Value {

@@ -632,7 +632,7 @@ impl OAuthService {
             .ok_or_else(|| AppError::bad("model_catalog_invalid"))?;
         Ok(
             json!({"models":models.iter().filter(|m|m["visibility"]=="list").map(|m|json!({
-            "slug":m["slug"],"display_name":m["display_name"]})).collect::<Vec<_>>()}),
+            "slug":m["slug"],"display_name":m["display_name"],"context_window":m["context_window"].as_u64().or_else(||m["max_context_window"].as_u64()),"max_output_tokens":m["max_output_tokens"].as_u64()})).collect::<Vec<_>>()}),
         )
     }
 
@@ -696,14 +696,8 @@ impl OAuthService {
         input: &[Value],
         tools: Value,
     ) -> AppResult<ModelReply> {
-        if model.is_empty()
-            || model.len() > 160
-            || serde_json::to_vec(input)
-                .map_err(|_| AppError::bad("invalid_inference_input"))?
-                .len()
-                > 262144
-        {
-            return Err(AppError::bad("inference_input_budget_exceeded"));
+        if model.is_empty() || model.len() > 160 {
+            return Err(AppError::bad("invalid_model"));
         }
         let record = self.fresh_record(id, None, false).await?;
         if !record.plan_enabled() {

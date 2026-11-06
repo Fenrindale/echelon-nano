@@ -152,9 +152,6 @@ pub async fn infer(
     tools: Value,
 ) -> AppResult<ModelReply> {
     if let Some(id) = id.strip_prefix("api:") {
-        if serde_json::to_vec(input).map_err(|_| bad())?.len() > 262144 {
-            return Err(AppError::bad("inference_input_budget_exceeded"));
-        }
         let (key, generation) =
             credential(s, tenant, Uuid::parse_str(id).map_err(|_| bad())?).await?;
         let response=crate::persistence::inference_client().map_err(|_|AppError::internal("provider_client_failed"))?.post("https://api.openai.com/v1/responses").bearer_auth(key.api_key).json(&json!({"model":model,"instructions":instructions,"input":input,"tools":tools,"tool_choice":"required","parallel_tool_calls":true,"store":false,"stream":true,"include":["reasoning.encrypted_content"]})).send().await.map_err(crate::persistence::transport_error)?;

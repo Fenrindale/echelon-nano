@@ -209,10 +209,11 @@ pub async fn read(pool: &PgPool, a: &Claims, input: &Value) -> AppResult<Value> 
     if !matches!(a.role, Role::Handler | Role::Agent) {
         return Err(AppError::forbidden("role_denied"));
     }
-    let r: Read = serde_json::from_value(input.clone()).map_err(|_| invalid())?;
-    if !(0..=100000).contains(&r.receipt_offset) || !(1..=16).contains(&r.receipt_limit) {
+    let mut r: Read = serde_json::from_value(input.clone()).map_err(|_| invalid())?;
+    if !(0..=100000).contains(&r.receipt_offset) {
         return Err(invalid());
     }
+    r.receipt_limit = r.receipt_limit.clamp(1, 16);
     if a.role == Role::Agent && a.work_order_id != Some(r.work_order_id) {
         return Err(missing());
     }
