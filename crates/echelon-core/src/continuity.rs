@@ -286,7 +286,7 @@ async fn list_outputs(pool: &PgPool, run: Uuid, a: &Claims, input: &Value) -> Ap
     }
     let limit = q.limit.unwrap_or(20).clamp(1, 100);
     let offset = q.offset.unwrap_or(0);
-    let rows=sqlx::query("SELECT x.id,x.call_id,x.sha256,x.role,x.work_order_id,a.request->>'tool' AS tool FROM execution_output_refs x JOIN execution_actions a USING(run_id,call_id) WHERE x.run_id=$1 AND ((x.role=$2 AND ($2<>'agent' OR x.work_order_id=$3)) OR ($2='handler' AND x.role='agent')) AND ($4::text IS NULL OR a.request->>'tool'=$4) ORDER BY x.created_at,x.id OFFSET $5 LIMIT $6")
+    let rows=sqlx::query("SELECT x.id,x.call_id,x.sha256,x.role,x.work_order_id,a.request->>'tool' AS tool FROM execution_output_refs x JOIN execution_actions a USING(run_id,call_id) WHERE x.run_id=$1 AND ((x.role=$2 AND ($2<>'agent' OR x.work_order_id=$3)) OR ($2='handler' AND x.role='agent')) AND ($4::text IS NULL OR a.request->>'tool'=$4) AND ($4='run.output' OR a.request->>'tool' IS DISTINCT FROM 'run.output') ORDER BY x.created_at,x.id OFFSET $5 LIMIT $6")
         .bind(run).bind(role_name(a.role)).bind(a.work_order_id).bind(q.tool).bind(offset).bind(limit+1).fetch_all(pool).await.map_err(db)?;
     let refs:Vec<_>=rows.iter().take(limit as usize).map(|r|json!({"id":r.get::<Uuid,_>("id"),"call_id":r.get::<String,_>("call_id"),"sha256":r.get::<String,_>("sha256"),"role":r.get::<String,_>("role"),"work_order_id":r.get::<Option<Uuid>,_>("work_order_id"),"tool":r.get::<Option<String>,_>("tool")})).collect();
     Ok(
