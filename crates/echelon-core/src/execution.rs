@@ -157,6 +157,8 @@ struct Checkpoint {
     #[serde(default)]
     supervised_at: u64,
     #[serde(default)]
+    monitor: crate::supervision::Monitor,
+    #[serde(default)]
     progress_receipts: BTreeSet<String>,
     #[serde(default)]
     last_tool: Value,
@@ -238,6 +240,7 @@ impl Checkpoint {
             refresh_return: String::new(),
             agent_actions: 0,
             supervised_at: 0,
+            monitor: Default::default(),
             progress_receipts: BTreeSet::new(),
             last_tool: Value::Null,
             recall: false,
@@ -292,6 +295,9 @@ impl Checkpoint {
         match self.role() {
             Role::Agent => format!("agent:{:?}", self.order),
             Role::Analyst => format!("analyst:{}:{}", self.context_generation, self.phase),
+            Role::Handler if self.phase == "supervise" => {
+                format!("handler:supervise:{:?}", self.order)
+            }
             Role::Handler => "handler".into(),
             Role::Master => "master".into(),
         }
@@ -336,6 +342,13 @@ impl Checkpoint {
         }
         if self.role() == Role::Handler {
             seed["task_working_state"] = self.memory.view();
+            if self.phase == "supervise" {
+                seed["supervision_trigger"] = json!({"reason":self.monitor.reason(unix_time(),self.supervised_at),"last_tool":self.last_tool,"heartbeat_seconds":crate::supervision::HEARTBEAT_SECONDS});
+                let notes: Vec<_> = self.memory.notes.iter().rev().take(6).cloned().collect();
+                seed["task_working_state"]["notes"] =
+                    json!(notes.into_iter().rev().collect::<Vec<_>>());
+                seed["task_working_state"]["notes_total"] = json!(self.memory.notes.len());
+            }
             seed["last_tool"] = self.last_tool.clone();
             seed["resolved_evidence"] = json!(self.resolved_evidence.iter().map(|e|json!({"reference":e["reference"],"title":e["document"]["title"],"content_excerpt":e["document"]["content"].as_str().unwrap_or("").chars().take(1200).collect::<String>(),"sources":e["document"]["sources"],"live_notice_at_resolution":e["live_notice"],"note":"Pinned reference previously resolved in this run. Reuse it; resolve again only for omitted detail or a changed live notice."})).collect::<Vec<_>>());
             seed["inspected_credential_bundles"] = json!(self.inspected_bundles);
@@ -1027,9 +1040,14 @@ async fn run(s: &AppState, id: Uuid) -> AppResult<()> {
             if p.automatic
                 && p.phase == "agent"
                 && !p.recall
-                && (p.agent_actions >= 8
-                    || p.supervised_at > 0 && unix_time().saturating_sub(p.supervised_at) >= 120)
+                && p.monitor.reason(unix_time(), p.supervised_at).is_some()
             {
+                let reason = p
+                    .monitor
+                    .reason(unix_time(), p.supervised_at)
+                    .unwrap_or("heartbeat")
+                    .to_string();
+                p.monitor.triggered(reason.clone());
                 archive_context(&s.pool, id, &p).await?;
                 p.advance("supervise");
                 p.agent_actions = 0;
@@ -1040,7 +1058,7 @@ async fn run(s: &AppState, id: Uuid) -> AppResult<()> {
                     id,
                     Role::Handler,
                     "handler.supervision",
-                    json!({"work_order_id":p.order,"reason":"progress_boundary"}),
+                    json!({"work_order_id":p.order,"reason":reason}),
                 )
                 .await?;
                 continue;
@@ -1359,6 +1377,7 @@ async fn run(s: &AppState, id: Uuid) -> AppResult<()> {
             p.last_tool = crate::harness::tool_summary(&call.tool, &call.call_id, &output);
             if role == Role::Agent {
                 p.agent_actions += 1;
+                p.monitor.observe(&call.tool, &call.input, &output);
             }
         }
         sqlx::query("UPDATE execution_actions SET outcome=$3 WHERE run_id=$1 AND call_id=$2 AND outcome IS NULL").bind(id).bind(&call.call_id).bind(&output).execute(&s.pool).await.map_err(db)?;
@@ -1454,6 +1473,15 @@ fn validation_hint(code: &str) -> &str {
         }
         "invalid_work_input" => {
             "Follow the offered Work Order schema, exact granted evidence refs and artifact IDs; include actual output artifacts for file tasks."
+        }
+        "execution_result_required" => {
+            "Collect the CURRENT Work Order with work_order.read {} before replanning or finishing. An earlier Agent/supervision read does not collect its completed result. This is not a call or Work Order limit."
+        }
+        "handler_contract_required" => {
+            "Finalize the full contract with run.configure_contract before task.plan after replanning. Preserve the original completion conditions."
+        }
+        "work_order_budget_exceeded" => {
+            "The explicit positive Work Order limit is reached. Inspect the actual contract and used count; never misreport an unlimited zero setting as exhausted."
         }
         _ => {
             "Correct the specific rejected arguments within the role and Task scope; if the task cannot be completed, use the offered blocked or input-request result path."
@@ -1787,7 +1815,14 @@ fn harness_instructions(p: &Checkpoint) -> String {
     } else {
         ""
     };
-    format!("{common}{role}{postprocess}")
+    let handoff = if p.role() == Role::Handler {
+        " For each new agent.delegate, select needed prior Task artifacts in input_artifacts:[EXACT_ARTIFACT_UUID] and protected Agent outputs in input_outputs:[EXACT_OUTPUT_UUID]. These are server-validated, hash-pinned inputs, not tool/credential permission expansion. Owned artifact/output UUIDs explicitly mentioned in your objective/expected_output are also pinned automatically to prevent missing grants. A completed previous Work Order is not automatically readable by the next Agent: inspect the issued contract.handoff_artifacts/input_outputs manifest. Never send nonexistent or foreign-Task references. In collect, work_order.read must first collect the CURRENT order, even if you read an earlier order or supervised this Agent previously. execution_result_required means collect first; only work_order_budget_exceeded means an actual positive Work Order limit."
+    } else if p.role() == Role::Agent {
+        " Your contract.handoff_artifacts and input_outputs are exact granted prior results: read them using artifact.read or run.output rather than repeating a business query. A json_escaped projection contains reversible JSON text in json; decode once conceptually to see NUL characters. Original bytes/hashes are preserved. Normal progress does not require Handler interruption. Use task.observe needs_handler:true only for a new important finding or a decision needing Handler direction; false/omitted for routine progress. Repeated tool failures/unchanged reads and the ten-minute heartbeat may request supervision."
+    } else {
+        ""
+    };
+    format!("{common}{role}{postprocess}{handoff}")
 }
 fn validate_input_request(p: &Checkpoint, input: &Value) -> AppResult<()> {
     if input["can_continue"] != false
@@ -2160,10 +2195,10 @@ fn prepare(run_id: Uuid, c: &StartRun, p: &mut Checkpoint, call: &Call) -> AppRe
             }
         }
         "run.replan" => {
-            if !p.collected
-                || p.task_contract.max_work_orders > 0
-                    && p.orders >= p.task_contract.max_work_orders
-            {
+            if !p.collected {
+                return Err(conflict("execution_result_required"));
+            }
+            if p.task_contract.max_work_orders > 0 && p.orders >= p.task_contract.max_work_orders {
                 return Err(conflict("work_order_budget_exceeded"));
             }
             p.results.push(if p.collected_order.is_null() {json!({"work_order_id":p.order,"result":p.result,"source":"server.collected_result"})} else {p.collected_order.clone()});
@@ -2195,6 +2230,7 @@ fn prepare(run_id: Uuid, c: &StartRun, p: &mut Checkpoint, call: &Call) -> AppRe
             p.response_repairs = 0;
             p.agent_actions = 0;
             p.supervised_at = unix_time();
+            p.monitor.reset();
             p.advance("agent");
             p.history.push(json!({"role":"user","content":json!({"source":"server.handler_direction","decision":decision,"message":message,"instruction":if p.recall {"Poll or cancel already-started sandbox jobs, then return an honest partial/blocked result with existing receipts. Do not start additional actions."} else {"Continue the existing Work Order with this course correction. Existing grants are unchanged; do not repeat confirmed effects."}}).to_string()}));
             return Ok(json!({"supervised":true,"decision":decision}));
@@ -2544,6 +2580,7 @@ async fn execute_read_batch(
         p.last_tool = crate::harness::tool_summary(&call.tool, &call.call_id, &value);
         if p.role() == Role::Agent {
             p.agent_actions += 1;
+            p.monitor.observe(&call.tool, &call.input, &value);
         }
         event(&s.pool,id,p.role(),if value["ok"]==true {"tool.completed"}else{"tool.failed"},json!({"phase":p.phase,"tool":call.tool,"call_id":call.call_id,"batch":true,"batch_id":batch_id,"error":value["error"]})).await?;
     }
@@ -2799,6 +2836,7 @@ fn apply_result(p: &mut Checkpoint, call: &Call, value: &Value) -> AppResult<()>
             p.recall = false;
             p.agent_actions = 0;
             p.supervised_at = unix_time();
+            p.monitor.reset();
             p.advance("agent");
         }
         "work_order.read" if p.phase == "agent" => {
@@ -3041,10 +3079,17 @@ mod tests {
         p.history =
             vec![json!({"type":"function_call_output","call_id":"agent-only","output":"{}"})];
         p.advance("supervise");
-        assert_eq!(p.history.len(), 1);
-        assert_eq!(p.history[0]["call_id"], "paired");
+        assert!(p.history.is_empty());
+        assert_eq!(p.sessions["handler"][0]["call_id"], "paired");
+        p.history =
+            vec![json!({"type":"function_call_output","call_id":"supervisor-only","output":"{}"})];
         p.advance("agent");
         assert_eq!(p.history[0]["call_id"], "agent-only");
+        p.advance("supervise");
+        assert_eq!(p.history[0]["call_id"], "supervisor-only");
+        p.advance("collect");
+        assert_eq!(p.history[0]["call_id"], "paired");
+        p.advance("agent");
         p.recall = true;
         assert!(!offered(&p).contains(&"shell.exec"));
         assert!(!offered(&p).contains(&"run.work"));
@@ -3087,6 +3132,51 @@ mod tests {
         assert!(p.resolved.contains(&reference));
         assert_eq!(p.resolved_evidence, vec![value]);
         assert_eq!(p.goal, "Original business goal");
+    }
+    #[test]
+    fn replan_distinguishes_uncollected_results_from_positive_order_limits() {
+        let c = StartRun {
+            request_id: Uuid::new_v4(),
+            tenant_id: Uuid::new_v4(),
+            task_id: Uuid::new_v4(),
+            connection_id: "owned".into(),
+            model: "owned".into(),
+            target: "owned:replan".into(),
+            max_calls: 48,
+            max_total_tokens: 0,
+            mode: "work".into(),
+            protocol_id: None,
+            protocol_version: None,
+            parameters: Value::Null,
+            retain_knowledge: false,
+            dream_after: false,
+            prepared_pack_id: None,
+            eager_context: false,
+            auto_configure: false,
+        };
+        let mut p = Checkpoint::new("Preserve the original goal".into());
+        p.phase = "collect".into();
+        p.orders = 99;
+        p.task_contract.max_work_orders = 0;
+        let call = Call {
+            call_id: "owned-replan".into(),
+            tool: "run.replan".into(),
+            input: json!({"reason":"Continue"}),
+        };
+        assert_eq!(
+            prepare(Uuid::new_v4(), &c, &mut p, &call).unwrap_err().code,
+            "execution_result_required"
+        );
+        p.collected = true;
+        p.task_contract.max_work_orders = 99;
+        assert_eq!(
+            prepare(Uuid::new_v4(), &c, &mut p, &call).unwrap_err().code,
+            "work_order_budget_exceeded"
+        );
+        p.task_contract.max_work_orders = 0;
+        prepare(Uuid::new_v4(), &c, &mut p, &call).unwrap();
+        assert_eq!(p.phase, "delegate");
+        assert_eq!(p.goal, "Preserve the original goal");
     }
     #[test]
     fn automatic_finish_requires_goal_evidence_and_continuation_review() {

@@ -25,6 +25,175 @@ fn actor(tenant: Uuid, task: Uuid, role: Role) -> Claims {
 
 #[tokio::test]
 #[ignore = "requires the isolated compose.verify.yaml PostgreSQL database"]
+async fn handoff_pins_only_owned_selected_inputs_and_nul_views_survive_jsonb() {
+    use echelon_core::continuity;
+    let pool = PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&std::env::var("DATABASE_URL").unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT current_database()")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        "echelon_verification"
+    );
+    sqlx::migrate!("../../migrations").run(&pool).await.unwrap();
+    let tenant = Uuid::new_v4();
+    let task = Uuid::new_v4();
+    let other = Uuid::new_v4();
+    let run = Uuid::new_v4();
+    sqlx::query("INSERT INTO tenants(id,name) VALUES($1,'Owned handoff fixture')")
+        .bind(tenant)
+        .execute(&pool)
+        .await
+        .unwrap();
+    for id in [task, other] {
+        sqlx::query("INSERT INTO tasks(id,tenant_id,goal,contract) VALUES($1,$2,'Owned handoff','{\"max_work_orders\":0,\"allowed_tools\":[\"artifact.write\"]}')").bind(id).bind(tenant).execute(&pool).await.unwrap();
+    }
+    let handler = actor(tenant, task, Role::Handler);
+    let first=work::delegate(&pool,&handler,&json!({"target":"owned:handoff","objective":"Create original","expected_output":"Original evidence"})).await.unwrap();
+    let first_id: Uuid = serde_json::from_value(first["work_order_id"].clone()).unwrap();
+    let mut agent = actor(tenant, task, Role::Agent);
+    agent.work_order_id = Some(first_id);
+    let body = json!({"event":{"command":"prefix\0suffix","literal":"\\u0000"}}).to_string();
+    let file=workspace::put_artifact(&pool,&agent,&json!({"request_id":Uuid::new_v4(),"name":"evidence.json","media_type":"application/json","content":body}),false).await.unwrap();
+    let file_id: Uuid = serde_json::from_value(file["artifact"]["id"].clone()).unwrap();
+    let untouched=workspace::put_artifact(&pool,&agent,&json!({"request_id":Uuid::new_v4(),"name":"unselected.txt","media_type":"text/plain","content":"Unselected source"}),false).await.unwrap();
+    let hidden: Uuid = serde_json::from_value(untouched["artifact"]["id"].clone()).unwrap();
+    sqlx::query("INSERT INTO execution_runs(id,tenant_id,task_id,request_key,config,state,status) VALUES($1,$2,$3,$4,'{}','{}','paused')").bind(run).bind(tenant).bind(task).bind(Uuid::new_v4()).execute(&pool).await.unwrap();
+    let original = json!({"ok":true,"result":{"cursor":"PINNED_CURSOR"}});
+    sqlx::query("INSERT INTO execution_actions(run_id,call_id,request,outcome) VALUES($1,'original','{\"tool\":\"mcp.call\"}',$2)").bind(run).bind(&original).execute(&pool).await.unwrap();
+    continuity::model_output(
+        &pool,
+        run,
+        "original",
+        Role::Agent,
+        Some(first_id),
+        &original,
+        2000,
+    )
+    .await
+    .unwrap();
+    let output_id = workspace::effect_key(run, "output:original");
+    let request = json!({"request_id":Uuid::new_v4(),"target":"owned:handoff","objective":format!("Reuse file {file_id} and output {output_id}"),"expected_output":"Continue without business replay"});
+    let second = work::delegate(&pool, &handler, &request).await.unwrap();
+    let second_id: Uuid = serde_json::from_value(second["work_order_id"].clone()).unwrap();
+    assert_eq!(
+        work::delegate(&pool, &handler, &request).await.unwrap()["work_order_id"],
+        second["work_order_id"]
+    );
+    agent.work_order_id = Some(second_id);
+    assert!(
+        echelon_core::broker::order_policy(&pool, &agent)
+            .await
+            .unwrap()
+            .input_artifacts
+            .contains(&file_id)
+    );
+    assert!(workspace::artifact(&pool, &agent, hidden).await.is_err());
+    let read = workspace::read_artifact(
+        &pool,
+        &agent,
+        &json!({"artifact_id":file_id,"format":"json","pointer":"/event/command"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(read["encoding"], "json_escaped");
+    let decoded: Value = serde_json::from_str(read["json"].as_str().unwrap()).unwrap();
+    assert_eq!(decoded["value"], "prefix\0suffix");
+    sqlx::query("INSERT INTO execution_actions(run_id,call_id,request,outcome) VALUES($1,'nul-view','{}',$2)").bind(run).bind(json!({"ok":true,"result":read})).execute(&pool).await.unwrap();
+    let q = json!({"id":output_id,"pointer":"/result/cursor"});
+    assert_eq!(
+        continuity::read_output(&pool, run, &agent, &q)
+            .await
+            .unwrap()["value"],
+        "PINNED_CURSOR"
+    );
+    let index = continuity::read_output(&pool, run, &agent, &json!({"op":"list"}))
+        .await
+        .unwrap();
+    assert_eq!(index["outputs"][0]["id"], json!(output_id));
+    let sibling=work::delegate(&pool,&handler,&json!({"target":"owned:handoff","objective":"Independent work","expected_output":"No previous grants"})).await.unwrap();
+    agent.work_order_id = Some(serde_json::from_value(sibling["work_order_id"].clone()).unwrap());
+    assert!(workspace::artifact(&pool, &agent, file_id).await.is_err());
+    assert!(
+        continuity::read_output(&pool, run, &agent, &q)
+            .await
+            .is_err()
+    );
+    let foreign = actor(tenant, other, Role::Handler);
+    assert_eq!(
+        work::delegate(
+            &pool,
+            &foreign,
+            &json!({"target":"owned:handoff","input_artifacts":[file_id]})
+        )
+        .await
+        .unwrap_err()
+        .code,
+        "handoff_artifact_scope_denied"
+    );
+    assert_eq!(
+        work::delegate(
+            &pool,
+            &foreign,
+            &json!({"target":"owned:handoff","input_outputs":[output_id]})
+        )
+        .await
+        .unwrap_err()
+        .code,
+        "handoff_output_scope_denied"
+    );
+    let handler_output = json!({"ok":true,"result":{"private_plan":"Handler only"}});
+    sqlx::query("INSERT INTO execution_actions(run_id,call_id,request,outcome) VALUES($1,'handler','{}',$2)").bind(run).bind(&handler_output).execute(&pool).await.unwrap();
+    continuity::model_output(
+        &pool,
+        run,
+        "handler",
+        Role::Handler,
+        None,
+        &handler_output,
+        2000,
+    )
+    .await
+    .unwrap();
+    assert!(work::delegate(&pool,&handler,&json!({"target":"owned:handoff","input_outputs":[workspace::effect_key(run,"output:handler")]})).await.is_err());
+    assert_eq!(
+        workspace::artifact(&pool, &handler, file_id).await.unwrap()["content"],
+        body
+    );
+    let denied = Uuid::new_v4();
+    let source_order = Uuid::new_v4();
+    sqlx::query("INSERT INTO knowledge_items(id,tenant_id,category,title,external_model_allowed) VALUES($1,$2,'data','Owned restricted source',false)").bind(denied).bind(tenant).execute(&pool).await.unwrap();
+    let contract = json!({"handoff_artifacts":[{"source_policies":[{"item_id":denied}]}],"parameters":{"item_id":"not-a-uuid"}});
+    sqlx::query("INSERT INTO work_orders(id,tenant_id,task_id,target,contract) VALUES($1,$2,$3,'owned:handoff',$4)").bind(source_order).bind(tenant).bind(task).bind(contract).execute(&pool).await.unwrap();
+    agent.work_order_id = Some(source_order);
+    let restricted=workspace::put_artifact(&pool,&agent,&json!({"request_id":Uuid::new_v4(),"name":"restricted.txt","media_type":"text/plain","content":"Owned restricted derivation"}),false).await.unwrap();
+    assert_eq!(
+        work::delegate(
+            &pool,
+            &handler,
+            &json!({"target":"owned:handoff","input_artifacts":[restricted["artifact"]["id"]]})
+        )
+        .await
+        .unwrap_err()
+        .code,
+        "external_model_policy_denied"
+    );
+    assert!(
+        sqlx::query("UPDATE work_orders SET contract='{}' WHERE id=$1")
+            .bind(second_id)
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the isolated compose.verify.yaml PostgreSQL database"]
 async fn context_outputs_are_scoped_immutable_and_queryable_after_restart() {
     use echelon_core::continuity;
     let pool = PgPoolOptions::new()

@@ -43,6 +43,10 @@ struct Delegate {
     protocol_parameters: Value,
     #[serde(default)]
     step_id: Option<String>,
+    #[serde(default)]
+    input_artifacts: Vec<Uuid>,
+    #[serde(default)]
+    input_outputs: Vec<Uuid>,
 }
 
 pub async fn delegate(pool: &PgPool, a: &Claims, input: &Value) -> AppResult<Value> {
@@ -80,7 +84,24 @@ pub async fn delegate(pool: &PgPool, a: &Claims, input: &Value) -> AppResult<Val
         if row.get::<Value,_>("contract")["request"]!=*input {return Err(AppError::new(StatusCode::CONFLICT,"work_idempotency_conflict"));}
         return Ok(json!({"work_order_id":row.get::<Uuid,_>("id"),"status":row.get::<String,_>("status"),"replayed":true}));
     }
-    let policy = crate::workspace::task_contract(pool, a).await?;
+    let mut policy = crate::workspace::task_contract(pool, a).await?;
+    let (handoff, outputs) = crate::handoff::pin(
+        pool,
+        a,
+        &d.input_artifacts,
+        &d.input_outputs,
+        &format!("{} {}", d.objective, d.expected_output),
+    )
+    .await?;
+    for file in &handoff {
+        let id: Uuid = serde_json::from_value(file["id"].clone()).map_err(|_| invalid())?;
+        if !policy.input_artifacts.contains(&id) {
+            policy.input_artifacts.push(id);
+        }
+    }
+    if policy.input_artifacts.len() > 16 {
+        return Err(AppError::bad("handoff_input_limit"));
+    }
     let count: i64 =
         sqlx::query_scalar("SELECT count(*) FROM work_orders WHERE tenant_id=$1 AND task_id=$2")
             .bind(a.tenant_id)
@@ -160,7 +181,7 @@ pub async fn delegate(pool: &PgPool, a: &Claims, input: &Value) -> AppResult<Val
         Value::Null
     };
     let mcp_schemas = crate::mcp::granted_tools(pool, a.tenant_id, &policy.mcp_tools).await?;
-    let contract = json!({"mcp_schemas":mcp_schemas,"objective":d.objective,"expected_output":d.expected_output,"references":d.references,"evidence":evidence,"protocol":procedure,"input_artifacts":policy.input_artifacts,"tool_policy":policy,"request":input});
+    let contract = json!({"mcp_schemas":mcp_schemas,"objective":d.objective,"expected_output":d.expected_output,"references":d.references,"evidence":evidence,"protocol":procedure,"input_artifacts":policy.input_artifacts,"handoff_artifacts":handoff,"input_outputs":outputs,"tool_policy":policy,"request":input});
     if serde_json::to_vec(&contract).map_err(|_| invalid())?.len() > 131072 {
         return Err(AppError::bad("work_evidence_budget_exceeded"));
     }

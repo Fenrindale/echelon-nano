@@ -209,7 +209,8 @@ pub async fn order_policy(pool: &PgPool, a: &Claims) -> AppResult<TaskContract> 
     if a.role != Role::Agent {
         return Err(AppError::forbidden("role_denied"));
     }
-    let value:Value=sqlx::query_scalar("SELECT contract->'tool_policy' FROM work_orders WHERE tenant_id=$1 AND task_id=$2 AND id=$3 AND status='ready'").bind(a.tenant_id).bind(a.task_id).bind(a.work_order_id).fetch_optional(pool).await.map_err(db)?.ok_or_else(missing)?;
+    let contract:Value=sqlx::query_scalar("SELECT contract FROM work_orders WHERE tenant_id=$1 AND task_id=$2 AND id=$3 AND status='ready'").bind(a.tenant_id).bind(a.task_id).bind(a.work_order_id).fetch_optional(pool).await.map_err(db)?.ok_or_else(missing)?;
+    let value = contract["tool_policy"].clone();
     if value.is_null() {
         return Ok(TaskContract::default());
     }
@@ -228,9 +229,12 @@ pub async fn order_policy(pool: &PgPool, a: &Claims) -> AppResult<TaskContract> 
     pinned
         .secret_refs
         .retain(|id| current.secret_refs.contains(id));
-    pinned
-        .input_artifacts
-        .retain(|id| current.input_artifacts.contains(id));
+    pinned.input_artifacts.retain(|id| {
+        current.input_artifacts.contains(id)
+            || contract["handoff_artifacts"]
+                .as_array()
+                .is_some_and(|files| files.iter().any(|f| f["id"] == json!(id)))
+    });
     pinned
         .credential_bundles
         .retain(|id| current.credential_bundles.contains(id));

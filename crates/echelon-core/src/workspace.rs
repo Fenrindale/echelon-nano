@@ -339,7 +339,9 @@ fn artifact_preview(value: Value, offset: usize, limit: usize) -> Value {
     let preview = content.map(|s| s.chars().skip(offset).take(limit).collect::<String>());
     let end = offset + preview.as_ref().map_or(0, |s| s.chars().count());
     let more = content.is_some_and(|s| s.chars().count() > end);
-    json!({"artifact":value["artifact"],"content":preview,"text_readable":content.is_some(),"truncated":more,"next_offset":if more {Some(end)}else{None}})
+    crate::continuity::jsonb_projection(
+        json!({"artifact":value["artifact"],"content":preview,"text_readable":content.is_some(),"truncated":more,"next_offset":if more {Some(end)}else{None}}),
+    )
 }
 pub fn actor(tenant: Uuid, task: Uuid, role: Role) -> Claims {
     Claims {

@@ -2,6 +2,8 @@
 
 Shared knowledge and bounded work agents, built with Rust and Docker. Local beta 0.2.
 
+Work Orders pin selected prior artifacts and protected output references for explicit input handoff. Handler supervision responds to important events, repeated failures/unchanged reads and a ten-minute heartbeat. See [handoff and supervision](docs/HANDOFF_SUPERVISION.md).
+
 Analyst curates registered knowledge, Handler plans and delegates work, Agent executes a scoped Work Order, and Master audits and optimizes knowledge. Role capabilities are enforced by the server and signed, short-lived scope tokens.
 
 ## Current scope

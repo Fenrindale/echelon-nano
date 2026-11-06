@@ -209,9 +209,9 @@ pub fn page(
         let total = s.chars().count();
         let text: String = s.chars().skip(offset).take(limit).collect();
         let next = offset.saturating_add(text.chars().count());
-        return Ok(
+        return Ok(jsonb_projection(
             json!({"content":text,"total_characters":total,"offset":offset,"limit":limit,"requested_limit":requested,"truncated":next<total,"next_offset":if next<total{Some(next)}else{None}}),
-        );
+        ));
     }
     if format != "json" {
         return Err(bad());
@@ -233,9 +233,28 @@ pub fn page(
         v => (v, 1, 1),
     };
     let next = offset.saturating_add(count);
-    Ok(
+    Ok(jsonb_projection(
         json!({"value":value,"total_items":total,"offset":offset,"limit":limit,"requested_limit":requested,"truncated":next<total,"next_offset":if next<total{Some(next)}else{None}}),
-    )
+    ))
+}
+
+/// PostgreSQL JSONB cannot represent NUL. Preserve an exceptional projection
+/// losslessly as JSON text (including escaped keys), never alter source bytes.
+pub(crate) fn jsonb_projection(value: Value) -> Value {
+    fn has_nul(v: &Value) -> bool {
+        match v {
+            Value::String(s) => s.contains('\0'),
+            Value::Array(a) => a.iter().any(has_nul),
+            Value::Object(m) => m.iter().any(|(k, v)| k.contains('\0') || has_nul(v)),
+            _ => false,
+        }
+    }
+    let encoded = value.to_string();
+    if has_nul(&value) {
+        json!({"encoding":"json_escaped","json":encoded,"note":"Decode json once for the exact selected value, including NUL. Original artifact/output bytes and hash are unchanged."})
+    } else {
+        value
+    }
 }
 
 pub async fn read_output(pool: &PgPool, run: Uuid, a: &Claims, input: &Value) -> AppResult<Value> {
@@ -243,13 +262,46 @@ pub async fn read_output(pool: &PgPool, run: Uuid, a: &Claims, input: &Value) ->
         return list_outputs(pool, run, a, input).await;
     }
     let q: Query = serde_json::from_value(input.clone()).map_err(|_| bad())?;
-    let row=sqlx::query("SELECT x.role,x.work_order_id,x.sha256,a.outcome FROM execution_output_refs x JOIN execution_actions a USING(run_id,call_id) JOIN execution_runs r ON r.id=x.run_id WHERE x.id=$1 AND x.run_id=$2 AND r.tenant_id=$3 AND r.task_id=$4")
-        .bind(q.id).bind(run).bind(a.tenant_id).bind(a.task_id).fetch_optional(pool).await.map_err(db)?.ok_or_else(||AppError::forbidden("output_scope_denied"))?;
+    let owned: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM execution_runs WHERE id=$1 AND tenant_id=$2 AND task_id=$3)",
+    )
+    .bind(run)
+    .bind(a.tenant_id)
+    .bind(a.task_id)
+    .fetch_one(pool)
+    .await
+    .map_err(db)?;
+    if !owned {
+        return Err(AppError::forbidden("output_scope_denied"));
+    }
+    let row=sqlx::query("SELECT x.run_id,x.role,x.work_order_id,x.sha256,a.outcome FROM execution_output_refs x JOIN execution_actions a USING(run_id,call_id) JOIN execution_runs r ON r.id=x.run_id WHERE x.id=$1 AND r.tenant_id=$2 AND r.task_id=$3")
+        .bind(q.id).bind(a.tenant_id).bind(a.task_id).fetch_optional(pool).await.map_err(db)?.ok_or_else(||AppError::forbidden("output_scope_denied"))?;
     let role: String = row.get("role");
     let order: Option<Uuid> = row.get("work_order_id");
-    let own = role == role_name(a.role)
+    let same_run = row.get::<Uuid, _>("run_id") == run;
+    let own = same_run
+        && role == role_name(a.role)
         && (a.role != Role::Agent || order.is_some() && order == a.work_order_id);
-    if !(own || a.role == Role::Handler && role == role_name(Role::Agent)) {
+    let grant = if a.role == Role::Agent && a.work_order_id.is_some() {
+        let contract: Option<Value> = sqlx::query_scalar(
+            "SELECT contract FROM work_orders WHERE id=$1 AND tenant_id=$2 AND task_id=$3",
+        )
+        .bind(a.work_order_id)
+        .bind(a.tenant_id)
+        .bind(a.task_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(db)?;
+        contract.is_some_and(|c| {
+            crate::handoff::output_granted(&c, q.id, &row.get::<String, _>("sha256"))
+        })
+    } else {
+        false
+    };
+    if !(own
+        || same_run && a.role == Role::Handler && role == role_name(Role::Agent)
+        || grant && role == role_name(Role::Agent))
+    {
         return Err(AppError::forbidden("output_scope_denied"));
     }
     let original: Option<Value> = row.get("outcome");
@@ -286,8 +338,8 @@ async fn list_outputs(pool: &PgPool, run: Uuid, a: &Claims, input: &Value) -> Ap
     }
     let limit = q.limit.unwrap_or(20).clamp(1, 100);
     let offset = q.offset.unwrap_or(0);
-    let rows=sqlx::query("SELECT x.id,x.call_id,x.sha256,x.role,x.work_order_id,a.request->>'tool' AS tool FROM execution_output_refs x JOIN execution_actions a USING(run_id,call_id) WHERE x.run_id=$1 AND ((x.role=$2 AND ($2<>'agent' OR x.work_order_id=$3)) OR ($2='handler' AND x.role='agent')) AND ($4::text IS NULL OR a.request->>'tool'=$4) AND ($4='run.output' OR a.request->>'tool' IS DISTINCT FROM 'run.output') ORDER BY x.created_at,x.id OFFSET $5 LIMIT $6")
-        .bind(run).bind(role_name(a.role)).bind(a.work_order_id).bind(q.tool).bind(offset).bind(limit+1).fetch_all(pool).await.map_err(db)?;
+    let rows=sqlx::query("SELECT x.id,x.call_id,x.sha256,x.role,x.work_order_id,a.request->>'tool' AS tool FROM execution_output_refs x JOIN execution_actions a USING(run_id,call_id) JOIN execution_runs r ON r.id=x.run_id WHERE r.tenant_id=$7 AND r.task_id=$8 AND ((x.run_id=$1 AND ((x.role=$2 AND ($2<>'agent' OR x.work_order_id=$3)) OR ($2='handler' AND x.role='agent'))) OR ($2='agent' AND x.role='agent' AND EXISTS(SELECT 1 FROM work_orders w CROSS JOIN LATERAL jsonb_array_elements(COALESCE(w.contract->'input_outputs','[]')) g WHERE w.id=$3 AND w.tenant_id=$7 AND w.task_id=$8 AND g->>'id'=x.id::text AND g->>'sha256'=x.sha256))) AND ($4::text IS NULL OR a.request->>'tool'=$4) AND ($4='run.output' OR a.request->>'tool' IS DISTINCT FROM 'run.output') ORDER BY x.created_at,x.id OFFSET $5 LIMIT $6")
+        .bind(run).bind(role_name(a.role)).bind(a.work_order_id).bind(q.tool).bind(offset).bind(limit+1).bind(a.tenant_id).bind(a.task_id).fetch_all(pool).await.map_err(db)?;
     let refs:Vec<_>=rows.iter().take(limit as usize).map(|r|json!({"id":r.get::<Uuid,_>("id"),"call_id":r.get::<String,_>("call_id"),"sha256":r.get::<String,_>("sha256"),"role":r.get::<String,_>("role"),"work_order_id":r.get::<Option<Uuid>,_>("work_order_id"),"tool":r.get::<Option<String>,_>("tool")})).collect();
     Ok(
         json!({"outputs":refs,"offset":offset,"next_offset":if rows.len()>limit as usize{Some(offset.saturating_add(limit))}else{None},"note":"Scoped original-output index. Query a listed id and a narrow pointer for detail."}),
@@ -321,6 +373,20 @@ pub fn recent_pairs(history: &[Value], pairs: usize) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn nul_projection_is_reversible_without_corrupting_or_reencoding_sources() {
+        let original = json!({"data":{"nul\0key":"literal \\u0000 plus actual \0 end"}});
+        let hash = workspace::digest(original.to_string().as_bytes());
+        let p = page(&original, "/data", "json", 0, None).unwrap();
+        assert_eq!(p["encoding"], "json_escaped");
+        let decoded: Value = serde_json::from_str(p["json"].as_str().unwrap()).unwrap();
+        assert_eq!(decoded["value"], original["data"]);
+        assert_eq!(jsonb_projection(p.clone()), p);
+        let text = page(&json!("a\0b"), "", "text", 1, None).unwrap();
+        let decoded: Value = serde_json::from_str(text["json"].as_str().unwrap()).unwrap();
+        assert_eq!(decoded["content"], "\0b");
+        assert_eq!(hash, workspace::digest(original.to_string().as_bytes()));
+    }
     #[test]
     fn large_output_view_never_changes_original_and_queries_encoded_json() {
         let original = json!({"ok":true,"result":{"content":[{"text":json!({"items":(0..5000).map(|i|json!({"id":i,"text":"evidence ".repeat(10)})).collect::<Vec<_>>()}).to_string()}]}});

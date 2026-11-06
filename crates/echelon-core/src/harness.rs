@@ -349,7 +349,10 @@ pub fn schema(tool: &str) -> Value {
         }
         "task.plan" => json!({"steps":strings(),"risks":strings()}),
         "agent.delegate" => {
-            json!({"objective":string(),"expected_output":string(),"step_id":string(),"references":{"type":"array","items":object()}})
+            json!({"objective":string(),"expected_output":string(),"step_id":string(),"input_artifacts":strings(),"input_outputs":strings(),"references":{"type":"array","items":object()}})
+        }
+        "task.observe" => {
+            json!({"observation":string(),"evidence":{"type":"array","items":object()},"needs_handler":{"type":"boolean","description":"True only for a new important finding or a decision requiring Handler direction; ordinary progress stays false."}})
         }
         "work_order.read" => {
             json!({"work_order_id":string(),"receipt_offset":{"type":"integer","minimum":0,"maximum":100000},"receipt_limit":{"type":"integer","minimum":1,"maximum":16}})
