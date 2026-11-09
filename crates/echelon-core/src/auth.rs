@@ -749,6 +749,18 @@ pub struct SseProbe {
 }
 
 impl SseProbe {
+    fn failure(&mut self, value: &Value) {
+        self.failed = true;
+        let code = crate::persistence::stream_failure(value);
+        // A second empty terminal envelope must not erase a preceding quota,
+        // authentication or context error and turn it into a generic retry.
+        if self.failure_code.is_none()
+            || (self.failure_code == Some("inference_failed") && code != "inference_failed")
+        {
+            self.failure_code = Some(code);
+            self.failure_diagnostic = Some(crate::persistence::failure_diagnostic(value, None));
+        }
+    }
     pub fn feed(&mut self, chunk: &[u8]) -> AppResult<()> {
         self.total += chunk.len();
         if self.total > 2 * 1024 * 1024 {
@@ -799,11 +811,7 @@ impl SseProbe {
                     return Err(AppError::bad("inference_duplicate_completion"));
                 }
                 if value["response"]["status"] != "completed" {
-                    self.failed = true;
-                    self.failure_code = Some(crate::persistence::stream_failure(&value));
-                    self.failure_diagnostic.get_or_insert_with(|| {
-                        crate::persistence::failure_diagnostic(&value, None)
-                    });
+                    self.failure(&value);
                 }
                 self.completed = true;
                 self.usage = value["response"]["usage"].clone();
@@ -827,10 +835,7 @@ impl SseProbe {
                 }
             }
             Some("response.failed" | "response.incomplete" | "error") => {
-                self.failed = true;
-                self.failure_code = Some(crate::persistence::stream_failure(&value));
-                self.failure_diagnostic
-                    .get_or_insert_with(|| crate::persistence::failure_diagnostic(&value, None));
+                self.failure(&value);
             }
             _ => {}
         }
@@ -897,6 +902,27 @@ mod tests {
                 .unwrap()
                 .contains("private provider prose")
         );
+    }
+    #[test]
+    fn empty_terminal_failure_cannot_erase_permanent_error() {
+        for first in [true, false] {
+            let quota = json!({"type":"error","error":{"code":"insufficient_quota"}});
+            let empty =
+                json!({"type":"response.failed","response":{"status":"failed","error":null}});
+            let mut parser = SseProbe::default();
+            for event in if first {
+                [quota, empty]
+            } else {
+                [empty, quota]
+            } {
+                parser
+                    .feed(format!("data: {event}\n\n").as_bytes())
+                    .unwrap();
+            }
+            let error = parser.finish_output().unwrap_err();
+            assert_eq!(error.code, "provider_quota_exhausted");
+            assert!(crate::persistence::retry_delay(error.code, 1).is_none());
+        }
     }
     #[test]
     fn function_calls_are_released_only_after_terminal_success() {
