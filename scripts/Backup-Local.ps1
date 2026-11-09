@@ -52,10 +52,15 @@ try{
   try{
    & docker compose -f compose.verify.yaml up -d database
    if($LASTEXITCODE -ne 0){throw 'Isolated restore database startup failed.'}
-   for($attempt=0;$attempt -lt 30;$attempt++){& docker compose -f compose.verify.yaml exec -T database pg_isready -U verifier -d echelon_verification *> $null;if($LASTEXITCODE -eq 0){break};Start-Sleep -Milliseconds 500}
-   $restoreIdentity=& docker compose -f compose.verify.yaml exec -T database psql -U verifier -d echelon_verification -Atc 'SELECT current_database()'
-   $tableCount=& docker compose -f compose.verify.yaml exec -T database psql -U verifier -d echelon_verification -Atc "SELECT count(*) FROM pg_tables WHERE schemaname='public'"
-   if("$restoreIdentity".Trim() -ne 'echelon_verification' -or [long]("$tableCount".Trim()) -ne 0){throw 'Restore target must be the empty isolated verification database.'}
+   # The image's temporary init server accepts local sockets before restarting;
+   # wait for the final TCP listener rather than racing that shutdown.
+   $restoreReady=$false
+   for($attempt=0;$attempt -lt 60;$attempt++){& docker compose -f compose.verify.yaml exec -T database pg_isready -h 127.0.0.1 -U verifier -d echelon_verification *> $null;if($LASTEXITCODE -eq 0){$restoreReady=$true;break};Start-Sleep -Milliseconds 500}
+   if(-not $restoreReady){throw 'Isolated restore database did not become ready.'}
+   $restoreIdentity=& docker compose -f compose.verify.yaml exec -T database psql -h 127.0.0.1 -U verifier -d echelon_verification -Atc 'SELECT current_database()'
+   if($LASTEXITCODE -ne 0){throw 'Could not verify isolated restore identity.'}
+   $tableCount=& docker compose -f compose.verify.yaml exec -T database psql -h 127.0.0.1 -U verifier -d echelon_verification -Atc "SELECT count(*) FROM pg_tables WHERE schemaname='public'"
+   if($LASTEXITCODE -ne 0 -or "$restoreIdentity".Trim() -ne 'echelon_verification' -or "$tableCount".Trim() -ne '0'){throw 'Restore target must be the empty isolated verification database.'}
    & docker compose -f compose.verify.yaml cp $dump database:/tmp/owned-restore.dump
    if($LASTEXITCODE -ne 0){throw 'Isolated restore archive transfer failed.'}
    & docker compose -f compose.verify.yaml exec -T database pg_restore --no-owner --no-acl --exit-on-error -U verifier -d echelon_verification /tmp/owned-restore.dump
