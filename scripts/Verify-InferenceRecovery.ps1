@@ -24,6 +24,32 @@ do {
 $null=Invoke-Echelon "/v1/operator/runs/$run/control" 'POST' @{action='pause'}
 $deadline=[DateTimeOffset]::UtcNow.AddMinutes(3)
 do {$state=Invoke-Echelon "/v1/operator/runs/$run";if($state.status -eq 'paused'){break};if($state.status -notin @('queued','running') -or [DateTimeOffset]::UtcNow -gt $deadline){throw 'Pause after the first effect failed.'};Start-Sleep -Milliseconds 500} while($true)
+# Pause may follow a completed model response with a valid tool decision still
+# pending. Execute it normally, then pause during an isolated provider retry.
+# Never erase a committed decision to manufacture an empty checkpoint.
+$hasPending=[int](Sql-Recovery "SELECT CASE WHEN state->'pending' IS DISTINCT FROM 'null'::jsonb OR jsonb_array_length(COALESCE(state->'read_batch','[]'))>0 THEN 1 ELSE 0 END FROM execution_runs WHERE id='$run';")
+if($hasPending) {
+ $retriesBefore=[int](Sql-Recovery "SELECT count(*) FROM execution_events WHERE run_id='$run' AND kind='model.retry_scheduled';")
+ $network='echelon-nano-dragdrop-verification_provider';$core=(docker compose ps -q core).Trim();$disconnected=$false
+ function Internal-RecoveryControl([string]$Action) {
+  $payload=@{token=(Get-OperatorToken);run=$run;action=$Action}|ConvertTo-Json -Compress
+  $code='import sys,json,urllib.request; p=json.load(sys.stdin); r=urllib.request.Request("http://core:8080/v1/operator/runs/"+p["run"]+"/control",data=json.dumps({"action":p["action"]}).encode(),headers={"Authorization":"Bearer "+p["token"],"Content-Type":"application/json"}); urllib.request.urlopen(r,timeout=30).read(); print("CONTROL_OK")'
+  $out=$payload|docker compose exec -T fixture python3 -c $code
+  if($LASTEXITCODE -ne 0 -or "$out".Trim() -ne 'CONTROL_OK'){throw 'Internal owned control failed.'}
+ }
+ try {
+  docker network disconnect $network $core
+  if($LASTEXITCODE -ne 0){throw 'Isolated boundary setup failed.'};$disconnected=$true
+  Internal-RecoveryControl 'resume'
+  $deadline=[DateTimeOffset]::UtcNow.AddMinutes(3)
+  do {if([int](Sql-Recovery "SELECT count(*) FROM execution_events WHERE run_id='$run' AND kind='model.retry_scheduled';") -gt $retriesBefore){break};if([DateTimeOffset]::UtcNow -gt $deadline){throw 'No isolated generation boundary was reached.'};Start-Sleep -Milliseconds 500} while($true)
+  Internal-RecoveryControl 'pause'
+  $deadline=[DateTimeOffset]::UtcNow.AddMinutes(2)
+  do {if((Sql-Recovery "SELECT status FROM execution_runs WHERE id='$run';") -eq 'paused'){break};if([DateTimeOffset]::UtcNow -gt $deadline){throw 'Boundary pause failed.'};Start-Sleep -Milliseconds 500} while($true)
+ } finally {
+  if($disconnected){docker network connect $network $core;if($LASTEXITCODE -ne 0){throw 'RESTORE FAILED: reconnect the isolated provider network.'}}
+ }
+}
 $before=Sql-Recovery "SELECT jsonb_build_object('goal',state->'goal','goals',state->'memory'->'goals','order',state->'order','phase',state->'phase','pending',state->'pending','batch',state->'read_batch','actions',(SELECT jsonb_object_agg(call_id,md5(to_jsonb(a)::text)) FROM execution_actions a WHERE run_id=r.id AND outcome IS NOT NULL)) FROM execution_runs r WHERE id='$run' AND tenant_id='$tenant' AND task_id='$task';" | ConvertFrom-Json -AsHashtable
 Check-Recovery ($null -eq $before.pending -and @($before.batch).Count -eq 0) 'A pending or unknown effect cannot be used for this fixture.'
 if($Scenario -eq 'InvalidContext') {
