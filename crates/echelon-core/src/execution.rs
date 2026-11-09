@@ -2300,9 +2300,6 @@ fn prepare(run_id: Uuid, c: &StartRun, p: &mut Checkpoint, call: &Call) -> AppRe
             return Ok(json!({"supervised":true,"decision":decision}));
         }
         "run.context_refresh" => {
-            if p.phase == "collect" {
-                p.review_goal_progress(&input)?;
-            }
             let mut criteria = input["criteria"].clone();
             crate::harness::bind_goal_tags(&p.goal, &mut criteria);
             if c.protocol_id.is_some() {
@@ -2318,6 +2315,7 @@ fn prepare(run_id: Uuid, c: &StartRun, p: &mut Checkpoint, call: &Call) -> AppRe
                 if !p.collected {
                     return Err(conflict("execution_result_required"));
                 }
+                p.review_goal_progress(&input)?;
                 p.results.push(p.collected_order.clone());
                 p.order = None;
                 p.collected = false;

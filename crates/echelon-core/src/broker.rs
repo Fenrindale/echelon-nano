@@ -620,6 +620,7 @@ pub(crate) fn worker_inputs(
         // Preserve older single-file scripts without ambiguous/prefix aliases.
         let alias = workspace::safe_name(name)
             && name != "echelon-inputs.json"
+            && !name.starts_with("echelon-inputs.json/")
             && name != "inputs"
             && !name.starts_with("inputs/")
             && names.iter().filter(|n| **n == name.as_str()).count() == 1
@@ -803,6 +804,20 @@ mod tests {
             .code,
             "worker_input_hash_mismatch"
         );
+        let content = "Reserved manifest prefix".to_owned();
+        let reserved = worker_inputs(vec![(
+            Uuid::new_v4(),
+            "echelon-inputs.json/child".into(),
+            content.clone(),
+            workspace::digest(content.as_bytes()),
+        )])
+        .unwrap();
+        assert!(
+            !reserved
+                .iter()
+                .any(|f| f.name == "echelon-inputs.json/child")
+        );
+        assert!(serde_json::from_str::<Value>(&reserved.last().unwrap().content).is_ok());
     }
     #[test]
     fn broker_echoes_are_redacted_before_storage() {
