@@ -741,6 +741,7 @@ pub struct SseProbe {
     completed: bool,
     failed: bool,
     failure_code: Option<&'static str>,
+    failure_diagnostic: Option<crate::persistence::FailureDiagnostic>,
     total: usize,
     usage: Value,
     output: Vec<Value>,
@@ -800,6 +801,9 @@ impl SseProbe {
                 if value["response"]["status"] != "completed" {
                     self.failed = true;
                     self.failure_code = Some(crate::persistence::stream_failure(&value));
+                    self.failure_diagnostic.get_or_insert_with(|| {
+                        crate::persistence::failure_diagnostic(&value, None)
+                    });
                 }
                 self.completed = true;
                 self.usage = value["response"]["usage"].clone();
@@ -825,6 +829,8 @@ impl SseProbe {
             Some("response.failed" | "response.incomplete" | "error") => {
                 self.failed = true;
                 self.failure_code = Some(crate::persistence::stream_failure(&value));
+                self.failure_diagnostic
+                    .get_or_insert_with(|| crate::persistence::failure_diagnostic(&value, None));
             }
             _ => {}
         }
@@ -841,9 +847,9 @@ impl SseProbe {
         }
         self.event()?;
         if self.failed {
-            return Err(AppError::bad(
-                self.failure_code.unwrap_or("inference_failed"),
-            ));
+            let mut error = AppError::bad(self.failure_code.unwrap_or("inference_failed"));
+            error.diagnostic = self.failure_diagnostic.take().map(Box::new);
+            return Err(error);
         }
         if !self.completed {
             return Err(AppError::bad("inference_missing_completion"));
@@ -871,6 +877,27 @@ impl SseProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn failed_stream_keeps_safe_diagnostic_but_never_releases_partial_tools() {
+        let mut parser = SseProbe::default();
+        for event in [
+            json!({"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","call_id":"must-not-run","name":"shell__exec","arguments":"{}"}}),
+            json!({"type":"response.failed","response":{"status":"failed","error":{"code":"invalid_encrypted_content","message":"private provider prose"},"usage":{"input_tokens":9,"output_tokens":1,"total_tokens":10}}}),
+        ] {
+            parser
+                .feed(format!("data: {event}\n\n").as_bytes())
+                .unwrap();
+        }
+        let error = parser.finish_output().unwrap_err();
+        assert_eq!(error.code, "inference_context_invalid");
+        let d = error.diagnostic.unwrap();
+        assert_eq!(d.usage()["total_tokens"], 10);
+        assert!(
+            !serde_json::to_string(&d)
+                .unwrap()
+                .contains("private provider prose")
+        );
+    }
     #[test]
     fn function_calls_are_released_only_after_terminal_success() {
         let call = json!({"type":"function_call","name":"invoke","namespace":"echelon","call_id":"synthetic","arguments":"{}"});

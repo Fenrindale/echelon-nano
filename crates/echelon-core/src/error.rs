@@ -10,11 +10,20 @@ use serde_json::json;
 pub struct AppError {
     pub status: StatusCode,
     pub code: &'static str,
+    pub diagnostic: Option<Box<crate::persistence::FailureDiagnostic>>,
 }
 
 impl AppError {
     pub fn new(status: StatusCode, code: &'static str) -> Self {
-        Self { status, code }
+        Self {
+            status,
+            code,
+            diagnostic: None,
+        }
+    }
+    pub fn with_diagnostic(mut self, diagnostic: crate::persistence::FailureDiagnostic) -> Self {
+        self.diagnostic = Some(Box::new(diagnostic));
+        self
     }
     pub fn internal(code: &'static str) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, code)

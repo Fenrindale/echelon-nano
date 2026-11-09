@@ -8,6 +8,8 @@ Analyst curates registered knowledge, Handler plans and delegates work, Agent ex
 
 ## Current scope
 
+Model-only generation failures retain safe structural diagnostics and reported usage, without provider prose or private reasoning. After bounded retries of an unexplained failure, the engine archives the original conversation and rebuilds context from the unchanged goal, scoped Work Order and confirmed receipts. Explicitly resuming a failed generation also repairs its context. Repair never replays completed business effects or unknown tool outcomes; authentication, quota and content-policy failures remain separately classified. See [generation recovery](docs/INFERENCE_RECOVERY.md).
+
 The first beta includes all four roles, Data/Info/Intel knowledge, immutable revisions and failure history, pinned Context Packs, scoped Work Orders, artifact recovery, pause/cancel/explicit resume, and separate knowledge retention and Master audit stages.
 
 Master reviews activity and repetition, proposes versioned merges/splits/revisions and protocols, and queues separate verification requests. Semantic changes go through operator review; exact duplicates can be linked without deleting either original. Active protocols load their pinned information sets directly and use a tenant- and policy-aware cache.

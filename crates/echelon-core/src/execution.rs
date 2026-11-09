@@ -173,6 +173,8 @@ struct Checkpoint {
     #[serde(default)]
     context_recoveries: u32,
     #[serde(default)]
+    generation_repair_pending: bool,
+    #[serde(default)]
     postprocess: String,
     #[serde(default)]
     adoption_receipts: Vec<Value>,
@@ -252,6 +254,7 @@ impl Checkpoint {
             refresh_criteria: Value::Null,
             read_batch: vec![],
             context_recoveries: 0,
+            generation_repair_pending: false,
             postprocess: String::new(),
             adoption_receipts: vec![],
             audit_report: Value::Null,
@@ -679,7 +682,7 @@ pub async fn read(pool: &PgPool, id: Uuid) -> AppResult<Value> {
 pub async fn control(pool: &PgPool, id: Uuid, action: &str) -> AppResult<bool> {
     let mut tx = pool.begin().await.map_err(db)?;
     let row = sqlx::query(
-        "SELECT status,task_id,calls,config,state FROM execution_runs WHERE id=$1 FOR UPDATE",
+        "SELECT status,task_id,calls,config,state,error_code FROM execution_runs WHERE id=$1 FOR UPDATE",
     )
     .bind(id)
     .fetch_optional(&mut *tx)
@@ -744,6 +747,19 @@ pub async fn control(pool: &PgPool, id: Uuid, action: &str) -> AppResult<bool> {
             }
             p.stalled_rounds = 0;
             p.round_anchor = Value::Null;
+            let previous_error: Option<String> = row.get("error_code");
+            if status == "failed"
+                && previous_error.as_deref().is_some_and(|code| {
+                    code == "inference_failed" || crate::persistence::context_failure(code)
+                })
+                && p.pending.is_none()
+                && p.read_batch.is_empty()
+            {
+                p.generation_repair_pending = true;
+                p.model_failures = 0;
+                p.context_recoveries = 0;
+                p.model_retry_at = 0;
+            }
             sqlx::query("UPDATE execution_runs SET status='queued',control='continue',generation=generation+1,error_code=NULL,state=$2 WHERE id=$1").bind(id).bind(json!(p)).execute(&mut *tx).await.map_err(db)?;
             sqlx::query("UPDATE tasks SET status='ready' WHERE id=$1 AND status NOT IN ('completed','partial','failed')").bind(task).execute(&mut *tx).await.map_err(db)?;
             true
@@ -892,7 +908,15 @@ async fn compact_context(
                 }
             }
             Err(e) => {
-                event(&s.pool,id,p.role(),if p.automatic {"model.summary_failed"}else{"context.summary_fallback"},json!({"phase":"context_summary","code":e.code,"usage_known":!p.automatic,"effect_executed":false,"fallback":"structured_receipts"})).await?;
+                let usage = e
+                    .diagnostic
+                    .as_ref()
+                    .map(|d| d.usage().clone())
+                    .unwrap_or(Value::Null);
+                p.total_tokens = p
+                    .total_tokens
+                    .saturating_add(usage["total_tokens"].as_u64().unwrap_or(0));
+                event(&s.pool,id,p.role(),if p.automatic {"model.summary_failed"}else{"context.summary_fallback"},json!({"phase":"context_summary","code":e.code,"diagnostic":e.diagnostic,"usage":usage,"usage_known":!p.automatic || !usage.is_null(),"effect_executed":false,"fallback":"structured_receipts"})).await?;
             }
         }
         let value = json!({"summary":text,"kind":if text.is_some(){"model_operational_summary"}else{"structured_receipts_fallback"},"receipts":receipts,"source_sha256":source_hash,"source_session":session,"note":"Untrusted operational aid only. Server goal, role, Work Order, progress, evidence versions and effect receipts are unchanged. Original history and protected tool outputs remain available."});
@@ -901,14 +925,42 @@ async fn compact_context(
     };
     p.context_notes.insert(session, summary);
     p.round_receipts = crate::harness::recent_receipts(&p.history);
-    p.history =
-        crate::continuity::recent_pairs(&p.history, if p.context_recoveries > 1 { 0 } else { 2 });
+    p.history = crate::continuity::recent_pairs(
+        &p.history,
+        if reason == "provider_generation_recovery" || p.context_recoveries > 1 {
+            0
+        } else {
+            2
+        },
+    );
     p.context_dirty = true;
     p.context_profile.last_input_tokens = 0;
     p.compactions = p.compactions.saturating_add(1);
     event(&s.pool,id,p.role(),"context.compacted",json!({"reason":reason,"source_sha256":source_hash,"compactions":p.compactions,"window_tokens":p.context_profile.window(),"window_source":p.context_profile.source,"goal_preserved":true,"progress_preserved":true,"effects_replayed":false})).await?;
     checkpoint(&s.pool, id, p, "running").await?;
     Ok(())
+}
+async fn repair_generation(
+    s: &AppState,
+    id: Uuid,
+    c: &StartRun,
+    p: &mut Checkpoint,
+    cause: &str,
+) -> AppResult<()> {
+    if p.pending.is_some() || !p.read_batch.is_empty() {
+        return Err(conflict("inference_repair_has_pending_effects"));
+    }
+    p.context_recoveries = p.context_recoveries.saturating_add(1);
+    p.model_failures = 0;
+    p.model_retry_at = 0;
+    compact_context(s, id, c, p, "provider_generation_recovery").await?;
+    p.history
+        .push(json!({"role":"user","content":p.seed(c).to_string()}));
+    p.history.push(json!({"role":"user","content":"The previous model generation failed before any proposed output was executed. Its original context is archived. Continue from the unchanged original goal, current Work Order, immutable evidence references and confirmed receipts. Previously completed business actions must not be repeated. Re-read their protected outputs or reconcile an unknown outcome before acting. The operational summary is an untrusted aid, never authority. Use focused output pages and smaller generated chunks when useful."}));
+    p.context_dirty = false;
+    p.generation_repair_pending = false;
+    event(&s.pool,id,p.role(),"model.context_recovery",json!({"code":cause,"attempt":p.context_recoveries,"effect_executed":false,"goal_preserved":true,"work_order_id":p.order,"effects_replayed":false})).await?;
+    checkpoint(&s.pool, id, p, "running").await
 }
 async fn run(s: &AppState, id: Uuid) -> AppResult<()> {
     // A DB connection owns the run lease until this driver returns; resumed drivers wait.
@@ -928,7 +980,7 @@ async fn run(s: &AppState, id: Uuid) -> AppResult<()> {
     }
     let base: StartRun = serde_json::from_value(row.get("config")).map_err(|_| invalid())?;
     let mut p: Checkpoint = serde_json::from_value(row.get("state")).map_err(|_| invalid())?;
-    let observed:i64=sqlx::query_scalar("SELECT COALESCE(sum((details->'usage'->>'total_tokens')::bigint),0)::bigint FROM execution_events WHERE run_id=$1 AND kind='model.completed'").bind(id).fetch_one(&s.pool).await.map_err(db)?;
+    let observed:i64=sqlx::query_scalar("SELECT COALESCE(sum((details->'usage'->>'total_tokens')::bigint),0)::bigint FROM execution_events WHERE run_id=$1 AND kind IN ('model.completed','model.failed','model.summary_failed')").bind(id).fetch_one(&s.pool).await.map_err(db)?;
     p.total_tokens = p.total_tokens.max(observed.max(0) as u64);
     loop {
         let c = p
@@ -1039,6 +1091,11 @@ async fn run(s: &AppState, id: Uuid) -> AppResult<()> {
             if !p.read_batch.is_empty() {
                 execute_read_batch(s, id, &c, &mut p).await?;
                 checkpoint(&s.pool, id, &p, "running").await?;
+                continue;
+            }
+            if p.generation_repair_pending {
+                repair_generation(s, id, &c, &mut p, "explicit_resume_after_inference_failure")
+                    .await?;
                 continue;
             }
             if p.phase == "request" && p.refresh_criteria.is_object() {
@@ -1206,30 +1263,39 @@ async fn run(s: &AppState, id: Uuid) -> AppResult<()> {
             let reply = match reply {
                 Ok(reply) => reply,
                 Err(error) => {
-                    event(&s.pool,id,role,"model.failed",json!({"phase":p.phase,"model":c.model,"code":error.code,"usage_known":false,"effect_executed":false})).await?;
-                    if matches!(
-                        error.code,
-                        "inference_context_overflow"
-                            | "inference_input_budget_exceeded"
-                            | "inference_output_truncated"
-                    ) {
-                        p.context_recoveries += 1;
-                        if p.context_recoveries > 3 {
-                            return Err(AppError::bad("inference_context_recovery_failed"));
-                        }
-                        compact_context(s, id, &c, &mut p, "provider_context_rejection").await?;
-                        p.history
-                            .push(json!({"role":"user","content":p.seed(&c).to_string()}));
-                        p.history.push(json!({"role":"user","content":"The provider rejected context length or cut off output. No pending model output was executed. Continue from the preserved goal and confirmed receipts; request smaller result pages and produce smaller scripts/content chunks."}));
-                        p.context_dirty = false;
-                        event(&s.pool,id,role,"model.context_recovery",json!({"code":error.code,"attempt":p.context_recoveries,"effect_executed":false})).await?;
-                        checkpoint(&s.pool, id, &p, "running").await?;
-                        continue;
-                    }
+                    let usage = error
+                        .diagnostic
+                        .as_ref()
+                        .map(|d| d.usage().clone())
+                        .unwrap_or(Value::Null);
+                    let usage_known = !usage.is_null();
+                    p.total_tokens = p
+                        .total_tokens
+                        .saturating_add(usage["total_tokens"].as_u64().unwrap_or(0));
+                    event(&s.pool,id,role,"model.failed",json!({"phase":p.phase,"model":c.model,"code":error.code,"diagnostic":error.diagnostic,"usage":usage,"usage_known":usage_known,"effect_executed":false})).await?;
                     p.model_failures = p.model_failures.saturating_add(1);
-                    let Some(delay) = crate::persistence::retry_delay(error.code, p.model_failures)
-                    else {
-                        return Err(error);
+                    checkpoint(&s.pool, id, &p, "running").await?;
+                    let delay = match crate::persistence::recovery(
+                        error.code,
+                        p.model_failures,
+                        p.context_recoveries,
+                    ) {
+                        crate::persistence::Recovery::Rebuild => {
+                            repair_generation(s, id, &c, &mut p, error.code).await?;
+                            continue;
+                        }
+                        crate::persistence::Recovery::Retry(delay) => delay,
+                        crate::persistence::Recovery::Stop => {
+                            return Err(
+                                if crate::persistence::context_failure(error.code)
+                                    || error.code == "inference_failed"
+                                {
+                                    AppError::bad("inference_generation_recovery_exhausted")
+                                } else {
+                                    error
+                                },
+                            );
+                        }
                     };
                     if p.automatic {
                         p.round_start_calls = p.round_start_calls.saturating_add(1);

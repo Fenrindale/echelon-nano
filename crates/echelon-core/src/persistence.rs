@@ -1,6 +1,61 @@
 //! Recovery policy for model generation only. Never wrap business tool execution in this policy.
 use crate::error::{AppError, AppResult};
+use serde_json::{Value, json};
 use std::{future::Future, time::Duration};
+
+/// Safe, structural failure evidence. Never retain provider prose, input, output,
+/// opaque reasoning, credentials or account identifiers in an error/event.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct FailureDiagnostic {
+    source: &'static str,
+    http_status: Option<u16>,
+    event: &'static str,
+    classification: &'static str,
+    code_sha256: Option<String>,
+    type_sha256: Option<String>,
+    message_sha256: Option<String>,
+    message_bytes: Option<usize>,
+    usage: Value,
+}
+impl FailureDiagnostic {
+    pub fn usage(&self) -> &Value {
+        &self.usage
+    }
+}
+fn error_body(value: &Value) -> &Value {
+    value
+        .pointer("/response/error")
+        .filter(|v| v.is_object())
+        .or_else(|| value.get("error").filter(|v| v.is_object()))
+        .unwrap_or(value)
+}
+pub fn failure_diagnostic(value: &Value, status: Option<u16>) -> FailureDiagnostic {
+    let error = error_body(value);
+    let hash = |v: &Value| v.as_str().map(|s| crate::workspace::digest(s.as_bytes()));
+    let usage = &value["response"]["usage"];
+    let usage = if let Some(total) = usage["total_tokens"].as_u64() {
+        json!({"total_tokens":total,"input_tokens":usage["input_tokens"].as_u64(),"output_tokens":usage["output_tokens"].as_u64()})
+    } else {
+        Value::Null
+    };
+    FailureDiagnostic {
+        source: if status.is_some() { "http" } else { "sse" },
+        http_status: status,
+        event: match value["type"].as_str() {
+            Some("response.failed") => "response.failed",
+            Some("response.incomplete") => "response.incomplete",
+            Some("response.completed") => "response.completed",
+            Some("error") => "error",
+            _ => "unknown",
+        },
+        classification: stream_failure(value),
+        code_sha256: hash(&error["code"]),
+        type_sha256: hash(&error["type"]),
+        message_sha256: hash(&error["message"]),
+        message_bytes: error["message"].as_str().map(str::len),
+        usage,
+    }
+}
 
 pub fn inference_client() -> Result<reqwest::Client, reqwest::Error> {
     reqwest::Client::builder()
@@ -41,13 +96,20 @@ pub async fn rejected(response: reqwest::Response) -> AppError {
             Some("context_length_exceeded" | "input_too_long")
         )
     {
-        return AppError::bad("inference_context_overflow");
+        return AppError::bad("inference_context_overflow")
+            .with_diagnostic(failure_diagnostic(&value, Some(status)));
     }
     let permanent_quota = matches!(
         value["error"]["code"].as_str(),
         Some("insufficient_quota" | "billing_hard_limit_reached")
     );
-    status_error(status, permanent_quota)
+    let code = stream_failure(&value);
+    let error = if code != "inference_failed" {
+        AppError::bad(code)
+    } else {
+        status_error(status, permanent_quota)
+    };
+    error.with_diagnostic(failure_diagnostic(&value, Some(status)))
 }
 
 fn status_error(status: u16, permanent_quota: bool) -> AppError {
@@ -66,12 +128,17 @@ pub fn stream_failure(value: &serde_json::Value) -> &'static str {
     if value["response"]["incomplete_details"]["reason"] == "max_output_tokens" {
         return "inference_output_truncated";
     }
-    let code = value["response"]["error"]["code"]
-        .as_str()
-        .or_else(|| value["error"]["code"].as_str())
-        .or_else(|| value["code"].as_str());
+    if value["response"]["incomplete_details"]["reason"] == "content_filter" {
+        return "inference_content_filtered";
+    }
+    let error = error_body(value);
+    let code = error["code"].as_str().or_else(|| error["type"].as_str());
     match code {
         Some("context_length_exceeded" | "input_too_long") => "inference_context_overflow",
+        Some("invalid_encrypted_content" | "invalid_encrypted_reasoning") => {
+            "inference_context_invalid"
+        }
+        Some("content_filter" | "content_policy_violation") => "inference_content_filtered",
         Some("server_error" | "internal_error" | "overloaded" | "service_unavailable") => {
             "provider_temporarily_unavailable"
         }
@@ -90,6 +157,38 @@ pub fn stream_failure(value: &serde_json::Value) -> &'static str {
         ) => "inference_rejected",
         _ => "inference_failed",
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Recovery {
+    Retry(Duration),
+    Rebuild,
+    Stop,
+}
+
+pub fn context_failure(code: &str) -> bool {
+    matches!(
+        code,
+        "inference_context_overflow"
+            | "inference_input_budget_exceeded"
+            | "inference_output_truncated"
+            | "inference_context_invalid"
+            | "inference_generation_recovery_exhausted"
+    )
+}
+/// Only call after uncommitted generation fails, with no pending/batched tool actions.
+/// A bounded context repair changes the next request instead of replaying a bad one.
+pub fn recovery(code: &str, failures: u32, repairs: u32) -> Recovery {
+    if context_failure(code) || (code == "inference_failed" && failures > 3) {
+        return if repairs < 3 {
+            Recovery::Rebuild
+        } else {
+            Recovery::Stop
+        };
+    }
+    retry_delay(code, failures)
+        .map(Recovery::Retry)
+        .unwrap_or(Recovery::Stop)
 }
 
 pub fn retry_delay(code: &str, failures: u32) -> Option<Duration> {
@@ -172,15 +271,69 @@ mod tests {
             ("insufficient_quota", "provider_quota_exhausted"),
             ("invalid_token", "provider_authentication_rejected"),
             ("context_length_exceeded", "inference_context_overflow"),
+            ("invalid_encrypted_content", "inference_context_invalid"),
+            ("content_policy_violation", "inference_content_filtered"),
             ("private-unknown-value", "inference_failed"),
         ] {
             for event in [
                 serde_json::json!({"response":{"error":{"code":code}}}),
                 serde_json::json!({"error":{"code":code}}),
+                serde_json::json!({"code":code}),
             ] {
                 assert_eq!(stream_failure(&event), expected);
             }
         }
+    }
+    #[test]
+    fn repeated_generic_failure_repairs_context_instead_of_replaying_forever() {
+        assert!(matches!(
+            recovery("inference_failed", 3, 0),
+            Recovery::Retry(_)
+        ));
+        assert_eq!(recovery("inference_failed", 4, 0), Recovery::Rebuild);
+        assert_eq!(recovery("inference_failed", 4, 2), Recovery::Rebuild);
+        assert_eq!(recovery("inference_failed", 4, 3), Recovery::Stop);
+        assert_eq!(
+            recovery("inference_context_invalid", 1, 0),
+            Recovery::Rebuild
+        );
+        for code in [
+            "provider_quota_exhausted",
+            "provider_authentication_rejected",
+            "inference_rejected",
+            "inference_content_filtered",
+            "worker_timeout",
+        ] {
+            assert_eq!(recovery(code, 4, 0), Recovery::Stop);
+        }
+    }
+    #[test]
+    fn diagnostics_preserve_usage_and_structure_without_provider_material() {
+        let event = json!({"type":"response.failed","response":{"error":{"code":"private-code-secret","type":"private-type-secret","message":"credential and customer prose"},"usage":{"total_tokens":42,"input_tokens":40,"output_tokens":2,"private":"secret"}}});
+        let d = failure_diagnostic(&event, None);
+        assert_eq!(d.usage()["total_tokens"], 42);
+        let encoded = serde_json::to_string(&d).unwrap();
+        for secret in [
+            "private-code-secret",
+            "private-type-secret",
+            "credential",
+            "customer",
+            "prose",
+        ] {
+            assert!(!encoded.contains(secret));
+        }
+        assert_eq!(d.event, "response.failed");
+        assert_eq!(d.classification, "inference_failed");
+        assert_eq!(d.message_bytes, Some(29));
+        assert!(d.message_sha256.is_some());
+        assert_eq!(
+            stream_failure(&json!({"error":{"type":"server_error"}})),
+            "provider_temporarily_unavailable"
+        );
+        assert_eq!(
+            stream_failure(&json!({"response":{"incomplete_details":{"reason":"content_filter"}}})),
+            "inference_content_filtered"
+        );
     }
     #[tokio::test]
     async fn pause_prevents_another_attempt_during_backoff() {
