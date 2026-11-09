@@ -201,6 +201,9 @@ pub fn attachment_manifest(files: &[workspace::ArtifactInput]) -> AppResult<Valu
             return Err(AppError::bad("attachment_duplicate"));
         }
         let body = workspace::artifact_body(file)?;
+        if body.len() > 1048576 {
+            return Err(AppError::bad("artifact_budget_exceeded"));
+        }
         total += body.len();
         if total > 4 * 1048576 {
             return Err(AppError::bad("attachment_budget_exceeded"));

@@ -799,6 +799,7 @@ impl SseProbe {
                 }
                 if value["response"]["status"] != "completed" {
                     self.failed = true;
+                    self.failure_code = Some(crate::persistence::stream_failure(&value));
                 }
                 self.completed = true;
                 self.usage = value["response"]["usage"].clone();
@@ -823,20 +824,7 @@ impl SseProbe {
             }
             Some("response.failed" | "response.incomplete" | "error") => {
                 self.failed = true;
-                self.failure_code = match value["response"]["incomplete_details"]["reason"].as_str()
-                {
-                    Some("max_output_tokens") => Some("inference_output_truncated"),
-                    _ if matches!(
-                        value["response"]["error"]["code"]
-                            .as_str()
-                            .or_else(|| value["error"]["code"].as_str()),
-                        Some("context_length_exceeded" | "input_too_long")
-                    ) =>
-                    {
-                        Some("inference_context_overflow")
-                    }
-                    _ => None,
-                };
+                self.failure_code = Some(crate::persistence::stream_failure(&value));
             }
             _ => {}
         }

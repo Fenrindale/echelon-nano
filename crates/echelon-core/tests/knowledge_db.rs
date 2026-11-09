@@ -57,6 +57,47 @@ async fn handoff_pins_only_owned_selected_inputs_and_nul_views_survive_jsonb() {
     let first_id: Uuid = serde_json::from_value(first["work_order_id"].clone()).unwrap();
     let mut agent = actor(tenant, task, Role::Agent);
     agent.work_order_id = Some(first_id);
+    let large_body = "Owned generated evidence. ".repeat(80_000);
+    let large_input =
+        json!({"request_id":Uuid::new_v4(),"name":"large-ledger.txt","content":large_body});
+    let large = workspace::put_artifact(&pool, &agent, &large_input, false)
+        .await
+        .unwrap();
+    let large_id: Uuid = serde_json::from_value(large["artifact"]["id"].clone()).unwrap();
+    assert!(large["artifact"]["bytes"].as_u64().unwrap() > 1048576);
+    assert_eq!(
+        large["artifact"]["sha256"],
+        workspace::digest(large_body.as_bytes())
+    );
+    assert_eq!(
+        workspace::artifact(&pool, &agent, large_id).await.unwrap()["content"],
+        large_body
+    );
+    assert_eq!(
+        workspace::put_artifact(&pool, &agent, &large_input, false)
+            .await
+            .unwrap()["artifact"]["id"],
+        large["artifact"]["id"]
+    );
+    assert!(
+        sqlx::query("UPDATE artifacts SET body='changed' WHERE id=$1")
+            .bind(large_id)
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        workspace::put_artifact(
+            &pool,
+            &handler,
+            &json!({"request_id":Uuid::new_v4(),"name":"large-upload.txt","content":large_body}),
+            true
+        )
+        .await
+        .unwrap_err()
+        .code,
+        "artifact_budget_exceeded"
+    );
     let body = json!({"event":{"command":"prefix\0suffix","literal":"\\u0000"}}).to_string();
     let file=workspace::put_artifact(&pool,&agent,&json!({"request_id":Uuid::new_v4(),"name":"evidence.json","media_type":"application/json","content":body}),false).await.unwrap();
     let file_id: Uuid = serde_json::from_value(file["artifact"]["id"].clone()).unwrap();

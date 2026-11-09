@@ -208,9 +208,6 @@ pub fn artifact_body(r: &ArtifactInput) -> AppResult<Vec<u8>> {
         (None, Some(data)) => STANDARD.decode(data).map_err(|_| bad())?,
         _ => return Err(bad()),
     };
-    if body.len() > 1048576 {
-        return Err(AppError::bad("artifact_budget_exceeded"));
-    }
     Ok(body)
 }
 pub async fn put_artifact_tx(
@@ -225,6 +222,9 @@ pub async fn put_artifact_tx(
     let r: ArtifactInput = serde_json::from_value(input.clone()).map_err(|_| bad())?;
     let body = artifact_body(&r)?;
     if operator {
+        if body.len() > 1048576 {
+            return Err(AppError::bad("artifact_budget_exceeded"));
+        }
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))")
             .bind(format!("task-input-files:{}:{}", a.tenant_id, a.task_id))
             .execute(&mut **tx)

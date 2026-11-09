@@ -90,7 +90,9 @@ pub async fn serve() -> anyhow::Result<()> {
         .route("/jobs/{id}/cancel", post(cancel))
         .route("/jobs/{id}/release", post(release))
         .route("/workspaces/{id}/close", post(close_workspace))
-        .layer(DefaultBodyLimit::max(524288))
+        // This RPC is private and authenticated. Source sizes are governed by
+        // container resources, not a second, hidden transfer-size quota.
+        .layer(DefaultBodyLimit::disable())
         .with_state(state);
     axum::serve(tokio::net::TcpListener::bind("0.0.0.0:9090").await?, router).await?;
     Ok(())
@@ -123,17 +125,24 @@ fn authenticated(s: &Worker, h: &HeaderMap) -> AppResult<()> {
     Ok(())
 }
 pub(crate) fn validate(job: &Job) -> AppResult<()> {
-    if !nonempty(&job.script, 24000)
-        || job.files.len() > 16
-        || job.outputs.len() > 16
-        || job
-            .files
-            .iter()
-            .any(|f| !safe_name(&f.name) || f.content.len() > 131072)
-        || job.outputs.iter().any(|n| !safe_name(n))
-        || !(1..=3600).contains(&job.timeout_seconds)
-    {
-        return Err(AppError::bad("invalid_worker_job"));
+    if !nonempty(&job.script, 24000) {
+        return Err(AppError::bad("worker_script_invalid"));
+    }
+    if !(1..=3600).contains(&job.timeout_seconds) {
+        return Err(AppError::bad("worker_timeout_invalid"));
+    }
+    if job.files.iter().any(|f| !safe_name(&f.name)) {
+        return Err(AppError::bad("worker_input_path_invalid"));
+    }
+    let names: std::collections::BTreeSet<_> = job.files.iter().map(|f| &f.name).collect();
+    if names.len() != job.files.len() {
+        return Err(AppError::bad("worker_duplicate_input_path"));
+    }
+    if job.outputs.len() > 16 {
+        return Err(AppError::bad("worker_output_count_exceeded"));
+    }
+    if job.outputs.iter().any(|n| !safe_name(n)) {
+        return Err(AppError::bad("worker_output_path_invalid"));
     }
     Ok(())
 }
@@ -281,6 +290,9 @@ async fn kill_descendants(uid: u32) {
 }
 fn io_error(error: std::io::Error) -> AppError {
     tracing::warn!(event="worker_io_failed",kind=?error.kind(),os_code=error.raw_os_error());
+    if error.raw_os_error() == Some(28) {
+        return AppError::bad("worker_storage_exhausted");
+    }
     AppError::internal("worker_io_failed")
 }
 async fn execute(job: &Job, entry: &Entry) -> AppResult<Value> {
@@ -384,18 +396,17 @@ async fn execute_in(job: &Job, root: &Path, entry: &Entry) -> AppResult<Value> {
     let read_handle = |mut file: std::fs::File| -> AppResult<String> {
         file.rewind().map_err(io_error)?;
         let mut bytes = Vec::new();
-        file.take(65536).read_to_end(&mut bytes).map_err(io_error)?;
+        file.read_to_end(&mut bytes).map_err(io_error)?;
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     };
     let mut outputs = vec![];
     let canonical = std::fs::canonicalize(root).map_err(io_error)?;
-    let mut total = 0;
     for name in &job.outputs {
         let path = root.join(name);
         let Ok(meta) = std::fs::symlink_metadata(&path) else {
             continue;
         };
-        if !meta.is_file() || meta.file_type().is_symlink() || meta.len() > 131072 {
+        if !meta.is_file() || meta.file_type().is_symlink() {
             return Err(AppError::bad("worker_output_invalid"));
         }
         let resolved = std::fs::canonicalize(&path).map_err(io_error)?;
@@ -403,13 +414,43 @@ async fn execute_in(job: &Job, root: &Path, entry: &Entry) -> AppResult<Value> {
             return Err(AppError::forbidden("worker_output_scope_denied"));
         }
         let bytes = std::fs::read(&resolved).map_err(io_error)?;
-        total += bytes.len();
-        if total > 524288 {
-            return Err(AppError::bad("worker_output_budget_exceeded"));
-        }
         outputs.push(json!({"name":name,"content":String::from_utf8(bytes).map_err(|_|AppError::bad("worker_output_not_utf8"))?}));
     }
     Ok(
         json!({"job_id":job.id,"status":if entry.cancelled.load(Ordering::SeqCst){"cancelled"}else{"completed"},"exit_code":exit,"timed_out":timed_out,"stdout":read_handle(stdout)?,"stderr":read_handle(stderr)?,"outputs":outputs,"execution":{"script":job.script.chars().take(1024).collect::<String>(),"script_sha256":crate::workspace::digest(job.script.as_bytes()),"script_truncated":job.script.chars().count()>1024,"outputs":job.outputs,"timeout_seconds":job.timeout_seconds,"persistent_workspace":job.workspace_id.is_some()}}),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn validates_paths_and_execution_contract_without_a_file_size_quota() {
+        let mut job = Job {
+            id: Uuid::new_v4(),
+            script: "true".into(),
+            files: vec![InputFile {
+                name: "large.json".into(),
+                content: "x".repeat(2_000_000),
+            }],
+            outputs: vec!["large-result.json".into()],
+            timeout_seconds: 30,
+            workspace_id: None,
+        };
+        validate(&job).unwrap();
+        job.files.push(job.files[0].clone());
+        assert_eq!(
+            validate(&job).unwrap_err().code,
+            "worker_duplicate_input_path"
+        );
+        job.files.pop();
+        job.files[0].name = "../foreign".into();
+        assert_eq!(
+            validate(&job).unwrap_err().code,
+            "worker_input_path_invalid"
+        );
+        job.files.clear();
+        job.timeout_seconds = 0;
+        assert_eq!(validate(&job).unwrap_err().code, "worker_timeout_invalid");
+    }
 }

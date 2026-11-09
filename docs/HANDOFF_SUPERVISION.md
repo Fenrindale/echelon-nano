@@ -15,12 +15,16 @@ Ordinary partial reads no longer interrupt Agent every eight tool results or two
 - An important finding or decision explicitly reported with task.observe needs_handler:true.
 - Two consecutive failed tool results, including MCP operation_ok:false.
 - Three consecutive identical read requests with unchanged results.
+- Three visits to the same unchanged read, including interleaved reads/ordinary observations, within the current supervision interval.
+- A rejected local shell execution, or repeated nonzero/timed-out shell results, so failed computation can be corrected before falling back to manual bookkeeping.
 - An unknown tool outcome needing reconciliation.
 - A ten-minute heartbeat since the preceding supervision or delegation.
 
 Events in an independent read batch coalesce before the next model call. Completion still goes directly to Handler collection and original-goal verification. Pause, terminal state, manual call budgets and server-owned Work Order grants retain their existing checks. The heartbeat does not interrupt/replay an in-flight external operation.
 
 Supervision uses a separate per-Work-Order Handler conversation with the original goal, working-state goals/steps, recent operational notes, previous result references and trigger metadata. The complete notes and planning conversation remain in the server checkpoint; this projection does not rewrite them. A server restart still needs explicit resume.
+
+Recovery reads and narrative notes do not reset the model-round progress anchor. Handler also receives the original unverified completion conditions and the last explicit course review. After three issued Work Orders without such a review, further replanning (including collect-phase Context refresh) requires `progress_review:{goal_id,observed_change,next_action,why_advances_goal}`. The goal ID must belong to the immutable original conditions. This is a course-correction checkpoint, not proof that an order failed, that a business write is required, or that every intermediate step must complete an entire goal. It does not stop a Task merely because the review is due. Full original evidence, completed effects and historical decisions remain immutable.
 
 This design references Artex revision 869a4aefc2e6aeee9575e841d3331d6ac93367e7:
 

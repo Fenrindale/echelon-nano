@@ -60,7 +60,44 @@ fn status_error(status: u16, permanent_quota: bool) -> AppError {
     })
 }
 
+/// SSE failures need the same classification as HTTP rejections. Preserve only
+/// known codes; provider prose can contain request/account material.
+pub fn stream_failure(value: &serde_json::Value) -> &'static str {
+    if value["response"]["incomplete_details"]["reason"] == "max_output_tokens" {
+        return "inference_output_truncated";
+    }
+    let code = value["response"]["error"]["code"]
+        .as_str()
+        .or_else(|| value["error"]["code"].as_str())
+        .or_else(|| value["code"].as_str());
+    match code {
+        Some("context_length_exceeded" | "input_too_long") => "inference_context_overflow",
+        Some("server_error" | "internal_error" | "overloaded" | "service_unavailable") => {
+            "provider_temporarily_unavailable"
+        }
+        Some("rate_limit_exceeded" | "rate_limit_error") => "provider_rate_limited",
+        Some("insufficient_quota" | "billing_hard_limit_reached" | "usage_limit_reached") => {
+            "provider_quota_exhausted"
+        }
+        Some(
+            "invalid_api_key" | "invalid_token" | "authentication_error" | "permission_denied",
+        ) => "provider_authentication_rejected",
+        Some(
+            "invalid_request_error"
+            | "invalid_request"
+            | "unsupported_parameter"
+            | "model_not_found",
+        ) => "inference_rejected",
+        _ => "inference_failed",
+    }
+}
+
 pub fn retry_delay(code: &str, failures: u32) -> Option<Duration> {
+    // A terminal generic generation failure has no committed model decision or
+    // business effect. Give it a small recovery opportunity, not endless retry.
+    if code == "inference_failed" {
+        return (failures <= 3).then(|| Duration::from_secs(2u64.pow(failures.min(3))));
+    }
     if !matches!(
         code,
         "inference_timeout"
@@ -112,7 +149,6 @@ mod tests {
         for code in [
             "provider_authentication_rejected",
             "provider_quota_exhausted",
-            "inference_failed",
             "inference_stream_invalid",
             "database_failed",
             "worker_timeout",
@@ -124,6 +160,27 @@ mod tests {
         assert!(retry_delay(status_error(429, true).code, 1).is_none());
         assert!(retry_delay(status_error(503, false).code, 1).is_some());
         assert!(retry_delay(status_error(403, false).code, 1).is_none());
+        assert!(retry_delay("inference_failed", 1).is_some());
+        assert!(retry_delay("inference_failed", 3).is_some());
+        assert!(retry_delay("inference_failed", 4).is_none());
+    }
+    #[test]
+    fn stream_errors_keep_safe_causes_and_do_not_retry_quota_or_auth() {
+        for (code, expected) in [
+            ("server_error", "provider_temporarily_unavailable"),
+            ("rate_limit_exceeded", "provider_rate_limited"),
+            ("insufficient_quota", "provider_quota_exhausted"),
+            ("invalid_token", "provider_authentication_rejected"),
+            ("context_length_exceeded", "inference_context_overflow"),
+            ("private-unknown-value", "inference_failed"),
+        ] {
+            for event in [
+                serde_json::json!({"response":{"error":{"code":code}}}),
+                serde_json::json!({"error":{"code":code}}),
+            ] {
+                assert_eq!(stream_failure(&event), expected);
+            }
+        }
     }
     #[tokio::test]
     async fn pause_prevents_another_attempt_during_backoff() {

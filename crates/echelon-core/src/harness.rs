@@ -364,6 +364,9 @@ pub fn schema(tool: &str) -> Value {
             json!({"outcome":{"type":"string","enum":["completed","partial","blocked","failed"]},"summary":string(),"evidence":{"type":"array","items":object()},"artifacts":strings(),"limitations":strings()})
         }
         "run.work" => json!({"steps":{"type":"array","items":object()},"note":string()}),
+        "run.replan" => {
+            json!({"reason":string(),"progress_review":{"type":"object","properties":{"goal_id":string(),"observed_change":string(),"next_action":string(),"why_advances_goal":string()},"required":["goal_id","observed_change","next_action","why_advances_goal"],"additionalProperties":false}})
+        }
         "run.supervise" => {
             json!({"decision":{"type":"string","enum":["continue","steer","recall"]},"message":string()})
         }

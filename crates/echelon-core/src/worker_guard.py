@@ -7,7 +7,8 @@ import sys
 
 resource.setrlimit(resource.RLIMIT_CPU, (15, 15))
 resource.setrlimit(resource.RLIMIT_AS, (201326592, 201326592))
-resource.setrlimit(resource.RLIMIT_FSIZE, (131072, 131072))
+# Files are bounded by the dedicated workspace tmpfs/container resources. Do
+# not impose a hidden per-file limit on source analysis, reports or stdout.
 resource.setrlimit(resource.RLIMIT_NOFILE, (64, 64))
 resource.setrlimit(resource.RLIMIT_NPROC, (32, 32))
 
