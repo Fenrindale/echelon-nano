@@ -100,7 +100,15 @@ Analyst는 context.curate의 pack 조회로 같은 tenant의 전달 기록을 �
 
 request_id는 Handler 요청에서는 Task 안의 클라이언트 멱등 키이고, curate/read에서는 서버가 반환한 request.id다. 같은 키로 같은 정규화 조건을 보내면 기존 요청을 반환한다. 조건을 바꾸면 409다. 같은 전달의 재전송과 동시 재전송은 기존 Pack을 반환하며 참조 ID를 다시 만들지 않는다. 이미 전달한 요청의 selections·gaps를 바꾸면 409다. 재선별은 새 Handler 요청을 사용한다.
 
-선택은 최대 16개, 참조는 기본 64·최대 128개, manifest는 기본 32,768·최대 65,536 UTF-8 바이트다. 예산은 토큰 수 추정치가 아니다. 근거나 부정 이력까지 포함해 예산을 넘으면 409 `context_reference_budget_exceeded` 또는 `context_manifest_budget_exceeded`를 반환한다. 참조를 조용히 제외하거나 부분 Pack을 저장하지 않는다. 요청은 pending으로 남는다. 이력이 매우 큰 항목은 현재 상한 안에서 전달할 수 없을 수 있다.
+선택은 최대 16개다. `max_references`(기본 64, 입력 범위 1..128)와 `max_manifest_bytes`(기본 32,768, 입력 범위 1,024..65,536)는 **조회 페이지의 선호 크기**다. 필수 실패 이력·과거 개정·의존 근거를 포함한 전체 참조는 한 트랜잭션으로 고정하며, 이 선호 크기를 넘는다는 이유로 전달을 거절하거나 근거를 버리지 않는다.
+
+`context.read {op:'pack',pack_id,offset:0,limit:64}`로 헤더를 나눠 읽는다. `reference_count`는 전체 수이며, 부분 응답의 `page`에는 `returned`, `total`, `next_offset`, 전체 `caution_count`를 표시한다. 헤더 하나가 선호 바이트 수보다 커도 하나를 반환하고 초과를 명시하여 페이지가 반드시 전진한다. 작은 Pack은 기존 응답 형태를 유지한다. 저장된 manifest와 ref_id·버전·해시는 페이지 크기와 무관하게 불변이다. Analyst의 Pack 관리 조회도 같은 페이지 계약을 따른다.
+
+실행 하네스는 `agent.delegate`에 현재 전달된 `context_pack_id`를 서버에서 묶는다. Handler가 선택하고 해석한 유용한 참조와 별도로, 그 Pack의 **모든 주의 이력**을 서버가 해석하여 Work Order의 고정 참조·근거에 자동 포함한다. 다른 Task·tenant·Pack으로 범위를 넓힐 수 없으며, 외부 모델 전송 정책은 자동 포함한 문서마다 검사한다. 기존 명시 선택 16개 제한과 자동 필수 이력을 혼동하지 않는다. 전체 고정 근거가 128KiB를 넘더라도 저장하며 모델 조회는 원본 보존·부분 조회 경로를 사용한다.
+
+Analyst는 선별을 마칠 수 없을 때 `context.curate {op:'return',request_id,reason}`으로 요청을 Handler에게 반환한다. 요청은 `returned`가 되며 원래 criteria·목표·이력은 바꾸지 않는다. 같은 반환은 보존된 결과를 재사용하고, 이미 전달된 Pack은 기존 Pack을 반환한다. 반환된 요청을 다시 전달하거나 pending으로 되돌릴 수 없다. 새로운 조건은 새 Handler 요청으로 남긴다.
+
+실행 중 Analyst의 도구 검증 오류가 두 번 발생하면 서버가 반환을 예약하여 같은 거절을 수백 번 반복하지 않게 한다. Handler의 `context_replan` 단계에서는 `run.context_refresh`로 범위를 재설계한다. 보존된 이전 Pack이 있으면 `run.context_resume {reason}`으로 당시 실행 단계·Work Order·결과를 복원할 수도 있다. Analyst에게 수집·Agent 지시·Task 종료 권한을 추가하지 않는다. 원래 목표와 완료된 효과를 유지하며 내부 도구 오류를 사람의 업무 입력 부족으로 처리하지 않는다.
 
 신규 Pack·참조·요청 상태 변경·감사 이벤트는 한 트랜잭션에 넣는다. 요청 행 잠금으로 중복 전달을 막고 기존 지식 쓰기와 같은 tenant 잠금으로 선별 중의 근거·현재 버전이 일관되게 보이도록 한다. Pack과 참조는 변경·삭제·TRUNCATE를 거부한다. DB 관리자까지 막는 외부 불변 저장소는 아니다.
 

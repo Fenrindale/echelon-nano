@@ -40,6 +40,8 @@ struct Delegate {
     #[serde(default)]
     references: Vec<Evidence>,
     #[serde(default)]
+    context_pack_id: Option<Uuid>,
+    #[serde(default)]
     protocol_parameters: Value,
     #[serde(default)]
     step_id: Option<String>,
@@ -53,7 +55,7 @@ pub async fn delegate(pool: &PgPool, a: &Claims, input: &Value) -> AppResult<Val
     if a.role != Role::Handler {
         return Err(AppError::forbidden("role_denied"));
     }
-    let d: Delegate = serde_json::from_value(input.clone()).map_err(|_| invalid())?;
+    let mut d: Delegate = serde_json::from_value(input.clone()).map_err(|_| invalid())?;
     if d.step_id.as_ref().is_some_and(|v| !bounded(v, 64)) {
         return Err(invalid());
     }
@@ -68,6 +70,28 @@ pub async fn delegate(pool: &PgPool, a: &Claims, input: &Value) -> AppResult<Val
         || d.expected_output.len() > 2000
     {
         return Err(invalid());
+    }
+    if let Some(pack) = d.context_pack_id {
+        let manifest = context::stored_pack(pool, a.tenant_id, a.task_id, pack).await?;
+        if d.references.iter().any(|r| r.pack_id != pack) {
+            return Err(AppError::forbidden("work_context_scope_denied"));
+        }
+        let mut selected = std::collections::BTreeSet::new();
+        for r in &d.references {
+            if !selected.insert(r.ref_id) {
+                return Err(invalid());
+            }
+        }
+        for caution in manifest["cautions"].as_array().ok_or_else(invalid)? {
+            let reference =
+                serde_json::from_value(caution["ref_id"].clone()).map_err(|_| invalid())?;
+            if selected.insert(reference) {
+                d.references.push(Evidence {
+                    pack_id: pack,
+                    ref_id: reference,
+                });
+            }
+        }
     }
     if (!d.objective.is_empty() || !d.expected_output.is_empty() || !d.references.is_empty())
         && (!bounded(&d.objective, 4000) || !bounded(&d.expected_output, 2000))
@@ -181,10 +205,7 @@ pub async fn delegate(pool: &PgPool, a: &Claims, input: &Value) -> AppResult<Val
         Value::Null
     };
     let mcp_schemas = crate::mcp::granted_tools(pool, a.tenant_id, &policy.mcp_tools).await?;
-    let contract = json!({"mcp_schemas":mcp_schemas,"objective":d.objective,"expected_output":d.expected_output,"references":d.references,"evidence":evidence,"protocol":procedure,"input_artifacts":policy.input_artifacts,"handoff_artifacts":handoff,"input_outputs":outputs,"tool_policy":policy,"request":input});
-    if serde_json::to_vec(&contract).map_err(|_| invalid())?.len() > 131072 {
-        return Err(AppError::bad("work_evidence_budget_exceeded"));
-    }
+    let contract = json!({"mcp_schemas":mcp_schemas,"objective":d.objective,"expected_output":d.expected_output,"references":d.references,"context_pack_id":d.context_pack_id,"evidence":evidence,"protocol":procedure,"input_artifacts":policy.input_artifacts,"handoff_artifacts":handoff,"input_outputs":outputs,"tool_policy":policy,"request":input});
     let id = Uuid::new_v4();
     let saved=sqlx::query(
         "INSERT INTO work_orders(id,tenant_id,task_id,target,contract,request_key) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING",

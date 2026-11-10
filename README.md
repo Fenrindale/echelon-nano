@@ -8,6 +8,8 @@ Analyst curates registered knowledge, Handler plans and delegates work, Agent ex
 
 ## Current scope
 
+Context Packs preserve their full pinned reference set while paging headers to the model. Small display preferences cannot reject mandatory failure history or dependencies. Work Orders automatically pin all cautions from their explicitly delivered Pack. Analyst can return a selection problem to Handler; repeated curation validation errors trigger that handoff instead of an unchanged retry loop. See [Context Packs](docs/CONTEXT_PACKS.md).
+
 Model-only generation failures retain safe structural diagnostics and reported usage, without provider prose or private reasoning. After bounded retries of an unexplained failure, the engine archives the original conversation and rebuilds context from the unchanged goal, scoped Work Order and confirmed receipts. Explicitly resuming a failed generation also repairs its context. Repair never replays completed business effects or unknown tool outcomes; authentication, quota and content-policy failures remain separately classified. See [generation recovery](docs/INFERENCE_RECOVERY.md).
 
 The first beta includes all four roles, Data/Info/Intel knowledge, immutable revisions and failure history, pinned Context Packs, scoped Work Orders, artifact recovery, pause/cancel/explicit resume, and separate knowledge retention and Master audit stages.

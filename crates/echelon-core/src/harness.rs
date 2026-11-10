@@ -336,8 +336,12 @@ pub fn schema(tool: &str) -> Value {
         "mcp.call" => json!({"server_id":string(),"tool":string(),"arguments":object()}),
         "context.request" | "run.context_refresh" => json!({"criteria":object()}),
         "context.read" => {
-            json!({"op":{"type":"string","enum":["pack","resolve","resolve_many"]},"ref_id":string(),"ref_ids":strings()})
+            json!({"op":{"type":"string","enum":["pack","resolve","resolve_many"]},"ref_id":string(),"ref_ids":strings(),"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":128}})
         }
+        "context.curate" => {
+            json!({"op":{"type":"string","enum":["candidates","deliver","return"]},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":100},"selections":{"type":"array","items":object()},"gaps":strings(),"reason":string()})
+        }
+        "run.context_resume" => json!({"reason":string()}),
         "artifact.read" => {
             json!({"artifact_id":string(),"format":{"type":"string","enum":["text","json"]},"pointer":{"type":"string","description":"JSON Pointer; may enter JSON encoded inside MCP text. Use a narrow field instead of reading the whole result."},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":16000,"description":"Text characters (max 16000); JSON array/object items (max 100). Larger legacy requests are paged, never discard originals."}})
         }

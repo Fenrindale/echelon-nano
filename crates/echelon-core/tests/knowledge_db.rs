@@ -2269,6 +2269,168 @@ async fn context_request(pool: &PgPool, h: &Claims, key: Uuid, extra: Value) -> 
         .await
         .unwrap()
 }
+
+#[tokio::test]
+#[ignore = "requires the isolated compose.verify.yaml PostgreSQL database"]
+async fn context_overflow_preserves_all_cautions_and_returns_are_terminal() {
+    let pool = PgPoolOptions::new()
+        .max_connections(8)
+        .connect(&std::env::var("DATABASE_URL").unwrap())
+        .await
+        .unwrap();
+    sqlx::migrate!("../../migrations").run(&pool).await.unwrap();
+    let tenant = Uuid::new_v4();
+    let task = Uuid::new_v4();
+    let other = Uuid::new_v4();
+    sqlx::query("INSERT INTO tenants(id,name) VALUES($1,'Owned large context fixture')")
+        .bind(tenant)
+        .execute(&pool)
+        .await
+        .unwrap();
+    for id in [task, other] {
+        sqlx::query(
+            "INSERT INTO tasks(id,tenant_id,goal) VALUES($1,$2,'Preserve all context evidence')",
+        )
+        .bind(id)
+        .bind(tenant)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    let h = actor(tenant, task, Role::Handler);
+    let a = actor(tenant, task, Role::Analyst);
+    for n in 0..20 {
+        let mut document = source();
+        document["category"] = json!("info");
+        document["storage_mode"] = json!("excerpt");
+        document["title"] = json!(format!("Owned caution {n}"));
+        document["content"] = json!(format!("Owned fixture caution {n}: {}", "x".repeat(8000)));
+        document["tags"] = json!(["scope:large-context"]);
+        document["truth_state"] = json!("refuted");
+        document["outcome"] = json!("failed");
+        document["assessment"] = json!({"conditions":"Owned verification only","attempted_action":"Synthetic action","observed":"Owned synthetic failure","reason":"Fixture condition","avoid":"Repeat the synthetic failure","retry_when":"Fixture condition changes"});
+        let submitted = submit(&pool, &h, document, None).await;
+        let mut decision = acceptance(&submitted);
+        decision["reuse"]["evidence"] = json!(
+            &submitted["submission"]["document"]["content"]
+                .as_str()
+                .unwrap()[..100]
+        );
+        knowledge::publish(&pool, &a, &decision).await.unwrap();
+    }
+    let request = context_request(
+        &pool,
+        &h,
+        Uuid::new_v4(),
+        json!({"tags":["scope:large-context"],"max_references":1,"max_manifest_bytes":1024}),
+    )
+    .await;
+    let delivered=context::curate(&pool,&a,&json!({"op":"deliver","request_id":request["request"]["id"],"selections":[],"gaps":["No positive record is required for this owned fixture"]})).await.unwrap();
+    let pack = id(&delivered["pack"]["id"]);
+    assert_eq!(delivered["pack"]["cautions"].as_array().unwrap().len(), 20);
+    assert_eq!(delivered["pack"]["reference_count"], 20);
+    let page = context::read(&pool, &h, &json!({"op":"pack","pack_id":pack}))
+        .await
+        .unwrap();
+    assert_eq!(page["pack"]["page"]["caution_count"], 20);
+    assert_eq!(page["pack"]["page"]["returned"], 1);
+    assert_eq!(page["pack"]["page"]["next_offset"], 1);
+    let foreign = actor(tenant, other, Role::Handler);
+    assert_eq!(
+        context::read(
+            &pool,
+            &foreign,
+            &json!({"op":"pack","pack_id":pack,"offset":1})
+        )
+        .await
+        .unwrap_err()
+        .status
+        .as_u16(),
+        404
+    );
+    let input = json!({"request_id":Uuid::new_v4(),"target":"owned:context","objective":"Read the owned synthetic caution set","expected_output":"Acknowledge existing warnings only","references":[],"context_pack_id":pack});
+    let order = work::delegate(&pool, &h, &input).await.unwrap();
+    assert_eq!(
+        work::delegate(&pool, &h, &input).await.unwrap()["replayed"],
+        true
+    );
+    let contract: Value = sqlx::query_scalar("SELECT contract FROM work_orders WHERE id=$1")
+        .bind(id(&order["work_order_id"]))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(contract["references"].as_array().unwrap().len(), 20);
+    assert_eq!(contract["evidence"].as_array().unwrap().len(), 20);
+    assert!(serde_json::to_vec(&contract).unwrap().len() > 131072);
+    for evidence in contract["evidence"].as_array().unwrap() {
+        assert_eq!(evidence["resolved"]["document"]["truth_state"], "refuted");
+        assert_eq!(evidence["pack_id"], json!(pack));
+    }
+    let mut cross = input.clone();
+    cross["request_id"] = json!(Uuid::new_v4());
+    assert_eq!(
+        work::delegate(&pool, &foreign, &cross)
+            .await
+            .unwrap_err()
+            .status
+            .as_u16(),
+        404
+    );
+    let pending = context_request(
+        &pool,
+        &h,
+        Uuid::new_v4(),
+        json!({"tags":["scope:no-such-record"]}),
+    )
+    .await;
+    let return_input = json!({"op":"return","request_id":pending["request"]["id"],"reason":"No existing source matches the requested selection"});
+    assert_eq!(
+        context::curate(&pool, &h, &return_input)
+            .await
+            .unwrap_err()
+            .status
+            .as_u16(),
+        403
+    );
+    let returned = context::curate(&pool, &a, &return_input).await.unwrap();
+    assert_eq!(returned["replayed"], false);
+    assert_eq!(
+        context::curate(&pool, &a, &return_input).await.unwrap()["replayed"],
+        true
+    );
+    let state = context::read(
+        &pool,
+        &h,
+        &json!({"op":"request","request_id":pending["request"]["id"]}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(state["request"]["status"], "returned");
+    assert_eq!(state["request"]["criteria"], pending["request"]["criteria"]);
+    assert!(state["request"]["pack_id"].is_null());
+    assert_eq!(context::curate(&pool,&a,&json!({"op":"deliver","request_id":pending["request"]["id"],"selections":[],"gaps":["Keep original return"]})).await.unwrap_err().code,"context_request_returned");
+    assert!(
+        sqlx::query("UPDATE context_requests SET status='pending',delivery=NULL WHERE id=$1")
+            .bind(id(&pending["request"]["id"]))
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+    let impossible = context_request(
+        &pool,
+        &h,
+        Uuid::new_v4(),
+        json!({"tags":["scope:invalid-return"]}),
+    )
+    .await;
+    assert!(
+        sqlx::query("UPDATE context_requests SET status='returned',delivery='{}' WHERE id=$1")
+            .bind(id(&impossible["request"]["id"]))
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+}
 fn delivery(request: &Value, item: Uuid, version: i32) -> Value {
     json!({"op":"deliver","request_id":request["request"]["id"],"selections":[{"item_id":item,"version":version,"reason":"Registered report rule and its evidence"}],"gaps":[]})
 }
@@ -2608,24 +2770,40 @@ async fn context_packs_pin_evidence_and_scope_reference_access() {
         .as_u16(),
         404
     );
-    for (extra, code) in [
-        (
-            json!({"max_references":1}),
-            "context_reference_budget_exceeded",
-        ),
-        (
-            json!({"max_manifest_bytes":1024}),
-            "context_manifest_budget_exceeded",
-        ),
+    for extra in [
+        json!({"max_references":1}),
+        json!({"max_manifest_bytes":1024}),
     ] {
         let small = context_request(&pool, &h, Uuid::new_v4(), extra).await;
-        assert_eq!(
-            context::curate(&pool, &a, &delivery(&small, rule, 1))
-                .await
-                .unwrap_err()
-                .code,
-            code
-        );
+        let delivered = context::curate(&pool, &a, &delivery(&small, rule, 1))
+            .await
+            .unwrap();
+        assert_eq!(delivered["pack"]["reference_count"], 7);
+        let mut offset = 0;
+        let mut seen = std::collections::BTreeSet::new();
+        loop {
+            let page = context::read(
+                &pool,
+                &h,
+                &json!({"op":"pack","pack_id":delivered["pack"]["id"],"offset":offset,"limit":1}),
+            )
+            .await
+            .unwrap();
+            assert_eq!(page["pack"]["reference_count"], 7);
+            for entry in page["pack"]["knowledge"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .chain(page["pack"]["cautions"].as_array().unwrap())
+            {
+                assert!(seen.insert(entry["ref_id"].as_str().unwrap().to_owned()));
+            }
+            let Some(next) = page["pack"]["page"]["next_offset"].as_u64() else {
+                break;
+            };
+            offset = next;
+        }
+        assert_eq!(seen.len(), 7);
         let state = context::read(
             &pool,
             &h,
@@ -2633,8 +2811,7 @@ async fn context_packs_pin_evidence_and_scope_reference_access() {
         )
         .await
         .unwrap();
-        assert_eq!(state["request"]["status"], "pending");
-        assert!(state["request"]["pack_id"].is_null());
+        assert_eq!(state["request"]["status"], "delivered");
     }
     let empty = context_request(
         &pool,

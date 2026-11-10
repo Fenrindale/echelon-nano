@@ -189,6 +189,9 @@ enum CurateInput {
     },
     Pack {
         pack_id: Uuid,
+        #[serde(default)]
+        offset: usize,
+        limit: Option<usize>,
     },
     Candidates {
         request_id: Uuid,
@@ -202,6 +205,10 @@ enum CurateInput {
         selections: Vec<Selection>,
         #[serde(default)]
         gaps: Vec<String>,
+    },
+    Return {
+        request_id: Uuid,
+        reason: String,
     },
 }
 #[derive(Deserialize)]
@@ -217,6 +224,9 @@ enum ReadInput {
     },
     Pack {
         pack_id: Uuid,
+        #[serde(default)]
+        offset: usize,
+        limit: Option<usize>,
     },
     Resolve {
         pack_id: Uuid,
@@ -345,7 +355,7 @@ pub async fn curate(pool: &PgPool, a: &Claims, input: &Value) -> AppResult<Value
             pagination(limit)?;
             if status
                 .as_ref()
-                .is_some_and(|s| !matches!(s.as_str(), "pending" | "delivered"))
+                .is_some_and(|s| !matches!(s.as_str(), "pending" | "delivered" | "returned"))
             {
                 return Err(invalid());
             }
@@ -365,7 +375,11 @@ pub async fn curate(pool: &PgPool, a: &Claims, input: &Value) -> AppResult<Value
                 .ok_or_else(missing)?;
             Ok(json!({"request":request_json(&row)}))
         }
-        CurateInput::Pack { pack_id } => {
+        CurateInput::Pack {
+            pack_id,
+            offset,
+            limit,
+        } => {
             let manifest: Value = sqlx::query_scalar(
                 "SELECT manifest FROM context_packs WHERE tenant_id=$1 AND id=$2",
             )
@@ -375,7 +389,7 @@ pub async fn curate(pool: &PgPool, a: &Claims, input: &Value) -> AppResult<Value
             .await
             .map_err(database)?
             .ok_or_else(missing)?;
-            Ok(json!({"pack":manifest}))
+            Ok(json!({"pack":manifest_page(&manifest, offset, limit)?}))
         }
         CurateInput::Candidates {
             request_id,
@@ -429,6 +443,9 @@ pub async fn curate(pool: &PgPool, a: &Claims, input: &Value) -> AppResult<Value
             )
             .await
         }
+        CurateInput::Return { request_id, reason } => {
+            return_request(pool, a, request_id, &reason).await
+        }
     }
 }
 
@@ -446,7 +463,130 @@ fn caution(document: &Value) -> bool {
         || crate::knowledge::effective_freshness(document) != "current"
 }
 
-const CLOSURE: &str = "WITH RECURSIVE closure(item_id,version) AS (SELECT * FROM unnest($2::uuid[],$3::int[]) UNION SELECT n.item_id,n.version FROM closure c CROSS JOIN LATERAL (SELECT e.target_id AS item_id,e.target_version AS version FROM knowledge_edges e WHERE e.tenant_id=$1 AND e.source_id=c.item_id AND e.source_version=c.version UNION SELECT r.item_id,r.version FROM knowledge_revisions r WHERE r.tenant_id=$1 AND r.item_id=c.item_id AND (r.document->>'truth_state'='refuted' OR r.document->>'outcome'='failed') UNION SELECT k.id,k.version FROM knowledge_items k WHERE k.tenant_id=$1 AND k.id=c.item_id UNION SELECT e.source_id,e.source_version FROM knowledge_edges e JOIN knowledge_items k ON k.tenant_id=e.tenant_id AND k.id=e.source_id AND k.version=e.source_version WHERE e.tenant_id=$1 AND e.target_id=c.item_id AND e.kind='contradicts') n) SELECT c.item_id,c.version FROM closure c JOIN knowledge_items k ON k.tenant_id=$1 AND k.id=c.item_id WHERE k.retention_scope='central' LIMIT $4";
+/// Presentation preferences never discard pinned evidence or prevent delivery.
+/// A single large header is returned with an explicit overrun rather than an
+/// empty page that cannot advance. The full immutable manifest remains in DB.
+pub fn manifest_page(manifest: &Value, offset: usize, limit: Option<usize>) -> AppResult<Value> {
+    let preferred = manifest["presentation"]["page_references"]
+        .as_u64()
+        .unwrap_or(64) as usize;
+    let limit = limit.unwrap_or(preferred);
+    if !(1..=128).contains(&limit) {
+        return Err(invalid());
+    }
+    let budget = manifest["presentation"]["page_bytes"]
+        .as_u64()
+        .unwrap_or(32768) as usize;
+    let knowledge = manifest["knowledge"].as_array().ok_or_else(invalid)?;
+    let cautions = manifest["cautions"].as_array().ok_or_else(invalid)?;
+    let total = knowledge.len() + cautions.len();
+    if offset > total {
+        return Err(invalid());
+    }
+    if offset == 0
+        && total <= limit
+        && serde_json::to_vec(manifest).map_err(|_| invalid())?.len() <= budget
+    {
+        return Ok(manifest.clone());
+    }
+    let mut page = manifest.clone();
+    page["knowledge"] = json!([]);
+    page["cautions"] = json!([]);
+    let mut count = 0;
+    for index in offset..total.min(offset.saturating_add(limit)) {
+        let (key, header) = if index < knowledge.len() {
+            ("knowledge", &knowledge[index])
+        } else {
+            ("cautions", &cautions[index - knowledge.len()])
+        };
+        page[key]
+            .as_array_mut()
+            .ok_or_else(invalid)?
+            .push(header.clone());
+        if count > 0 && serde_json::to_vec(&page).map_err(|_| invalid())?.len() > budget {
+            page[key].as_array_mut().ok_or_else(invalid)?.pop();
+            break;
+        }
+        count += 1;
+    }
+    page["page"] = json!({"offset":offset,"returned":count,"total":total,
+        "next_offset":if offset+count < total {Some(offset+count)} else {None},
+        "caution_count":cautions.len(),"knowledge_count":knowledge.len(),
+        "mandatory_cautions_auto_attached":true,"all_references_preserved":true,
+        "note":"Page only; reference_count is the full pinned set. Read another offset for omitted headers. All cautions are automatically pinned into an explicitly delegated Work Order."});
+    page["page"]["preferred_bytes_exceeded"] =
+        json!(serde_json::to_vec(&page).map_err(|_| invalid())?.len() > budget);
+    Ok(page)
+}
+
+pub(crate) async fn stored_pack(
+    pool: &PgPool,
+    tenant: Uuid,
+    task: Uuid,
+    pack: Uuid,
+) -> AppResult<Value> {
+    sqlx::query_scalar(
+        "SELECT manifest FROM context_packs WHERE tenant_id=$1 AND task_id=$2 AND id=$3",
+    )
+    .bind(tenant)
+    .bind(task)
+    .bind(pack)
+    .fetch_optional(pool)
+    .await
+    .map_err(database)?
+    .ok_or_else(missing)
+}
+
+async fn return_request(
+    pool: &PgPool,
+    a: &Claims,
+    request: Uuid,
+    reason: &str,
+) -> AppResult<Value> {
+    if !bounded(reason, 1000) {
+        return Err(invalid());
+    }
+    let mut tx = pool.begin().await.map_err(database)?;
+    let row = sqlx::query(
+        "SELECT status,delivery FROM context_requests WHERE tenant_id=$1 AND id=$2 FOR UPDATE",
+    )
+    .bind(a.tenant_id)
+    .bind(request)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(database)?
+    .ok_or_else(missing)?;
+    let status: String = row.get("status");
+    if status == "delivered" {
+        let manifest: Value = sqlx::query_scalar(
+            "SELECT manifest FROM context_packs WHERE tenant_id=$1 AND context_request_id=$2",
+        )
+        .bind(a.tenant_id)
+        .bind(request)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(database)?;
+        return Ok(json!({"pack":manifest,"replayed":true}));
+    }
+    if status == "returned" {
+        return Ok(json!({"returned":row.get::<Value,_>("delivery"),"replayed":true}));
+    }
+    let returned = json!({"request_id":request,"reason":reason,"disposition":"return_to_handler"});
+    sqlx::query(
+        "UPDATE context_requests SET status='returned',delivery=$3 WHERE tenant_id=$1 AND id=$2",
+    )
+    .bind(a.tenant_id)
+    .bind(request)
+    .bind(&returned)
+    .execute(&mut *tx)
+    .await
+    .map_err(database)?;
+    event(&mut tx, a, "context.returned", returned.clone()).await?;
+    tx.commit().await.map_err(database)?;
+    Ok(json!({"returned":returned,"replayed":false}))
+}
+
+const CLOSURE: &str = "WITH RECURSIVE closure(item_id,version) AS (SELECT * FROM unnest($2::uuid[],$3::int[]) UNION SELECT n.item_id,n.version FROM closure c CROSS JOIN LATERAL (SELECT e.target_id AS item_id,e.target_version AS version FROM knowledge_edges e WHERE e.tenant_id=$1 AND e.source_id=c.item_id AND e.source_version=c.version UNION SELECT r.item_id,r.version FROM knowledge_revisions r WHERE r.tenant_id=$1 AND r.item_id=c.item_id AND (r.document->>'truth_state'='refuted' OR r.document->>'outcome'='failed') UNION SELECT k.id,k.version FROM knowledge_items k WHERE k.tenant_id=$1 AND k.id=c.item_id UNION SELECT e.source_id,e.source_version FROM knowledge_edges e JOIN knowledge_items k ON k.tenant_id=e.tenant_id AND k.id=e.source_id AND k.version=e.source_version WHERE e.tenant_id=$1 AND e.target_id=c.item_id AND e.kind='contradicts') n) SELECT c.item_id,c.version FROM closure c JOIN knowledge_items k ON k.tenant_id=$1 AND k.id=c.item_id WHERE k.retention_scope='central'";
 
 async fn deliver(pool: &PgPool, a: &Claims, delivery: Delivery) -> AppResult<Value> {
     delivery.validate()?;
@@ -463,6 +603,9 @@ async fn deliver(pool: &PgPool, a: &Claims, delivery: Delivery) -> AppResult<Val
         .await
         .map_err(database)?
         .ok_or_else(missing)?;
+    if row.get::<String, _>("status") == "returned" {
+        return Err(conflict("context_request_returned"));
+    }
     if row.get::<String, _>("status") == "delivered" {
         if row.get::<Option<Value>, _>("delivery").as_ref() != Some(&parameters) {
             return Err(conflict("context_already_delivered"));
@@ -506,15 +649,7 @@ async fn deliver(pool: &PgPool, a: &Claims, delivery: Delivery) -> AppResult<Val
     let matching_negative = if criteria.protocol_id.is_some() {
         vec![]
     } else {
-        matches(
-            &mut tx,
-            a.tenant_id,
-            &criteria,
-            true,
-            criteria.max_references + 1,
-            0,
-        )
-        .await?
+        matches(&mut tx, a.tenant_id, &criteria, true, i64::MAX, 0).await?
     };
     for r in matching_negative {
         seeds.insert((r.get("item_id"), r.get("version")));
@@ -539,22 +674,15 @@ async fn deliver(pool: &PgPool, a: &Claims, delivery: Delivery) -> AppResult<Val
             return Err(AppError::bad("context_selection_not_central"));
         }
     }
-    if seeds.len() > criteria.max_references as usize {
-        return Err(conflict("context_reference_budget_exceeded"));
-    }
     let ids: Vec<Uuid> = seeds.iter().map(|r| r.0).collect();
     let versions: Vec<i32> = seeds.iter().map(|r| r.1).collect();
     let closure = sqlx::query(CLOSURE)
         .bind(a.tenant_id)
         .bind(ids)
         .bind(versions)
-        .bind(criteria.max_references + 1)
         .fetch_all(&mut *tx)
         .await
         .map_err(database)?;
-    if closure.len() > criteria.max_references as usize {
-        return Err(conflict("context_reference_budget_exceeded"));
-    }
     let pack_id = Uuid::new_v4();
     let mut knowledge = Vec::new();
     let mut cautions = Vec::new();
@@ -624,10 +752,7 @@ async fn deliver(pool: &PgPool, a: &Claims, delivery: Delivery) -> AppResult<Val
     }
     let manifest = json!({"id":pack_id,"request_id":delivery.request_id,"task_id":task,"goal":row.get::<String,_>("goal_snapshot"),
         "need":criteria.need,"constraints":criteria.constraints,"knowledge":knowledge,"cautions":cautions,"gaps":delivery.gaps,
-        "reference_count":references.len(),"format":"echelon.context.v1","protocol_id":criteria.protocol_id,"protocol_version":criteria.protocol_version,"selection_mode":if criteria.protocol_id.is_some(){"protocol_direct"}else{"search"}});
-    if serde_json::to_vec(&manifest).map_err(|_| invalid())?.len() > criteria.max_manifest_bytes {
-        return Err(conflict("context_manifest_budget_exceeded"));
-    }
+        "reference_count":references.len(),"format":"echelon.context.v1","protocol_id":criteria.protocol_id,"protocol_version":criteria.protocol_version,"selection_mode":if criteria.protocol_id.is_some(){"protocol_direct"}else{"search"},"presentation":{"page_references":criteria.max_references,"page_bytes":criteria.max_manifest_bytes}});
     sqlx::query("INSERT INTO context_packs(id,tenant_id,task_id,context_request_id,created_by,manifest) VALUES($1,$2,$3,$4,$5,$6)")
         .bind(pack_id).bind(a.tenant_id).bind(task).bind(delivery.request_id).bind(a.jti).bind(&manifest).execute(&mut *tx).await.map_err(database)?;
     for (id, item, version, hash) in references {
@@ -664,7 +789,11 @@ pub async fn read(pool: &PgPool, a: &Claims, input: &Value) -> AppResult<Value> 
             .ok_or_else(missing)?;
             Ok(json!({"request":request_json(&row)}))
         }
-        ReadInput::Pack { pack_id } => {
+        ReadInput::Pack {
+            pack_id,
+            offset,
+            limit,
+        } => {
             let manifest: Value = sqlx::query_scalar(
                 "SELECT manifest FROM context_packs WHERE tenant_id=$1 AND task_id=$2 AND id=$3",
             )
@@ -675,7 +804,7 @@ pub async fn read(pool: &PgPool, a: &Claims, input: &Value) -> AppResult<Value> 
             .await
             .map_err(database)?
             .ok_or_else(missing)?;
-            Ok(json!({"pack":manifest}))
+            Ok(json!({"pack":manifest_page(&manifest, offset, limit)?}))
         }
         ReadInput::Resolve { pack_id, ref_id } => resolve(pool, a, pack_id, ref_id).await,
         ReadInput::ResolveMany { pack_id, ref_ids } => {
@@ -728,6 +857,38 @@ async fn resolve(pool: &PgPool, a: &Claims, pack: Uuid, reference: Uuid) -> AppR
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn small_pages_retain_every_reference_and_advance_past_large_headers() {
+        let refs: Vec<_> = (0..5)
+            .map(|i| json!({"ref_id":format!("ref-{i}"),"preview":{"title":"한글".repeat(600)}}))
+            .collect();
+        let full = json!({"id":"pack","knowledge":[refs[0]],"cautions":refs[1..],"reference_count":5,"presentation":{"page_references":1,"page_bytes":1024}});
+        let mut seen = BTreeSet::new();
+        let mut offset = 0;
+        loop {
+            let page = manifest_page(&full, offset, None).unwrap();
+            assert_eq!(page["reference_count"], 5);
+            assert_eq!(page["page"]["caution_count"], 4);
+            assert_eq!(page["page"]["all_references_preserved"], true);
+            assert_eq!(page["page"]["preferred_bytes_exceeded"], true);
+            for entry in page["knowledge"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .chain(page["cautions"].as_array().unwrap())
+            {
+                assert!(seen.insert(entry["ref_id"].as_str().unwrap().to_owned()));
+            }
+            let Some(next) = page["page"]["next_offset"].as_u64() else {
+                break;
+            };
+            assert!(next as usize > offset);
+            offset = next as usize;
+        }
+        assert_eq!(seen.len(), 5);
+        assert!(manifest_page(&full, 6, None).is_err());
+        assert!(manifest_page(&full, 0, Some(0)).is_err());
+    }
     #[test]
     fn context_criteria_require_a_bounded_search_and_canonical_retry_identity() {
         let mut c: Criteria =

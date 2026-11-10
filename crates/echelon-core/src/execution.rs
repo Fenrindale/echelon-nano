@@ -175,6 +175,14 @@ struct Checkpoint {
     #[serde(default)]
     generation_repair_pending: bool,
     #[serde(default)]
+    curation_failures: u32,
+    #[serde(default)]
+    curation_return_pending: bool,
+    #[serde(default)]
+    context_issue: Value,
+    #[serde(default)]
+    context_resume: Value,
+    #[serde(default)]
     postprocess: String,
     #[serde(default)]
     adoption_receipts: Vec<Value>,
@@ -255,6 +263,10 @@ impl Checkpoint {
             read_batch: vec![],
             context_recoveries: 0,
             generation_repair_pending: false,
+            curation_failures: 0,
+            curation_return_pending: false,
+            context_issue: Value::Null,
+            context_resume: Value::Null,
             postprocess: String::new(),
             adoption_receipts: vec![],
             audit_report: Value::Null,
@@ -326,6 +338,9 @@ impl Checkpoint {
             }
             "configure" => json!({"goal":self.goal,"available":self.setup_catalog}),
             "curate" => json!({"context_request":self.request}),
+            "context_replan" => {
+                json!({"goal":self.goal,"returned_request":self.request,"curation_issue":self.context_issue,"can_resume_previous_context":!self.context_resume["pack"]["id"].is_null(),"previous_results":self.previous_context()})
+            }
             "agent" => {
                 json!({"original_goal":self.goal,"work_order_id":self.order,"target":c.target,"scope_notice":"Execute only your assigned Work Order; the original goal never expands its grants."})
             }
@@ -391,6 +406,17 @@ impl Checkpoint {
     }
     fn progress(&self) -> Value {
         json!({"phase":self.phase,"order":self.order,"orders":self.orders,"resolved":self.resolved,"candidates":self.candidates,"planned":self.planned,"collected":self.collected,"result":self.result,"artifacts":self.artifacts,"submissions":self.submissions,"decisions":self.decisions,"receipts":self.progress_receipts,"verified_goals":self.memory.goals.iter().map(|g|(&g.id,&g.evidence)).collect::<Vec<_>>()})
+    }
+    fn curation_outcome(&mut self, tool: &str, output: &Value) {
+        if self.phase != "curate" {
+            return;
+        }
+        if output["ok"] == true {
+            return;
+        }
+        self.curation_failures = self.curation_failures.saturating_add(1);
+        self.context_issue = json!({"request_id":self.request["id"],"tool":tool,"code":output["error"]["code"],"failures":self.curation_failures,"source":"server.curator_validation","business_effect_replayed":false});
+        self.curation_return_pending = self.curation_failures >= 2;
     }
     fn goal_review_required(&self) -> bool {
         self.automatic
@@ -593,9 +619,7 @@ pub async fn start(s: &AppState, c: StartRun) -> AppResult<(Value, bool)> {
         checkpoint.phase = "dream".into();
     }
     if let Some(pack) = c.prepared_pack_id {
-        checkpoint.pack = crate::context::read(pool, &a, &json!({"op":"pack","pack_id":pack}))
-            .await?["pack"]
-            .clone();
+        checkpoint.pack = crate::context::stored_pack(pool, c.tenant_id, c.task_id, pack).await?;
         if c.eager_context {
             let refs = checkpoint.pack["knowledge"]
                 .as_array()
@@ -620,13 +644,6 @@ pub async fn start(s: &AppState, c: StartRun) -> AppResult<(Value, bool)> {
                 }
                 checkpoint.model_sources.insert(item);
                 checkpoint.prepared_evidence.push(value);
-            }
-            if serde_json::to_vec(&checkpoint.prepared_evidence)
-                .map_err(|_| invalid())?
-                .len()
-                > 131072
-            {
-                return Err(AppError::bad("prepared_context_budget_exceeded"));
             }
         }
         checkpoint.advance("delegate");
@@ -1098,6 +1115,25 @@ async fn run(s: &AppState, id: Uuid) -> AppResult<()> {
                     .await?;
                 continue;
             }
+            if p.phase == "curate" && p.curation_return_pending {
+                let call = Call {
+                    call_id: format!("curation-return-{}", p.context_generation),
+                    tool: "context.curate".into(),
+                    input: json!({"op":"return","reason":"Repeated curation validation failures. Handler must review the preserved request and error, refine its scope or resume a previously delivered context; do not repeat the same rejected delivery."}),
+                };
+                p.pending = Some(call.clone());
+                checkpoint(&s.pool, id, &p, "running").await?;
+                record_decision(&s.pool, id, &call).await?;
+                event(
+                    &s.pool,
+                    id,
+                    Role::Analyst,
+                    "curation.return_scheduled",
+                    p.context_issue.clone(),
+                )
+                .await?;
+                continue;
+            }
             if p.phase == "request" && p.refresh_criteria.is_object() {
                 let call_id = format!("context-refresh-{}", p.context_generation);
                 if !p
@@ -1490,6 +1526,15 @@ async fn run(s: &AppState, id: Uuid) -> AppResult<()> {
             json!({"phase":phase,"tool":call.tool,"call_id":call.call_id,"error":output["error"]}),
         )
         .await?;
+        p.curation_outcome(&call.tool, &output);
+        if p.phase == "curate"
+            && call.tool == "context.curate"
+            && call.input["op"] == "return"
+            && output["ok"] != true
+        {
+            p.curation_return_pending = false;
+            p.advance("context_replan");
+        }
         if phase == p.phase {
             let model_output = crate::continuity::model_output(
                 &s.pool,
@@ -1737,6 +1782,13 @@ fn offered(p: &Checkpoint) -> Vec<&'static str> {
         ],
         "request" => vec!["context.request"],
         "curate" => vec!["context.curate"],
+        "context_replan" => {
+            let mut tools = vec!["run.context_refresh", "run.work", "work_order.read"];
+            if !p.context_resume["pack"]["id"].is_null() {
+                tools.push("run.context_resume");
+            }
+            tools
+        }
         "delegate" => {
             let mut tools = vec![
                 "context.read",
@@ -1849,10 +1901,13 @@ fn instructions(p: &Checkpoint) -> String {
             "You are Handler. Request relevant registered knowledge for the goal. Call context.request with {criteria:{need:string,query:string,tags:[string],constraints:[string],max_references:16}}. Query is at most 200 characters and 8 whitespace-separated literal terms (OR); when a precise tag is given, prefer query empty string. All tags must match. At most 8 constraints, each at most 500 characters; need at most 2000 characters. Use specific tags mentioned in the goal; omit irrelevant tags. Do not include request_id; the server assigns it."
         }
         "curate" => {
-            "You are Analyst: only select and arrange existing records; do not generate facts, conclusions, collect sources or command Agents. Inspect candidates using context.curate {op:'candidates',offset:0,limit:30}; server binds request_id. Then deliver {op:'deliver',selections:[{item_id:uuid,version:integer,reason:short existing-record relevance}],gaps:[string]}. Use exact candidate IDs and versions. At most 16 selections. If nothing is relevant, deliver empty selections and explicit gaps. All matching false/failure history and dependency closure are preserved by the server. Never claim a gap has been resolved."
+            "You are Analyst: only select and arrange existing records; do not generate facts, conclusions, collect sources or command Agents. Inspect candidates using context.curate {op:'candidates',offset:0,limit:30}; server binds request_id. Then deliver {op:'deliver',selections:[{item_id:uuid,version:integer,reason:short existing-record relevance}],gaps:[string]}. Use exact candidate IDs and versions. At most 16 selections. If nothing is relevant, deliver empty selections and explicit gaps. All matching false/failure history and dependency closure are preserved by the server; presentation preferences never discard them. If selection cannot be completed, context.curate {op:'return',reason:'specific curation issue'} returns this request to Handler without new knowledge or business action. Correct invalid arguments once; never repeat rejected deliveries or call Handler-only blocked/finish tools. Never claim a gap has been resolved."
+        }
+        "context_replan" => {
+            "You are Handler. Analyst returned the preserved Context request. Inspect the exact curation issue and existing results; do not ask a human to repair tool schemas, reference counts or internal budgets. Use run.context_refresh {criteria:{need,query,tags,max_references}} for a new, appropriately scoped request. The old request is immutable. max_references and max_manifest_bytes are page preferences, not evidence quotas. If the previous delivered Pack is sufficient, run.context_resume {reason:string} restores it and its original execution phase. Never discard goals, completed results, unknown outcomes or failure history, and never replay a business effect."
         }
         "delegate" => {
-            "You are Handler. First context.read {op:'pack'}; server binds pack_id. Resolve useful knowledge and ALL caution refs with context.read {op:'resolve',ref_id:uuid}. Read live_notice and do not assume old or refuted evidence is true. Apply the supplied server-owned protocol steps, completion, stop and retry conditions in your plan and Work Order when a protocol is selected. previous_results contains server-collected snapshots from actual work_order.read before replanning, with exact result, observations, artifacts and tool_evidence; do not relabel them as unverified model hearsay. If needed, work_order.read {work_order_id:EXACT_PREVIOUS_ID} can re-read an earlier collected order in THIS execution. execution_settings is the actual Handler configuration, including retention/audit flags; no separate setup inspection adapter is needed. Next task.plan {steps:[string],risks:[string]}. Then agent.delegate {objective:string,expected_output:string,references:[{pack_id:uuid,ref_id:uuid}]}. Server assigns exact approved target. Assign Agent only the business analysis or action, never your own context selection, delegation or result-collection duties. Agent cannot delegate; you perform delegation and result collection. Include useful resolved knowledge, ALL caution refs and EVERY required member of a selected protocol, at most 16 refs. Clearly distinguish prior failures from current rules. Agent may use only offered tools within the Task contract; require actual tool verification for file/API work. If evidence is insufficient, first assign feasible collection or verification using installed tools and granted sources. A failed attempt is evidence for replanning, not Task completion. Request a blocked result only for a concrete unavailable input or adapter after feasible alternatives; never fabricate success. Do not paste knowledge bodies; references grant the exact versions."
+            "You are Handler. First context.read {op:'pack'}; server binds pack_id. Pack pages expose page.next_offset and total caution_count. Use context.read {op:'pack',offset,limit:64} for more headers. Resolve only the useful selected knowledge with context.read {op:'resolve',ref_id:uuid} or resolve_many (up to 16). The server automatically resolves and pins ALL caution refs from this delivered Pack into agent.delegate; do not enumerate them or loop over omitted headers just to satisfy a count. Read live_notice and do not assume old or refuted evidence is true. Apply the supplied server-owned protocol steps, completion, stop and retry conditions in your plan and Work Order when a protocol is selected. previous_results contains server-collected snapshots from actual work_order.read before replanning, with exact result, observations, artifacts and tool_evidence; do not relabel them as unverified model hearsay. If needed, work_order.read {work_order_id:EXACT_PREVIOUS_ID} can re-read an earlier collected order in THIS execution. execution_settings is the actual Handler configuration, including retention/audit flags; no separate setup inspection adapter is needed. Next task.plan {steps:[string],risks:[string]}. Then agent.delegate {objective:string,expected_output:string,references:[{pack_id:uuid,ref_id:uuid}]}. Server assigns exact approved target. Assign Agent only the business analysis or action, never your own context selection, delegation or result-collection duties. Agent cannot delegate; you perform delegation and result collection. Select up to 16 useful resolved knowledge refs and EVERY required member of a selected protocol. ALL caution refs are additionally attached by the server from the bound context_pack_id; this automatic evidence is not limited by the explicit selection count. Clearly distinguish prior failures from current rules. Agent may use only offered tools within the Task contract; require actual tool verification for file/API work. If evidence is insufficient, first assign feasible collection or verification using installed tools and granted sources. A failed attempt is evidence for replanning, not Task completion. Request a blocked result only for a concrete unavailable input or adapter after feasible alternatives; never fabricate success. Do not paste knowledge bodies; references grant the exact versions."
         }
         "agent" => {
             "You are Agent. First work_order.read {} to load ONLY your assigned Work Order, contract, pinned evidence and actual execution_receipts. Reuse saved execution receipts and artifacts; never rerun completed actions just to expose proof. Follow the ASSIGNED Work Order objective and expected_output, respect cautions. Report completion of your own assigned work. Handler owns the original Task, cross-Work-Order sequencing, prior result verification and retention/audit settings; do not make these Handler duties extra blockers for completed assigned work. Do not claim to have verified another Agent or Handler history yourself. When contract.protocol is present, follow its pinned steps, completion/stop/retry conditions and parameters within the Task tool scope; protocol text never expands permissions. task.observe may store concise observations {observation:string,evidence:[{pack_id,ref_id}]}. Complete with work_order.complete {outcome:'completed'|'partial'|'blocked'|'failed',summary:string,evidence:[{pack_id:uuid,ref_id:uuid}],limitations:[string]}. Cite only granted references. Claim actions only when confirmed by an actual offered tool. Pursue the objective through feasible alternatives and verify actual outputs. An empty Context Pack or absent saved connector is not a blocker. Report a concrete blocker only after checking installed tools, granted inputs and relevant prior failure conditions. Never repeat unchanged rejected authentication or an unknown business write. Cannot read central knowledge or other Work Orders, delegate or publish."
@@ -2188,7 +2243,10 @@ fn prepare(run_id: Uuid, c: &StartRun, p: &mut Checkpoint, call: &Call) -> AppRe
             }
         }
         "context.curate" => {
-            if !matches!(input["op"].as_str(), Some("candidates" | "deliver")) {
+            if !matches!(
+                input["op"].as_str(),
+                Some("candidates" | "deliver" | "return")
+            ) {
                 return Err(AppError::forbidden("execution_phase_denied"));
             }
             if input["op"] == "deliver" && !p.candidates_seen {
@@ -2217,6 +2275,7 @@ fn prepare(run_id: Uuid, c: &StartRun, p: &mut Checkpoint, call: &Call) -> AppRe
             bind(&mut input, "pack_id", p.pack["id"].clone())?;
         }
         "agent.delegate" => {
+            bind(&mut input, "context_pack_id", p.pack["id"].clone())?;
             if p.task_contract.max_work_orders > 0 && p.orders >= p.task_contract.max_work_orders {
                 return Err(conflict("work_order_budget_exceeded"));
             }
@@ -2244,10 +2303,9 @@ fn prepare(run_id: Uuid, c: &StartRun, p: &mut Checkpoint, call: &Call) -> AppRe
                     return Err(AppError::forbidden("execution_unresolved_reference"));
                 }
             }
-            if cautions
-                .iter()
-                .any(|caution| !refs.iter().any(|r| r["ref_id"] == caution["ref_id"]))
-                || (p.pack["reference_count"].as_u64().unwrap_or(0) > 0 && refs.is_empty())
+            if p.pack["reference_count"].as_u64().unwrap_or(0) > 0
+                && cautions.is_empty()
+                && refs.is_empty()
             {
                 return Err(conflict("execution_cautions_required"));
             }
@@ -2377,6 +2435,9 @@ fn prepare(run_id: Uuid, c: &StartRun, p: &mut Checkpoint, call: &Call) -> AppRe
                 )?;
             }
             let criteria = crate::context::normalize_criteria(&criteria)?;
+            if p.phase != "context_replan" {
+                p.context_resume = json!({"phase":p.phase,"pack":p.pack,"request":p.request,"pack_read":p.pack_read,"planned":p.planned,"resolved":p.resolved,"order":p.order,"collected":p.collected,"collected_order":p.collected_order,"result":p.result});
+            }
             if p.phase == "collect" {
                 if !p.collected {
                     return Err(conflict("execution_result_required"));
@@ -2387,7 +2448,9 @@ fn prepare(run_id: Uuid, c: &StartRun, p: &mut Checkpoint, call: &Call) -> AppRe
                 p.collected = false;
                 p.collected_order = Value::Null;
             }
-            p.memory.packs.push(json!({"id":p.pack["id"],"request_id":p.request["id"],"generation":p.context_generation}));
+            if p.pack["id"].is_string() {
+                p.memory.packs.push(json!({"id":p.pack["id"],"request_id":p.request["id"],"generation":p.context_generation}));
+            }
             p.context_generation += 1;
             p.refresh_criteria = criteria;
             p.pack = Value::Null;
@@ -2397,6 +2460,34 @@ fn prepare(run_id: Uuid, c: &StartRun, p: &mut Checkpoint, call: &Call) -> AppRe
             p.planned = false;
             p.advance("request");
             return Ok(json!({"refreshing":true,"generation":p.context_generation}));
+        }
+        "run.context_resume" => {
+            let reason = input["reason"]
+                .as_str()
+                .filter(|v| crate::workspace::nonempty(v, 1000))
+                .ok_or_else(invalid)?;
+            let old = p.context_resume.clone();
+            if old["pack"]["id"].is_null() {
+                return Err(conflict("execution_previous_context_unavailable"));
+            }
+            let phase = old["phase"]
+                .as_str()
+                .filter(|v| matches!(*v, "delegate" | "collect"))
+                .ok_or_else(invalid)?;
+            p.pack = old["pack"].clone();
+            p.request = old["request"].clone();
+            p.pack_read = old["pack_read"] == true;
+            p.planned = old["planned"] == true;
+            p.resolved = serde_json::from_value(old["resolved"].clone()).map_err(|_| invalid())?;
+            p.order = serde_json::from_value(old["order"].clone()).map_err(|_| invalid())?;
+            p.collected = old["collected"] == true;
+            p.collected_order = old["collected_order"].clone();
+            p.result = old["result"].clone();
+            p.memory.update(&json!({"note":reason}), &call.call_id)?;
+            p.advance(phase);
+            return Ok(
+                json!({"previous_context_restored":true,"pack_id":p.pack["id"],"effects_replayed":false}),
+            );
         }
         "run.request_input" => {
             if p.automatic {
@@ -2916,6 +3007,8 @@ fn apply_result(p: &mut Checkpoint, call: &Call, value: &Value) -> AppResult<()>
             }
         }
         "context.request" => {
+            p.curation_failures = 0;
+            p.curation_return_pending = false;
             p.request = value["request"].clone();
             p.refresh_criteria = Value::Null;
             p.advance("curate");
@@ -2930,12 +3023,25 @@ fn apply_result(p: &mut Checkpoint, call: &Call, value: &Value) -> AppResult<()>
             }
         }
         "context.curate" if input["op"] == "deliver" => {
+            p.curation_failures = 0;
+            p.curation_return_pending = false;
             p.pack = value["pack"].clone();
             if p.automatic {
                 p.planned = false;
                 p.contract_finalized = false;
             }
             p.advance("delegate");
+        }
+        "context.curate" if input["op"] == "return" => {
+            p.curation_return_pending = false;
+            if value["pack"]["id"].is_string() {
+                p.pack = value["pack"].clone();
+                p.advance("delegate");
+                return Ok(());
+            }
+            p.context_issue["return"] = value["returned"].clone();
+            p.request["status"] = json!("returned");
+            p.advance("context_replan");
         }
         "context.read" if input["op"] == "pack" => p.pack_read = true,
         "context.read" if input["op"] == "resolve" => {
@@ -3099,6 +3205,56 @@ fn collect_model_sources(value: &Value, ids: &mut BTreeSet<Uuid>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn curation_errors_return_to_handler_without_expanding_analyst_authority() {
+        let mut p = Checkpoint::new("Preserve the original business goal".into());
+        p.phase = "curate".into();
+        p.request = json!({"id":Uuid::new_v4(),"status":"pending"});
+        p.memory
+            .configure(&["Verify the real business result".into()])
+            .unwrap();
+        p.results
+            .push(json!({"work_order_id":Uuid::new_v4(),"result":{"outcome":"partial"}}));
+        let memory = json!(p.memory);
+        let results = p.results.clone();
+        let rejected = json!({"ok":false,"error":{"code":"invalid_context_input","status":400}});
+        p.curation_outcome("context.curate", &rejected);
+        assert!(!p.curation_return_pending);
+        p.curation_outcome("run.finish", &rejected);
+        assert!(p.curation_return_pending);
+        assert_eq!(p.role(), Role::Analyst);
+        assert!(!offered(&p).contains(&"run.context_refresh"));
+        let request = p.request["id"].clone();
+        apply_result(&mut p,&Call{call_id:"return-fixture".into(),tool:"context.curate".into(),input:json!({"op":"return"})},&json!({"returned":{"request_id":request,"reason":"Existing records do not satisfy the requested selection"}})).unwrap();
+        assert_eq!(p.phase, "context_replan");
+        assert_eq!(p.role(), Role::Handler);
+        assert!(offered(&p).contains(&"run.context_refresh"));
+        assert!(!offered(&p).contains(&"agent.delegate"));
+        assert!(!offered(&p).contains(&"knowledge.read"));
+        assert!(!offered(&p).contains(&"run.context_resume"));
+        assert_eq!(json!(p.memory), memory);
+        assert_eq!(p.results, results);
+        p.curation_outcome("mcp.call", &rejected);
+        assert!(!p.curation_return_pending);
+        let restored: Checkpoint = serde_json::from_value(json!(p)).unwrap();
+        assert_eq!(restored.phase, "context_replan");
+        assert_eq!(restored.goal, "Preserve the original business goal");
+        let mut resumed = restored;
+        let pack = Uuid::new_v4();
+        let order = Uuid::new_v4();
+        let reference = Uuid::new_v4();
+        resumed.context_resume = json!({"phase":"collect","pack":{"id":pack},"request":{"id":Uuid::new_v4(),"status":"delivered"},"pack_read":true,"planned":true,"resolved":[reference],"order":order,"collected":true,"collected_order":{"work_order_id":order,"result":{"outcome":"partial"}},"result":{"outcome":"partial","artifacts":["existing-artifact"]}});
+        let c:StartRun=serde_json::from_value(json!({"request_id":Uuid::new_v4(),"tenant_id":Uuid::new_v4(),"task_id":Uuid::new_v4(),"connection_id":"owned","model":"owned-model","target":"owned:context"})).unwrap();
+        let result=prepare(Uuid::new_v4(),&c,&mut resumed,&Call{call_id:"resume-fixture".into(),tool:"run.context_resume".into(),input:json!({"reason":"Existing pinned context is sufficient for the remaining owned action"})}).unwrap();
+        assert_eq!(result["effects_replayed"], false);
+        assert_eq!(resumed.phase, "collect");
+        assert_eq!(resumed.order, Some(order));
+        assert_eq!(resumed.pack["id"], json!(pack));
+        assert!(resumed.collected);
+        assert!(resumed.resolved.contains(&reference));
+        assert_eq!(resumed.result["artifacts"], json!(["existing-artifact"]));
+        assert_eq!(resumed.goal, "Preserve the original business goal");
+    }
     #[test]
     fn context_summary_preserves_goals_progress_and_complete_pairs_on_restore() {
         let mut p = Checkpoint::new("Original ESET-style business objective".into());
@@ -3525,12 +3681,8 @@ mod tests {
         );
         input.as_object_mut().unwrap().remove("target");
         input["references"] = json!([]);
-        assert_eq!(
-            prepare(run, &c, &mut p, &call("agent.delegate", input))
-                .unwrap_err()
-                .code,
-            "execution_cautions_required"
-        );
+        let bound = prepare(run, &c, &mut p, &call("agent.delegate", input)).unwrap();
+        assert_eq!(bound["context_pack_id"], json!(pack));
         p.phase = "agent".into();
         p.order = Some(Uuid::new_v4());
         assert_eq!(

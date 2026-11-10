@@ -152,12 +152,32 @@ $results=@(1..2 | ForEach-Object -Parallel {
 } -ThrottleLimit 2)
 Assert-Context ($results.Count -eq 2 -and $results[0].pack_id -eq $results[1].pack_id -and $results[0].replayed -ne $results[1].replayed) 'Concurrent delivery created duplicate packs.'
 Assert-ContextDenied 'context.read' @{op='resolve';pack_id=$results[0].pack_id;ref_id=$ruleRef} 404 $handler $handlerTask
-foreach($budget in @(@{extra=@{max_references=1};code='context_reference_budget_exceeded'},@{extra=@{max_manifest_bytes=1024};code='context_manifest_budget_exceeded'})) {
-    $small=Request-Context $budget.extra
-    Assert-ContextDenied 'context.curate' (Context-Delivery $small $rule) 409 $analyst $analystTask $budget.code
+foreach($preference in @(@{max_references=1},@{max_manifest_bytes=1024})) {
+    $small=Request-Context $preference
+    $saved=Invoke-ContextTool 'context.curate' (Context-Delivery $small $rule)
+    Assert-Context ($saved.pack.reference_count -eq ($pack.reference_count+1)) 'Small presentation preferences discarded pinned evidence.'
+    $offset=0;$seen=[Collections.Generic.HashSet[string]]::new()
+    do {
+        $page=(Read-Context @{op='pack';pack_id=$saved.pack.id;offset=$offset;limit=1}).pack
+        foreach($header in @($page.knowledge)+@($page.cautions)){Assert-Context ($seen.Add([string]$header.ref_id)) 'A page duplicated a pinned reference.'}
+        $next=$page.page.next_offset
+        if($null -eq $next){break}
+        Assert-Context ([int]$next -gt $offset) 'Manifest paging did not advance.'
+        $offset=[int]$next
+    }while($true)
+    Assert-Context ($seen.Count -eq $saved.pack.reference_count) 'Manifest paging lost a pinned reference.'
     $state=Read-Context @{op='request';request_id=$small.request.id}
-    Assert-Context ($state.request.status -eq 'pending' -and -not $state.request.pack_id) 'A failed budget check left a partial pack.'
+    Assert-Context ($state.request.status -eq 'delivered') 'A small display preference blocked delivery.'
 }
+$returnable=Request-Context @{tags=@('scope:return-fixture')}
+$return=@{op='return';request_id=$returnable.request.id;reason='Existing records do not satisfy this owned selection; Handler should refine the request.'}
+Assert-ContextDenied 'context.curate' $return 403 $handler $handlerTask
+Assert-ContextDenied 'context.curate' $return 404 $foreignAnalyst $foreignTask
+$returned=Invoke-ContextTool 'context.curate' $return
+Assert-Context ($returned.returned.request_id -eq $returnable.request.id) 'Analyst returned a different request.'
+Assert-Context ((Invoke-ContextTool 'context.curate' $return).replayed) 'An Analyst return was not idempotent.'
+Assert-Context ((Read-Context @{op='request';request_id=$returnable.request.id}).request.status -eq 'returned') 'The terminal return was not preserved.'
+Assert-ContextDenied 'context.curate' @{op='deliver';request_id=$returnable.request.id;selections=@();gaps=@('Do not overwrite the return')} 409 $analyst $analystTask 'context_request_returned'
 $empty=Request-Context @{tags=@('scope:no-match')}
 $noEvidence=Invoke-ContextTool 'context.curate' @{op='deliver';request_id=$empty.request.id;selections=@();gaps=@('No registered evidence matches the scope')}
 Assert-Context ($noEvidence.pack.reference_count -eq 0 -and @($noEvidence.pack.gaps).Count -eq 1) 'Missing information was not explicitly returned as a gap.'
@@ -172,7 +192,7 @@ if($RestartCore) {
     Assert-Context (((Read-Context @{op='pack';pack_id=$pack.id}).pack | ConvertTo-Json -Depth 16 -Compress) -eq $manifest) 'Pack did not survive restart.'
     Assert-Context ((Read-Context @{op='resolve';pack_id=$pack.id;ref_id=$ruleRef}).document.content -eq 'CONTEXT_RULE_BODY_VERSION_ONE') 'Pinned reference did not survive restart.'
 }
-$report=@{verified_at=[DateTimeOffset]::UtcNow.ToString('o');api_assertions=$script:ContextAssertions;request_delivery_verified=$true;references_only_manifest=$true;failure_history_preserved=$true;counter_evidence_included=$true;version_pinning=$true;scoped_resolution=$true;budget_atomicity=$true;concurrent_delivery_idempotent=$true;restart_verified=[bool]$RestartCore}
+$report=@{verified_at=[DateTimeOffset]::UtcNow.ToString('o');api_assertions=$script:ContextAssertions;request_delivery_verified=$true;references_only_manifest=$true;failure_history_preserved=$true;counter_evidence_included=$true;version_pinning=$true;scoped_resolution=$true;paged_complete_evidence=$true;analyst_return_verified=$true;concurrent_delivery_idempotent=$true;restart_verified=[bool]$RestartCore}
 Write-PrivateText (Join-Path $script:RuntimeRoot 'evidence/context-packs.json') ($report | ConvertTo-Json)
 Write-PrivateText (Join-Path $script:RuntimeRoot 'evidence/context-pack-inventory.json') (@{tenant_id=$tenant;writer_task_id=$writerTask.task_id;handler_task_id=$handlerTask.task_id;analyst_task_id=$analystTask.task_id;pack_id=$pack.id;rule_ref_id=$ruleRef;synthetic_records_retained=$true} | ConvertTo-Json)
 $report | ConvertTo-Json -Compress
